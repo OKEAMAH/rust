@@ -21,7 +21,7 @@ pub trait FileDescription: std::fmt::Debug + Any {
         &mut self,
         _communicate_allowed: bool,
         _bytes: &mut [u8],
-        _ecx: &mut MiriInterpCx<'_, 'tcx>,
+        _ecx: &mut MiriInterpCx<'tcx>,
     ) -> InterpResult<'tcx, io::Result<usize>> {
         throw_unsup_format!("cannot read from {}", self.name());
     }
@@ -31,7 +31,7 @@ pub trait FileDescription: std::fmt::Debug + Any {
         &mut self,
         _communicate_allowed: bool,
         _bytes: &[u8],
-        _ecx: &mut MiriInterpCx<'_, 'tcx>,
+        _ecx: &mut MiriInterpCx<'tcx>,
     ) -> InterpResult<'tcx, io::Result<usize>> {
         throw_unsup_format!("cannot write to {}", self.name());
     }
@@ -81,7 +81,7 @@ impl FileDescription for io::Stdin {
         &mut self,
         communicate_allowed: bool,
         bytes: &mut [u8],
-        _ecx: &mut MiriInterpCx<'_, 'tcx>,
+        _ecx: &mut MiriInterpCx<'tcx>,
     ) -> InterpResult<'tcx, io::Result<usize>> {
         if !communicate_allowed {
             // We want isolation mode to be deterministic, so we have to disallow all reads, even stdin.
@@ -104,7 +104,7 @@ impl FileDescription for io::Stdout {
         &mut self,
         _communicate_allowed: bool,
         bytes: &[u8],
-        _ecx: &mut MiriInterpCx<'_, 'tcx>,
+        _ecx: &mut MiriInterpCx<'tcx>,
     ) -> InterpResult<'tcx, io::Result<usize>> {
         // We allow writing to stderr even with isolation enabled.
         let result = Write::write(self, bytes);
@@ -132,7 +132,7 @@ impl FileDescription for io::Stderr {
         &mut self,
         _communicate_allowed: bool,
         bytes: &[u8],
-        _ecx: &mut MiriInterpCx<'_, 'tcx>,
+        _ecx: &mut MiriInterpCx<'tcx>,
     ) -> InterpResult<'tcx, io::Result<usize>> {
         // We allow writing to stderr even with isolation enabled.
         // No need to flush, stderr is not buffered.
@@ -157,7 +157,7 @@ impl FileDescription for NullOutput {
         &mut self,
         _communicate_allowed: bool,
         bytes: &[u8],
-        _ecx: &mut MiriInterpCx<'_, 'tcx>,
+        _ecx: &mut MiriInterpCx<'tcx>,
     ) -> InterpResult<'tcx, io::Result<usize>> {
         // We just don't write anything, but report to the user that we did.
         Ok(Ok(bytes.len()))
@@ -240,7 +240,7 @@ impl FdTable {
         let new_fd = candidate_new_fd.unwrap_or_else(|| {
             // find_map ran out of BTreeMap entries before finding a free fd, use one plus the
             // maximum fd in the map
-            self.fds.last_key_value().map(|(fd, _)| fd.checked_add(1).unwrap()).unwrap_or(min_fd)
+            self.fds.last_key_value().map(|(fd, _)| fd.strict_add(1)).unwrap_or(min_fd)
         });
 
         self.fds.try_insert(new_fd, file_handle).unwrap();
@@ -271,9 +271,9 @@ impl FdTable {
     }
 }
 
-impl<'mir, 'tcx: 'mir> EvalContextExt<'mir, 'tcx> for crate::MiriInterpCx<'mir, 'tcx> {}
-pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
-    fn fcntl(&mut self, args: &[OpTy<'tcx, Provenance>]) -> InterpResult<'tcx, i32> {
+impl<'tcx> EvalContextExt<'tcx> for crate::MiriInterpCx<'tcx> {}
+pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
+    fn fcntl(&mut self, args: &[OpTy<'tcx>]) -> InterpResult<'tcx, i32> {
         let this = self.eval_context_mut();
 
         if args.len() < 2 {
@@ -329,7 +329,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         }
     }
 
-    fn close(&mut self, fd_op: &OpTy<'tcx, Provenance>) -> InterpResult<'tcx, Scalar<Provenance>> {
+    fn close(&mut self, fd_op: &OpTy<'tcx>) -> InterpResult<'tcx, Scalar> {
         let this = self.eval_context_mut();
 
         let fd = this.read_scalar(fd_op)?.to_i32()?;
@@ -355,12 +355,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         Ok((-1).into())
     }
 
-    fn read(
-        &mut self,
-        fd: i32,
-        buf: Pointer<Option<Provenance>>,
-        count: u64,
-    ) -> InterpResult<'tcx, i64> {
+    fn read(&mut self, fd: i32, buf: Pointer, count: u64) -> InterpResult<'tcx, i64> {
         let this = self.eval_context_mut();
 
         // Isolation check is done via `FileDescriptor` trait.
@@ -409,12 +404,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         }
     }
 
-    fn write(
-        &mut self,
-        fd: i32,
-        buf: Pointer<Option<Provenance>>,
-        count: u64,
-    ) -> InterpResult<'tcx, i64> {
+    fn write(&mut self, fd: i32, buf: Pointer, count: u64) -> InterpResult<'tcx, i64> {
         let this = self.eval_context_mut();
 
         // Isolation check is done via `FileDescriptor` trait.

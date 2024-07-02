@@ -12,12 +12,13 @@ use intern::Interned;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use span::AstIdMap;
+use stdx::never;
 use syntax::{
     ast::{
         self, ArrayExprKind, AstChildren, BlockExpr, HasArgList, HasAttrs, HasLoopBody, HasName,
         RangeItem, SlicePatComponents,
     },
-    AstNode, AstPtr, SyntaxNodePtr,
+    AstNode, AstPtr, AstToken as _, SyntaxNodePtr,
 };
 use triomphe::Arc;
 
@@ -480,7 +481,8 @@ impl ExprCollector<'_> {
                     } else if e.const_token().is_some() {
                         Mutability::Shared
                     } else {
-                        unreachable!("parser only remaps to raw_token() if matching mutability token follows")
+                        never!("parser only remaps to raw_token() if matching mutability token follows");
+                        Mutability::Shared
                     }
                 } else {
                     Mutability::from_mutable(e.mut_token().is_some())
@@ -963,7 +965,7 @@ impl ExprCollector<'_> {
                     .resolve_path(
                         self.db,
                         module,
-                        &path,
+                        path,
                         crate::item_scope::BuiltinShadowMode::Other,
                         Some(MacroSubNs::Bang),
                     )
@@ -1006,9 +1008,9 @@ impl ExprCollector<'_> {
             Some((mark, expansion)) => {
                 // Keep collecting even with expansion errors so we can provide completions and
                 // other services in incomplete macro expressions.
-                self.source_map
-                    .expansions
-                    .insert(macro_call_ptr, self.expander.current_file_id().macro_file().unwrap());
+                if let Some(macro_file) = self.expander.current_file_id().macro_file() {
+                    self.source_map.expansions.insert(macro_call_ptr, macro_file);
+                }
                 let prev_ast_id_map = mem::replace(
                     &mut self.ast_id_map,
                     self.db.ast_id_map(self.expander.current_file_id()),
@@ -1577,7 +1579,13 @@ impl ExprCollector<'_> {
             });
         });
         let template = f.template();
-        let fmt_snippet = template.as_ref().map(ToString::to_string);
+        let fmt_snippet = template.as_ref().and_then(|it| match it {
+            ast::Expr::Literal(literal) => match literal.kind() {
+                ast::LiteralKind::String(s) => Some(s.text().to_owned()),
+                _ => None,
+            },
+            _ => None,
+        });
         let mut mappings = vec![];
         let fmt = match template.and_then(|it| self.expand_macros_to_string(it)) {
             Some((s, is_direct_literal)) => format_args::parse(

@@ -18,6 +18,7 @@ use rustc_middle::ty::cast::{mir_cast_kind, CastTy};
 use rustc_middle::ty::layout::IntegerExt;
 use rustc_middle::ty::{self, Ty, UpvarArgs};
 use rustc_span::{Span, DUMMY_SP};
+use tracing::debug;
 
 impl<'a, 'tcx> Builder<'a, 'tcx> {
     /// Returns an rvalue suitable for use until the end of the current
@@ -151,10 +152,11 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                     source_info,
                     TerminatorKind::Call {
                         func: exchange_malloc,
-                        args: vec![
+                        args: [
                             Spanned { node: Operand::Move(size), span: DUMMY_SP },
                             Spanned { node: Operand::Move(align), span: DUMMY_SP },
-                        ],
+                        ]
+                        .into(),
                         destination: storage,
                         target: Some(success),
                         unwind: UnwindAction::Continue,

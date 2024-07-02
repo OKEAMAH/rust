@@ -17,6 +17,7 @@ use rustc_span::{Span, DUMMY_SP};
 use rustc_target::abi::{self, FieldIdx, FIRST_VARIANT};
 
 use arrayvec::ArrayVec;
+use tracing::{debug, instrument};
 
 impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
     #[instrument(level = "trace", skip(self, bx))]
@@ -455,8 +456,12 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                             base::unsize_ptr(bx, lldata, operand.layout.ty, cast.ty, llextra);
                         OperandValue::Pair(lldata, llextra)
                     }
-                    mir::CastKind::PointerCoercion(PointerCoercion::MutToConstPointer)
-                    | mir::CastKind::PtrToPtr
+                    mir::CastKind::PointerCoercion(
+                        PointerCoercion::MutToConstPointer | PointerCoercion::ArrayToPointer,
+                    ) => {
+                        bug!("{kind:?} is for borrowck, and should never appear in codegen");
+                    }
+                    mir::CastKind::PtrToPtr
                         if bx.cx().is_backend_scalar_pair(operand.layout) =>
                     {
                         if let OperandValue::Pair(data_ptr, meta) = operand.val {
@@ -476,9 +481,6 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                             base::cast_to_dyn_star(bx, lldata, operand.layout, cast.ty, llextra);
                         OperandValue::Pair(lldata, llextra)
                     }
-                    mir::CastKind::PointerCoercion(
-                        PointerCoercion::MutToConstPointer | PointerCoercion::ArrayToPointer,
-                    )
                     | mir::CastKind::IntToInt
                     | mir::CastKind::FloatToInt
                     | mir::CastKind::FloatToFloat
@@ -622,19 +624,38 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
 
             mir::Rvalue::UnaryOp(op, ref operand) => {
                 let operand = self.codegen_operand(bx, operand);
-                let lloperand = operand.immediate();
                 let is_float = operand.layout.ty.is_floating_point();
-                let llval = match op {
-                    mir::UnOp::Not => bx.not(lloperand),
+                let (val, layout) = match op {
+                    mir::UnOp::Not => {
+                        let llval = bx.not(operand.immediate());
+                        (OperandValue::Immediate(llval), operand.layout)
+                    }
                     mir::UnOp::Neg => {
-                        if is_float {
-                            bx.fneg(lloperand)
+                        let llval = if is_float {
+                            bx.fneg(operand.immediate())
                         } else {
-                            bx.neg(lloperand)
+                            bx.neg(operand.immediate())
+                        };
+                        (OperandValue::Immediate(llval), operand.layout)
+                    }
+                    mir::UnOp::PtrMetadata => {
+                        debug_assert!(
+                            operand.layout.ty.is_unsafe_ptr() || operand.layout.ty.is_ref(),
+                        );
+                        let (_, meta) = operand.val.pointer_parts();
+                        assert_eq!(operand.layout.fields.count() > 1, meta.is_some());
+                        if let Some(meta) = meta {
+                            (OperandValue::Immediate(meta), operand.layout.field(self.cx, 1))
+                        } else {
+                            (OperandValue::ZeroSized, bx.cx().layout_of(bx.tcx().types.unit))
                         }
                     }
                 };
-                OperandRef { val: OperandValue::Immediate(llval), layout: operand.layout }
+                debug_assert!(
+                    val.is_expected_variant_for_type(self.cx, layout),
+                    "Made wrong variant {val:?} for type {layout:?}",
+                );
+                OperandRef { val, layout }
             }
 
             mir::Rvalue::Discriminant(ref place) => {
@@ -662,7 +683,10 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                         bx.cx().const_usize(val)
                     }
                     mir::NullOp::OffsetOf(fields) => {
-                        let val = layout.offset_of_subfield(bx.cx(), fields.iter()).bytes();
+                        let val = bx
+                            .tcx()
+                            .offset_of_subfield(bx.param_env(), layout, fields.iter())
+                            .bytes();
                         bx.cx().const_usize(val)
                     }
                     mir::NullOp::UbChecks => {
@@ -683,7 +707,7 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                 let static_ = if !def_id.is_local() && bx.cx().tcx().needs_thread_local_shim(def_id)
                 {
                     let instance = ty::Instance {
-                        def: ty::InstanceDef::ThreadLocalShim(def_id),
+                        def: ty::InstanceKind::ThreadLocalShim(def_id),
                         args: ty::GenericArgs::empty(),
                     };
                     let fn_ptr = bx.get_fn_addr(instance);
@@ -717,8 +741,9 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                     let values = op.val.immediates_or_place().left_or_else(|p| {
                         bug!("Field {field_idx:?} is {p:?} making {layout:?}");
                     });
-                    inputs.extend(values);
                     let scalars = self.value_kind(op.layout).scalars().unwrap();
+                    debug_assert_eq!(values.len(), scalars.len());
+                    inputs.extend(values);
                     input_scalars.extend(scalars);
                 }
 

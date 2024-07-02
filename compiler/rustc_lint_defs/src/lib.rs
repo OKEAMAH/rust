@@ -618,10 +618,6 @@ pub enum BuiltinLintDiag {
         is_foreign: bool,
     },
     LegacyDeriveHelpers(Span),
-    ProcMacroBackCompat {
-        crate_name: String,
-        fixed_version: String,
-    },
     OrPatternsBackCompat(Span, String),
     ReservedPrefix(Span, String),
     TrailingMacro(bool, Ident),
@@ -630,6 +626,9 @@ pub enum BuiltinLintDiag {
     UnexpectedCfgName((Symbol, Span), Option<(Symbol, Span)>),
     UnexpectedCfgValue((Symbol, Span), Option<(Symbol, Span)>),
     DeprecatedWhereclauseLocation(Span, Option<(Span, String)>),
+    MissingUnsafeOnExtern {
+        suggestion: Span,
+    },
     SingleUseLifetime {
         /// Span of the parameter which declares this lifetime.
         param_span: Span,
@@ -692,9 +691,14 @@ pub enum BuiltinLintDiag {
         /// The span of the unnecessarily-qualified path to remove.
         removal_span: Span,
     },
+    UnsafeAttrOutsideUnsafe {
+        attribute_name_span: Span,
+        sugg_spans: (Span, Span),
+    },
     AssociatedConstElidedLifetime {
         elided: bool,
         span: Span,
+        lifetimes_in_scope: MultiSpan,
     },
     RedundantImportVisibility {
         span: Span,
@@ -707,7 +711,10 @@ pub enum BuiltinLintDiag {
     },
     MacroUseDeprecated,
     UnusedMacroUse,
-    PrivateExternCrateReexport(Ident),
+    PrivateExternCrateReexport {
+        source: Ident,
+        extern_crate_span: Span,
+    },
     UnusedLabel,
     MacroIsPrivate(Ident),
     UnusedMacroDefinition(Symbol),
@@ -737,6 +744,9 @@ pub enum BuiltinLintDiag {
     InnerAttributeUnstable {
         is_macro: bool,
     },
+    OutOfScopeMacroCalls {
+        path: String,
+    },
 }
 
 /// Lints that are buffered up early on in the `Session` before the
@@ -764,19 +774,7 @@ pub struct LintBuffer {
 
 impl LintBuffer {
     pub fn add_early_lint(&mut self, early_lint: BufferedEarlyLint) {
-        let arr = self.map.entry(early_lint.node_id).or_default();
-        arr.push(early_lint);
-    }
-
-    pub fn add_lint(
-        &mut self,
-        lint: &'static Lint,
-        node_id: NodeId,
-        span: MultiSpan,
-        diagnostic: BuiltinLintDiag,
-    ) {
-        let lint_id = LintId::of(lint);
-        self.add_early_lint(BufferedEarlyLint { lint_id, node_id, span, diagnostic });
+        self.map.entry(early_lint.node_id).or_default().push(early_lint);
     }
 
     pub fn take(&mut self, id: NodeId) -> Vec<BufferedEarlyLint> {
@@ -787,11 +785,16 @@ impl LintBuffer {
     pub fn buffer_lint(
         &mut self,
         lint: &'static Lint,
-        id: NodeId,
-        sp: impl Into<MultiSpan>,
+        node_id: NodeId,
+        span: impl Into<MultiSpan>,
         diagnostic: BuiltinLintDiag,
     ) {
-        self.add_lint(lint, id, sp.into(), diagnostic)
+        self.add_early_lint(BufferedEarlyLint {
+            lint_id: LintId::of(lint),
+            node_id,
+            span: span.into(),
+            diagnostic,
+        });
     }
 }
 

@@ -159,7 +159,7 @@ pub(crate) fn detect_llvm_sha(config: &Config, is_git: bool) -> String {
         // in that case.
         let closest_upstream = get_git_merge_base(&config.git_config(), Some(&config.src))
             .unwrap_or_else(|_| "HEAD".into());
-        let mut rev_list = config.git();
+        let mut rev_list = helpers::git(Some(&config.src));
         rev_list.args(&[
             PathBuf::from("rev-list"),
             format!("--author={}", config.stage0_metadata.config.git_merge_commit_email).into(),
@@ -217,6 +217,7 @@ pub(crate) fn is_ci_llvm_available(config: &Config, asserts: bool) -> bool {
         ("arm-unknown-linux-gnueabihf", false),
         ("armv7-unknown-linux-gnueabihf", false),
         ("loongarch64-unknown-linux-gnu", false),
+        ("loongarch64-unknown-linux-musl", false),
         ("mips-unknown-linux-gnu", false),
         ("mips64-unknown-linux-gnuabi64", false),
         ("mips64el-unknown-linux-gnuabi64", false),
@@ -252,7 +253,7 @@ pub(crate) fn is_ci_llvm_modified(config: &Config) -> bool {
         // We assume we have access to git, so it's okay to unconditionally pass
         // `true` here.
         let llvm_sha = detect_llvm_sha(config, true);
-        let head_sha = output(config.git().arg("rev-parse").arg("HEAD"));
+        let head_sha = output(helpers::git(Some(&config.src)).arg("rev-parse").arg("HEAD"));
         let head_sha = head_sha.trim();
         llvm_sha == head_sha
     }
@@ -330,7 +331,7 @@ impl Step for Llvm {
 
         let llvm_exp_targets = match builder.config.llvm_experimental_targets {
             Some(ref s) => s,
-            None => "AVR;M68k;CSKY",
+            None => "AVR;M68k;CSKY;Xtensa",
         };
 
         let assertions = if builder.config.llvm_assertions { "ON" } else { "OFF" };
@@ -406,18 +407,21 @@ impl Step for Llvm {
             cfg.define("LLVM_LINK_LLVM_DYLIB", "ON");
         }
 
-        if (target.starts_with("riscv") || target.starts_with("csky"))
+        if (target.starts_with("csky")
+            || target.starts_with("riscv")
+            || target.starts_with("sparc-"))
             && !target.contains("freebsd")
             && !target.contains("openbsd")
             && !target.contains("netbsd")
         {
-            // RISC-V and CSKY GCC erroneously requires linking against
+            // CSKY and RISC-V GCC erroneously requires linking against
             // `libatomic` when using 1-byte and 2-byte C++
             // atomics but the LLVM build system check cannot
             // detect this. Therefore it is set manually here.
             // Some BSD uses Clang as its system compiler and
             // provides no libatomic in its base system so does
-            // not want this.
+            // not want this. 32-bit SPARC requires linking against
+            // libatomic as well.
             ldflags.exe.push(" -latomic");
             ldflags.shared.push(" -latomic");
         }

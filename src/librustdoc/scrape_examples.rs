@@ -7,6 +7,7 @@ use crate::formats::renderer::FormatRenderer;
 use crate::html::render::Context;
 
 use rustc_data_structures::fx::FxHashMap;
+use rustc_errors::DiagCtxtHandle;
 use rustc_hir::{
     self as hir,
     intravisit::{self, Visitor},
@@ -38,7 +39,7 @@ pub(crate) struct ScrapeExamplesOptions {
 }
 
 impl ScrapeExamplesOptions {
-    pub(crate) fn new(matches: &getopts::Matches, dcx: &rustc_errors::DiagCtxt) -> Option<Self> {
+    pub(crate) fn new(matches: &getopts::Matches, dcx: DiagCtxtHandle<'_>) -> Option<Self> {
         let output_path = matches.opt_str("scrape-examples-output-path");
         let target_crates = matches.opt_strs("scrape-examples-target-crate");
         let scrape_tests = matches.opt_present("scrape-tests");
@@ -283,7 +284,7 @@ pub(crate) fn run(
         // Collect CrateIds corresponding to provided target crates
         // If two different versions of the crate in the dependency tree, then examples will be collected from both.
         let all_crates = tcx
-            .crates_including_speculative(())
+            .crates(())
             .iter()
             .chain([&LOCAL_CRATE])
             .map(|crate_num| (crate_num, tcx.crate_name(*crate_num)))
@@ -336,7 +337,7 @@ pub(crate) fn run(
 // options.
 pub(crate) fn load_call_locations(
     with_examples: Vec<String>,
-    dcx: &rustc_errors::DiagCtxt,
+    dcx: DiagCtxtHandle<'_>,
 ) -> AllCallLocations {
     let mut all_calls: AllCallLocations = FxHashMap::default();
     for path in with_examples {

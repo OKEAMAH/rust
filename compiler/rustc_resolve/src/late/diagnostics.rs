@@ -508,7 +508,7 @@ impl<'a: 'ast, 'ast, 'tcx> LateResolutionVisitor<'a, '_, 'ast, 'tcx> {
                 let ast::AngleBracketedArg::Constraint(constraint) = param else {
                     continue;
                 };
-                let ast::AssocConstraintKind::Bound { bounds } = &constraint.kind else {
+                let ast::AssocItemConstraintKind::Bound { bounds } = &constraint.kind else {
                     continue;
                 };
                 for bound in bounds {
@@ -829,7 +829,7 @@ impl<'a: 'ast, 'ast, 'tcx> LateResolutionVisitor<'a, '_, 'ast, 'tcx> {
                         auto-traits; structs and enums can't be bound in that way",
                 );
                 if bounds.iter().all(|bound| match bound {
-                    ast::GenericBound::Outlives(_) => true,
+                    ast::GenericBound::Outlives(_) | ast::GenericBound::Use(..) => true,
                     ast::GenericBound::Trait(tr, _) => tr.span == base_error.span,
                 }) {
                     let mut sugg = vec![];
@@ -1021,12 +1021,14 @@ impl<'a: 'ast, 'ast, 'tcx> LateResolutionVisitor<'a, '_, 'ast, 'tcx> {
             },
         );
         let is_assoc_fn = self.self_type_is_available();
+        let self_from_macro = "a `self` parameter, but a macro invocation can only \
+                               access identifiers it receives from parameters";
         if let Some((fn_kind, span)) = &self.diag_metadata.current_function {
             // The current function has a `self` parameter, but we were unable to resolve
             // a reference to `self`. This can only happen if the `self` identifier we
             // are resolving came from a different hygiene context.
             if fn_kind.decl().inputs.get(0).is_some_and(|p| p.is_self()) {
-                err.span_label(*span, "this function has a `self` parameter, but a macro invocation can only access identifiers it receives from parameters");
+                err.span_label(*span, format!("this function has {self_from_macro}"));
             } else {
                 let doesnt = if is_assoc_fn {
                     let (span, sugg) = fn_kind
@@ -1068,14 +1070,18 @@ impl<'a: 'ast, 'ast, 'tcx> LateResolutionVisitor<'a, '_, 'ast, 'tcx> {
                 }
             }
         } else if let Some(item_kind) = self.diag_metadata.current_item {
-            err.span_label(
-                item_kind.ident.span,
-                format!(
-                    "`self` not allowed in {} {}",
-                    item_kind.kind.article(),
-                    item_kind.kind.descr()
-                ),
-            );
+            if matches!(item_kind.kind, ItemKind::Delegation(..)) {
+                err.span_label(item_kind.span, format!("delegation supports {self_from_macro}"));
+            } else {
+                err.span_label(
+                    item_kind.ident.span,
+                    format!(
+                        "`self` not allowed in {} {}",
+                        item_kind.kind.article(),
+                        item_kind.kind.descr()
+                    ),
+                );
+            }
         }
         true
     }
@@ -1103,14 +1109,11 @@ impl<'a: 'ast, 'ast, 'tcx> LateResolutionVisitor<'a, '_, 'ast, 'tcx> {
                 Side::Start => (segment.ident.span.between(range.span), " @ ".into()),
                 Side::End => (range.span.to(segment.ident.span), format!("{} @ ..", segment.ident)),
             };
-            err.subdiagnostic(
-                self.r.dcx(),
-                errors::UnexpectedResUseAtOpInSlicePatWithRangeSugg {
-                    span,
-                    ident: segment.ident,
-                    snippet,
-                },
-            );
+            err.subdiagnostic(errors::UnexpectedResUseAtOpInSlicePatWithRangeSugg {
+                span,
+                ident: segment.ident,
+                snippet,
+            });
         }
 
         enum Side {
@@ -1202,13 +1205,10 @@ impl<'a: 'ast, 'ast, 'tcx> LateResolutionVisitor<'a, '_, 'ast, 'tcx> {
         });
 
         if let Some(param) = param {
-            err.subdiagnostic(
-                self.r.dcx(),
-                errors::UnexpectedResChangeTyToConstParamSugg {
-                    span: param.shrink_to_lo(),
-                    applicability,
-                },
-            );
+            err.subdiagnostic(errors::UnexpectedResChangeTyToConstParamSugg {
+                span: param.shrink_to_lo(),
+                applicability,
+            });
         }
     }
 
@@ -2041,8 +2041,11 @@ impl<'a: 'ast, 'ast, 'tcx> LateResolutionVisitor<'a, '_, 'ast, 'tcx> {
                         ast::AssocItemKind::Fn(..) => AssocSuggestion::AssocFn { called },
                         ast::AssocItemKind::Type(..) => AssocSuggestion::AssocType,
                         ast::AssocItemKind::Delegation(..)
-                            if self.r.delegation_fn_sigs[&self.r.local_def_id(assoc_item.id)]
-                                .has_self =>
+                            if self
+                                .r
+                                .delegation_fn_sigs
+                                .get(&self.r.local_def_id(assoc_item.id))
+                                .map_or(false, |sig| sig.has_self) =>
                         {
                             AssocSuggestion::MethodWithSelf { called }
                         }
@@ -3201,7 +3204,7 @@ impl<'a: 'ast, 'ast, 'tcx> LateResolutionVisitor<'a, '_, 'ast, 'tcx> {
                                 .inputs
                                 .iter()
                                 .filter_map(|param| match &param.ty.kind {
-                                    TyKind::ImplTrait(_, bounds, _) => Some(bounds),
+                                    TyKind::ImplTrait(_, bounds) => Some(bounds),
                                     _ => None,
                                 })
                                 .flat_map(|bounds| bounds.into_iter())
@@ -3390,11 +3393,11 @@ fn mk_where_bound_predicate(
         };
         let mut segments = ThinVec::from(preceding);
 
-        let added_constraint = ast::AngleBracketedArg::Constraint(ast::AssocConstraint {
+        let added_constraint = ast::AngleBracketedArg::Constraint(ast::AssocItemConstraint {
             id: DUMMY_NODE_ID,
             ident: last.ident,
             gen_args: None,
-            kind: ast::AssocConstraintKind::Equality {
+            kind: ast::AssocItemConstraintKind::Equality {
                 term: ast::Term::Ty(ast::ptr::P(ast::Ty {
                     kind: ast::TyKind::Path(None, poly_trait_ref.trait_ref.path.clone()),
                     id: DUMMY_NODE_ID,

@@ -41,6 +41,7 @@ use rustc_errors::{codes::*, struct_span_code_err, Applicability, Diag};
 use rustc_hir as hir;
 use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_hir_analysis::hir_ty_lowering::HirTyLowerer;
+use rustc_infer::infer::relate::RelateResult;
 use rustc_infer::infer::{Coercion, DefineOpaqueTypes, InferOk, InferResult};
 use rustc_infer::traits::{IfExpressionCause, MatchExpressionArmCause};
 use rustc_infer::traits::{Obligation, PredicateObligation};
@@ -51,7 +52,6 @@ use rustc_middle::ty::adjustment::{
     Adjust, Adjustment, AllowTwoPhase, AutoBorrow, AutoBorrowMutability, PointerCoercion,
 };
 use rustc_middle::ty::error::TypeError;
-use rustc_middle::ty::relate::RelateResult;
 use rustc_middle::ty::visit::TypeVisitableExt;
 use rustc_middle::ty::{self, GenericArgsRef, Ty, TyCtxt};
 use rustc_session::parse::feature_err;
@@ -113,7 +113,7 @@ fn simple<'tcx>(kind: Adjust<'tcx>) -> impl FnOnce(Ty<'tcx>) -> Vec<Adjustment<'
 fn success<'tcx>(
     adj: Vec<Adjustment<'tcx>>,
     target: Ty<'tcx>,
-    obligations: traits::PredicateObligations<'tcx>,
+    obligations: Vec<traits::PredicateObligation<'tcx>>,
 ) -> CoerceResult<'tcx> {
     Ok(InferOk { value: (adj, target), obligations })
 }
@@ -913,7 +913,7 @@ impl<'f, 'tcx> Coerce<'f, 'tcx> {
                 if self
                     .tcx
                     .upvars_mentioned(closure_def_id_a.expect_local())
-                    .map_or(true, |u| u.is_empty()) =>
+                    .is_none_or(|u| u.is_empty()) =>
             {
                 // We coerce the closure, which has fn type
                 //     `extern "rust-call" fn((arg0,arg1,...)) -> _`
@@ -1158,7 +1158,6 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             let (a_sig, b_sig) = self.normalize(new.span, (a_sig, b_sig));
             let sig = self
                 .at(cause, self.param_env)
-                .trace(prev_ty, new_ty)
                 .lub(DefineOpaqueTypes::Yes, a_sig, b_sig)
                 .map(|ok| self.register_infer_ok_obligations(ok))?;
 
@@ -1246,11 +1245,11 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     expr,
                 );
 
-                return self
+                return Err(self
                     .commit_if_ok(|_| {
-                        self.at(cause, self.param_env).lub(DefineOpaqueTypes::No, prev_ty, new_ty)
+                        self.at(cause, self.param_env).lub(DefineOpaqueTypes::Yes, prev_ty, new_ty)
                     })
-                    .map(|ok| self.register_infer_ok_obligations(ok));
+                    .unwrap_err());
             }
         }
 
@@ -1260,10 +1259,15 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 if let Some(e) = first_error {
                     Err(e)
                 } else {
-                    self.commit_if_ok(|_| {
-                        self.at(cause, self.param_env).lub(DefineOpaqueTypes::No, prev_ty, new_ty)
-                    })
-                    .map(|ok| self.register_infer_ok_obligations(ok))
+                    Err(self
+                        .commit_if_ok(|_| {
+                            self.at(cause, self.param_env).lub(
+                                DefineOpaqueTypes::Yes,
+                                prev_ty,
+                                new_ty,
+                            )
+                        })
+                        .unwrap_err())
                 }
             }
             Ok(ok) => {
@@ -1783,32 +1787,26 @@ impl<'tcx, 'exprs, E: AsCoercionSite> CoerceMany<'tcx, 'exprs, E> {
         }
 
         let rpid_def_span = fcx.tcx.def_span(rpit_def_id);
-        err.subdiagnostic(
-            fcx.tcx.dcx(),
-            SuggestBoxingForReturnImplTrait::ChangeReturnType {
-                start_sp: rpid_def_span.with_hi(rpid_def_span.lo() + BytePos(4)),
-                end_sp: rpid_def_span.shrink_to_hi(),
-            },
-        );
+        err.subdiagnostic(SuggestBoxingForReturnImplTrait::ChangeReturnType {
+            start_sp: rpid_def_span.with_hi(rpid_def_span.lo() + BytePos(4)),
+            end_sp: rpid_def_span.shrink_to_hi(),
+        });
 
         let (starts, ends) =
             arm_spans.map(|span| (span.shrink_to_lo(), span.shrink_to_hi())).unzip();
-        err.subdiagnostic(
-            fcx.tcx.dcx(),
-            SuggestBoxingForReturnImplTrait::BoxReturnExpr { starts, ends },
-        );
+        err.subdiagnostic(SuggestBoxingForReturnImplTrait::BoxReturnExpr { starts, ends });
     }
 
-    fn report_return_mismatched_types<'a>(
+    fn report_return_mismatched_types<'infcx>(
         &self,
         cause: &ObligationCause<'tcx>,
         expected: Ty<'tcx>,
         found: Ty<'tcx>,
         ty_err: TypeError<'tcx>,
-        fcx: &FnCtxt<'a, 'tcx>,
+        fcx: &'infcx FnCtxt<'_, 'tcx>,
         block_or_return_id: hir::HirId,
         expression: Option<&'tcx hir::Expr<'tcx>>,
-    ) -> Diag<'a> {
+    ) -> Diag<'infcx> {
         let mut err = fcx.err_ctxt().report_mismatched_types(cause, expected, found, ty_err);
 
         let due_to_block = matches!(fcx.tcx.hir_node(block_or_return_id), hir::Node::Block(..));
@@ -1871,11 +1869,8 @@ impl<'tcx, 'exprs, E: AsCoercionSite> CoerceMany<'tcx, 'exprs, E> {
         // If this is due to a block, then maybe we forgot a `return`/`break`.
         if due_to_block
             && let Some(expr) = expression
-            && let Some((parent_fn_decl, parent_id)) = fcx
-                .tcx
-                .hir()
-                .parent_iter(block_or_return_id)
-                .find_map(|(_, node)| Some((node.fn_decl()?, node.associated_body()?.0)))
+            && let Some(parent_fn_decl) =
+                fcx.tcx.hir().fn_decl_by_hir_id(fcx.tcx.local_def_id_to_hir_id(fcx.body_id))
         {
             fcx.suggest_missing_break_or_return_expr(
                 &mut err,
@@ -1884,7 +1879,7 @@ impl<'tcx, 'exprs, E: AsCoercionSite> CoerceMany<'tcx, 'exprs, E> {
                 expected,
                 found,
                 block_or_return_id,
-                parent_id,
+                fcx.body_id,
             );
         }
 

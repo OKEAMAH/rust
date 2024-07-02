@@ -111,7 +111,6 @@ chalk-solve = { version = "0.97.0", default-features = false }
 chalk-ir = "0.97.0"
 chalk-recursive = { version = "0.97.0", default-features = false }
 chalk-derive = "0.97.0"
-command-group = "2.0.1"
 crossbeam-channel = "0.5.8"
 dissimilar = "1.0.7"
 dot = "0.1.4"
@@ -132,6 +131,7 @@ object = { version = "0.33.0", default-features = false, features = [
     "macho",
     "pe",
 ] }
+process-wrap = { version = "8.0.2", features = ["std"] }
 pulldown-cmark-to-cmark = "10.0.4"
 pulldown-cmark = { version = "0.9.0", default-features = false }
 rayon = "1.8.0"
@@ -162,7 +162,11 @@ xshell = "0.2.5"
 dashmap = { version = "=5.5.3", features = ["raw-api"] }
 
 [workspace.lints.rust]
-rust_2018_idioms = "warn"
+bare_trait_objects = "warn"
+elided_lifetimes_in_paths = "warn"
+ellipsis_inclusive_range_patterns = "warn"
+explicit_outlives_requirements = "warn"
+unused_extern_crates = "warn"
 unused_lifetimes = "warn"
 unreachable_pub = "warn"
 semicolon_in_expressions_from_macros = "warn"

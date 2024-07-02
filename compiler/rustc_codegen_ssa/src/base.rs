@@ -29,8 +29,8 @@ use rustc_middle::middle::debugger_visualizer::{DebuggerVisualizerFile, Debugger
 use rustc_middle::middle::exported_symbols;
 use rustc_middle::middle::exported_symbols::SymbolExportKind;
 use rustc_middle::middle::lang_items;
-use rustc_middle::mir::BinOp;
 use rustc_middle::mir::mono::{CodegenUnit, CodegenUnitNameBuilder, MonoItem};
+use rustc_middle::mir::BinOp;
 use rustc_middle::query::Providers;
 use rustc_middle::ty::layout::{HasTyCtxt, LayoutOf, TyAndLayout};
 use rustc_middle::ty::{self, Instance, Ty, TyCtxt};
@@ -45,6 +45,7 @@ use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
 use itertools::Itertools;
+use tracing::{debug, info};
 
 pub fn bin_op_to_icmp_predicate(op: BinOp, signed: bool) -> IntPredicate {
     match op {
@@ -162,8 +163,7 @@ pub fn unsized_info<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
 
             // trait upcasting coercion
 
-            let vptr_entry_idx =
-                cx.tcx().vtable_trait_upcasting_coercion_new_vptr_slot((source, target));
+            let vptr_entry_idx = cx.tcx().supertrait_vtable_slot((source, target));
 
             if let Some(entry_idx) = vptr_entry_idx {
                 let ptr_size = bx.data_layout().pointer_size;
@@ -293,12 +293,13 @@ pub fn coerce_unsized_into<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
     }
 }
 
-/// Returns `rhs` sufficiently masked, truncated, and/or extended so that
-/// it can be used to shift `lhs`.
+/// Returns `rhs` sufficiently masked, truncated, and/or extended so that it can be used to shift
+/// `lhs`: it has the same size as `lhs`, and the value, when interpreted unsigned (no matter its
+/// type), will not exceed the size of `lhs`.
 ///
-/// Shifts in MIR are all allowed to have mismatched LHS & RHS types.
+/// Shifts in MIR are all allowed to have mismatched LHS & RHS types, and signed RHS.
 /// The shift methods in `BuilderMethods`, however, are fully homogeneous
-/// (both parameters and the return type are all the same type).
+/// (both parameters and the return type are all the same size) and assume an unsigned RHS.
 ///
 /// If `is_unchecked` is false, this masks the RHS to ensure it stays in-bounds,
 /// as the `BuilderMethods` shifts are UB for out-of-bounds shift amounts.
@@ -539,7 +540,7 @@ pub fn collect_debugger_visualizers_transitive(
     tcx.debugger_visualizers(LOCAL_CRATE)
         .iter()
         .chain(
-            tcx.used_crates(())
+            tcx.crates(())
                 .iter()
                 .filter(|&cnum| {
                     let used_crate_source = tcx.used_crate_source(*cnum);
@@ -849,7 +850,7 @@ impl CrateInfo {
         // `compiler_builtins` are always placed last to ensure that they're linked correctly.
         used_crates.extend(compiler_builtins);
 
-        let crates = tcx.used_crates(());
+        let crates = tcx.crates(());
         let n_crates = crates.len();
         let mut info = CrateInfo {
             target_cpu,

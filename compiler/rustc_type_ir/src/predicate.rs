@@ -7,9 +7,9 @@ use rustc_type_ir_macros::{Lift_Generic, TypeFoldable_Generic, TypeVisitable_Gen
 
 use crate::inherent::*;
 use crate::lift::Lift;
-use crate::upcast::Upcast;
+use crate::upcast::{Upcast, UpcastFrom};
 use crate::visit::TypeVisitableExt as _;
-use crate::{self as ty, DebugWithInfcx, InferCtxtLike, Interner, WithInfcx};
+use crate::{self as ty, Interner};
 
 /// `A: 'region`
 #[derive(derivative::Derivative)]
@@ -64,36 +64,45 @@ pub struct TraitRef<I: Interner> {
     pub def_id: I::DefId,
     pub args: I::GenericArgs,
     /// This field exists to prevent the creation of `TraitRef` without
-    /// calling [`TraitRef::new`].
+    /// calling [`TraitRef::new_from_args`].
     _use_trait_ref_new_instead: (),
 }
 
 impl<I: Interner> TraitRef<I> {
+    pub fn new_from_args(interner: I, trait_def_id: I::DefId, args: I::GenericArgs) -> Self {
+        interner.debug_assert_args_compatible(trait_def_id, args);
+        Self { def_id: trait_def_id, args, _use_trait_ref_new_instead: () }
+    }
+
     pub fn new(
         interner: I,
         trait_def_id: I::DefId,
         args: impl IntoIterator<Item: Into<I::GenericArg>>,
     ) -> Self {
-        let args = interner.check_and_mk_args(trait_def_id, args);
-        Self { def_id: trait_def_id, args, _use_trait_ref_new_instead: () }
+        let args = interner.mk_args_from_iter(args.into_iter().map(Into::into));
+        Self::new_from_args(interner, trait_def_id, args)
     }
 
     pub fn from_method(interner: I, trait_id: I::DefId, args: I::GenericArgs) -> TraitRef<I> {
         let generics = interner.generics_of(trait_id);
-        TraitRef::new(interner, trait_id, args.into_iter().take(generics.count()))
+        TraitRef::new(interner, trait_id, args.iter().take(generics.count()))
     }
 
     /// Returns a `TraitRef` of the form `P0: Foo<P1..Pn>` where `Pi`
     /// are the parameters defined on trait.
     pub fn identity(interner: I, def_id: I::DefId) -> TraitRef<I> {
-        TraitRef::new(interner, def_id, I::GenericArgs::identity_for_item(interner, def_id))
+        TraitRef::new_from_args(
+            interner,
+            def_id,
+            I::GenericArgs::identity_for_item(interner, def_id),
+        )
     }
 
     pub fn with_self_ty(self, interner: I, self_ty: I::Ty) -> Self {
         TraitRef::new(
             interner,
             self.def_id,
-            [self_ty.into()].into_iter().chain(self.args.into_iter().skip(1)),
+            [self_ty.into()].into_iter().chain(self.args.iter().skip(1)),
         )
     }
 
@@ -163,6 +172,12 @@ impl<I: Interner> ty::Binder<I, TraitPredicate<I>> {
     #[inline]
     pub fn polarity(self) -> PredicatePolarity {
         self.skip_binder().polarity
+    }
+}
+
+impl<I: Interner> UpcastFrom<I, TraitRef<I>> for TraitPredicate<I> {
+    fn upcast_from(from: TraitRef<I>, _tcx: I) -> Self {
+        TraitPredicate { trait_ref: from, polarity: PredicatePolarity::Positive }
     }
 }
 
@@ -248,16 +263,6 @@ pub enum ExistentialPredicate<I: Interner> {
     AutoTrait(I::DefId),
 }
 
-// FIXME: Implement this the right way after
-impl<I: Interner> DebugWithInfcx<I> for ExistentialPredicate<I> {
-    fn fmt<Infcx: rustc_type_ir::InferCtxtLike<Interner = I>>(
-        this: rustc_type_ir::WithInfcx<'_, Infcx, &Self>,
-        f: &mut fmt::Formatter<'_>,
-    ) -> fmt::Result {
-        fmt::Debug::fmt(&this.data, f)
-    }
-}
-
 impl<I: Interner> ty::Binder<I, ExistentialPredicate<I>> {
     /// Given an existential predicate like `?Self: PartialEq<u32>` (e.g., derived from `dyn PartialEq<u32>`),
     /// and a concrete type `self_ty`, returns a full predicate where the existentially quantified variable `?Self`
@@ -278,7 +283,7 @@ impl<I: Interner> ty::Binder<I, ExistentialPredicate<I>> {
                     // If this is an ill-formed auto trait, then synthesize
                     // new error args for the missing generics.
                     let err_args = GenericArgs::extend_with_error(tcx, did, &[self_ty.into()]);
-                    ty::TraitRef::new(tcx, did, err_args)
+                    ty::TraitRef::new_from_args(tcx, did, err_args)
                 };
                 self.rebind(trait_ref).upcast(tcx)
             }
@@ -315,7 +320,7 @@ impl<I: Interner> ExistentialTraitRef<I> {
 
         ExistentialTraitRef {
             def_id: trait_ref.def_id,
-            args: interner.mk_args(&trait_ref.args[1..]),
+            args: interner.mk_args(&trait_ref.args.as_slice()[1..]),
         }
     }
 
@@ -327,11 +332,7 @@ impl<I: Interner> ExistentialTraitRef<I> {
         // otherwise the escaping vars would be captured by the binder
         // debug_assert!(!self_ty.has_escaping_bound_vars());
 
-        TraitRef::new(
-            interner,
-            self.def_id,
-            [self_ty.into()].into_iter().chain(self.args.into_iter()),
-        )
+        TraitRef::new(interner, self.def_id, [self_ty.into()].into_iter().chain(self.args.iter()))
     }
 }
 
@@ -374,7 +375,7 @@ impl<I: Interner> ExistentialProjection<I> {
     pub fn trait_ref(&self, interner: I) -> ExistentialTraitRef<I> {
         let def_id = interner.parent(self.def_id);
         let args_count = interner.generics_of(def_id).count() - 1;
-        let args = interner.mk_args(&self.args[..args_count]);
+        let args = interner.mk_args(&self.args.as_slice()[..args_count]);
         ExistentialTraitRef { def_id, args }
     }
 
@@ -386,7 +387,7 @@ impl<I: Interner> ExistentialProjection<I> {
             projection_term: AliasTerm::new(
                 interner,
                 self.def_id,
-                [self_ty.into()].into_iter().chain(self.args),
+                [self_ty.into()].iter().chain(self.args.iter()),
             ),
             term: self.term,
         }
@@ -398,7 +399,7 @@ impl<I: Interner> ExistentialProjection<I> {
 
         Self {
             def_id: projection_predicate.projection_term.def_id,
-            args: interner.mk_args(&projection_predicate.projection_term.args[1..]),
+            args: interner.mk_args(&projection_predicate.projection_term.args.as_slice()[1..]),
             term: projection_predicate.term,
         }
     }
@@ -459,7 +460,8 @@ impl AliasTermKind {
     Copy(bound = ""),
     Hash(bound = ""),
     PartialEq(bound = ""),
-    Eq(bound = "")
+    Eq(bound = ""),
+    Debug(bound = "")
 )]
 #[derive(TypeVisitable_Generic, TypeFoldable_Generic, Lift_Generic)]
 #[cfg_attr(feature = "nightly", derive(TyDecodable, TyEncodable, HashStable_NoContext))]
@@ -488,36 +490,24 @@ pub struct AliasTerm<I: Interner> {
     /// aka. `interner.parent(def_id)`.
     pub def_id: I::DefId,
 
-    /// This field exists to prevent the creation of `AliasTerm` without using
-    /// [AliasTerm::new].
+    /// This field exists to prevent the creation of `AliasTerm` without using [`AliasTerm::new_from_args`].
+    #[derivative(Debug = "ignore")]
     _use_alias_term_new_instead: (),
 }
 
-impl<I: Interner> std::fmt::Debug for AliasTerm<I> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        WithInfcx::with_no_infcx(self).fmt(f)
-    }
-}
-impl<I: Interner> DebugWithInfcx<I> for AliasTerm<I> {
-    fn fmt<Infcx: InferCtxtLike<Interner = I>>(
-        this: WithInfcx<'_, Infcx, &Self>,
-        f: &mut std::fmt::Formatter<'_>,
-    ) -> std::fmt::Result {
-        f.debug_struct("AliasTerm")
-            .field("args", &this.map(|data| data.args))
-            .field("def_id", &this.data.def_id)
-            .finish()
-    }
-}
-
 impl<I: Interner> AliasTerm<I> {
+    pub fn new_from_args(interner: I, def_id: I::DefId, args: I::GenericArgs) -> AliasTerm<I> {
+        interner.debug_assert_args_compatible(def_id, args);
+        AliasTerm { def_id, args, _use_alias_term_new_instead: () }
+    }
+
     pub fn new(
         interner: I,
         def_id: I::DefId,
         args: impl IntoIterator<Item: Into<I::GenericArg>>,
     ) -> AliasTerm<I> {
-        let args = interner.check_and_mk_args(def_id, args);
-        AliasTerm { def_id, args, _use_alias_term_new_instead: () }
+        let args = interner.mk_args_from_iter(args.into_iter().map(Into::into));
+        Self::new_from_args(interner, def_id, args)
     }
 
     pub fn expect_ty(self, interner: I) -> ty::AliasTy<I> {
@@ -567,7 +557,6 @@ impl<I: Interner> AliasTerm<I> {
                 I::Const::new_unevaluated(
                     interner,
                     ty::UnevaluatedConst::new(self.def_id, self.args),
-                    interner.type_of_instantiated(self.def_id, self.args),
                 )
                 .into()
             }
@@ -585,7 +574,7 @@ impl<I: Interner> AliasTerm<I> {
         AliasTerm::new(
             interner,
             self.def_id,
-            [self_ty.into()].into_iter().chain(self.args.into_iter().skip(1)),
+            [self_ty.into()].into_iter().chain(self.args.iter().skip(1)),
         )
     }
 
@@ -604,7 +593,7 @@ impl<I: Interner> AliasTerm<I> {
     /// For example, if this is a projection of `<T as StreamingIterator>::Item<'a>`,
     /// then this function would return a `T: StreamingIterator` trait reference and
     /// `['a]` as the own args.
-    pub fn trait_ref_and_own_args(self, interner: I) -> (TraitRef<I>, I::OwnItemArgs) {
+    pub fn trait_ref_and_own_args(self, interner: I) -> (TraitRef<I>, I::GenericArgsSlice) {
         interner.trait_ref_and_own_args_for_alias(self.def_id, self.args)
     }
 
@@ -793,4 +782,37 @@ pub struct SubtypePredicate<I: Interner> {
 pub struct CoercePredicate<I: Interner> {
     pub a: I::Ty,
     pub b: I::Ty,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "nightly", derive(HashStable_NoContext, TyEncodable, TyDecodable))]
+pub enum BoundConstness {
+    /// `Type: Trait`
+    NotConst,
+    /// `Type: const Trait`
+    Const,
+    /// `Type: ~const Trait`
+    ///
+    /// Requires resolving to const only when we are in a const context.
+    ConstIfConst,
+}
+
+impl BoundConstness {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotConst => "",
+            Self::Const => "const",
+            Self::ConstIfConst => "~const",
+        }
+    }
+}
+
+impl fmt::Display for BoundConstness {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotConst => f.write_str("normal"),
+            Self::Const => f.write_str("const"),
+            Self::ConstIfConst => f.write_str("~const"),
+        }
+    }
 }

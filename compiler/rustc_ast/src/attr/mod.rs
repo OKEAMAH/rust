@@ -1,6 +1,8 @@
 //! Functions dealing with attributes and meta items.
 
-use crate::ast::{AttrArgs, AttrArgsEq, AttrId, AttrItem, AttrKind, AttrStyle, AttrVec, Attribute};
+use crate::ast::{
+    AttrArgs, AttrArgsEq, AttrId, AttrItem, AttrKind, AttrStyle, AttrVec, Attribute, Safety,
+};
 use crate::ast::{DelimArgs, Expr, ExprKind, LitKind, MetaItemLit};
 use crate::ast::{MetaItem, MetaItemKind, NestedMetaItem, NormalAttr};
 use crate::ast::{Path, PathSegment, DUMMY_NODE_ID};
@@ -238,7 +240,12 @@ impl AttrItem {
     }
 
     pub fn meta(&self, span: Span) -> Option<MetaItem> {
-        Some(MetaItem { path: self.path.clone(), kind: self.meta_kind()?, span })
+        Some(MetaItem {
+            unsafety: Safety::Default,
+            path: self.path.clone(),
+            kind: self.meta_kind()?,
+            span,
+        })
     }
 
     pub fn meta_kind(&self) -> Option<MetaItemKind> {
@@ -320,7 +327,8 @@ impl MetaItem {
         I: Iterator<Item = &'a TokenTree>,
     {
         // FIXME: Share code with `parse_path`.
-        let path = match tokens.next().map(|tt| TokenTree::uninterpolate(tt)).as_deref() {
+        let tt = tokens.next().map(|tt| TokenTree::uninterpolate(tt));
+        let path = match tt.as_deref() {
             Some(&TokenTree::Token(
                 Token { kind: ref kind @ (token::Ident(..) | token::PathSep), span },
                 _,
@@ -361,6 +369,12 @@ impl MetaItem {
                 token::Nonterminal::NtPath(path) => (**path).clone(),
                 _ => return None,
             },
+            Some(TokenTree::Token(
+                Token { kind: token::OpenDelim(_) | token::CloseDelim(_), .. },
+                _,
+            )) => {
+                panic!("Should be `AttrTokenTree::Delimited`, not delim tokens: {:?}", tt);
+            }
             _ => return None,
         };
         let list_closing_paren_pos = tokens.peek().map(|tt| tt.span().hi());
@@ -371,7 +385,10 @@ impl MetaItem {
             _ => path.span.hi(),
         };
         let span = path.span.with_hi(hi);
-        Some(MetaItem { path, kind, span })
+        // FIXME: This parses `unsafe()` not as unsafe attribute syntax in `MetaItem`,
+        // but as a parenthesized list. This (and likely `MetaItem`) should be changed in
+        // such a way that builtin macros don't accept extraneous `unsafe()`.
+        Some(MetaItem { unsafety: Safety::Default, path, kind, span })
     }
 }
 
@@ -555,11 +572,12 @@ pub fn mk_doc_comment(
 pub fn mk_attr(
     g: &AttrIdGenerator,
     style: AttrStyle,
+    unsafety: Safety,
     path: Path,
     args: AttrArgs,
     span: Span,
 ) -> Attribute {
-    mk_attr_from_item(g, AttrItem { path, args, tokens: None }, None, style, span)
+    mk_attr_from_item(g, AttrItem { unsafety, path, args, tokens: None }, None, style, span)
 }
 
 pub fn mk_attr_from_item(
@@ -577,15 +595,22 @@ pub fn mk_attr_from_item(
     }
 }
 
-pub fn mk_attr_word(g: &AttrIdGenerator, style: AttrStyle, name: Symbol, span: Span) -> Attribute {
+pub fn mk_attr_word(
+    g: &AttrIdGenerator,
+    style: AttrStyle,
+    unsafety: Safety,
+    name: Symbol,
+    span: Span,
+) -> Attribute {
     let path = Path::from_ident(Ident::new(name, span));
     let args = AttrArgs::Empty;
-    mk_attr(g, style, path, args, span)
+    mk_attr(g, style, unsafety, path, args, span)
 }
 
 pub fn mk_attr_nested_word(
     g: &AttrIdGenerator,
     style: AttrStyle,
+    unsafety: Safety,
     outer: Symbol,
     inner: Symbol,
     span: Span,
@@ -601,12 +626,13 @@ pub fn mk_attr_nested_word(
         delim: Delimiter::Parenthesis,
         tokens: inner_tokens,
     });
-    mk_attr(g, style, path, attr_args, span)
+    mk_attr(g, style, unsafety, path, attr_args, span)
 }
 
 pub fn mk_attr_name_value_str(
     g: &AttrIdGenerator,
     style: AttrStyle,
+    unsafety: Safety,
     name: Symbol,
     val: Symbol,
     span: Span,
@@ -621,7 +647,7 @@ pub fn mk_attr_name_value_str(
     });
     let path = Path::from_ident(Ident::new(name, span));
     let args = AttrArgs::Eq(span, AttrArgsEq::Ast(expr));
-    mk_attr(g, style, path, args, span)
+    mk_attr(g, style, unsafety, path, args, span)
 }
 
 pub fn filter_by_name(attrs: &[Attribute], name: Symbol) -> impl Iterator<Item = &Attribute> {

@@ -4,7 +4,7 @@ use rustc_errors::{Applicability, Diag};
 use rustc_hir as hir;
 use rustc_hir::def::Res;
 use rustc_hir::intravisit::Visitor;
-use rustc_infer::infer::{DefineOpaqueTypes, InferOk};
+use rustc_infer::infer::DefineOpaqueTypes;
 use rustc_middle::bug;
 use rustc_middle::ty::adjustment::AllowTwoPhase;
 use rustc_middle::ty::error::{ExpectedFound, TypeError};
@@ -166,64 +166,58 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     /// Requires that the two types unify, and prints an error message if
     /// they don't.
     pub fn demand_suptype(&self, sp: Span, expected: Ty<'tcx>, actual: Ty<'tcx>) {
-        if let Some(e) = self.demand_suptype_diag(sp, expected, actual) {
+        if let Err(e) = self.demand_suptype_diag(sp, expected, actual) {
             e.emit();
         }
     }
 
     pub fn demand_suptype_diag(
-        &self,
+        &'a self,
         sp: Span,
         expected: Ty<'tcx>,
         actual: Ty<'tcx>,
-    ) -> Option<Diag<'tcx>> {
+    ) -> Result<(), Diag<'a>> {
         self.demand_suptype_with_origin(&self.misc(sp), expected, actual)
     }
 
     #[instrument(skip(self), level = "debug")]
     pub fn demand_suptype_with_origin(
-        &self,
+        &'a self,
         cause: &ObligationCause<'tcx>,
         expected: Ty<'tcx>,
         actual: Ty<'tcx>,
-    ) -> Option<Diag<'tcx>> {
-        match self.at(cause, self.param_env).sup(DefineOpaqueTypes::Yes, expected, actual) {
-            Ok(InferOk { obligations, value: () }) => {
-                self.register_predicates(obligations);
-                None
-            }
-            Err(e) => Some(self.err_ctxt().report_mismatched_types(cause, expected, actual, e)),
-        }
+    ) -> Result<(), Diag<'a>> {
+        self.at(cause, self.param_env)
+            .sup(DefineOpaqueTypes::Yes, expected, actual)
+            .map(|infer_ok| self.register_infer_ok_obligations(infer_ok))
+            .map_err(|e| self.err_ctxt().report_mismatched_types(cause, expected, actual, e))
     }
 
     pub fn demand_eqtype(&self, sp: Span, expected: Ty<'tcx>, actual: Ty<'tcx>) {
-        if let Some(err) = self.demand_eqtype_diag(sp, expected, actual) {
+        if let Err(err) = self.demand_eqtype_diag(sp, expected, actual) {
             err.emit();
         }
     }
 
     pub fn demand_eqtype_diag(
-        &self,
+        &'a self,
         sp: Span,
         expected: Ty<'tcx>,
         actual: Ty<'tcx>,
-    ) -> Option<Diag<'tcx>> {
+    ) -> Result<(), Diag<'a>> {
         self.demand_eqtype_with_origin(&self.misc(sp), expected, actual)
     }
 
     pub fn demand_eqtype_with_origin(
-        &self,
+        &'a self,
         cause: &ObligationCause<'tcx>,
         expected: Ty<'tcx>,
         actual: Ty<'tcx>,
-    ) -> Option<Diag<'tcx>> {
-        match self.at(cause, self.param_env).eq(DefineOpaqueTypes::Yes, expected, actual) {
-            Ok(InferOk { obligations, value: () }) => {
-                self.register_predicates(obligations);
-                None
-            }
-            Err(e) => Some(self.err_ctxt().report_mismatched_types(cause, expected, actual, e)),
-        }
+    ) -> Result<(), Diag<'a>> {
+        self.at(cause, self.param_env)
+            .eq(DefineOpaqueTypes::Yes, expected, actual)
+            .map(|infer_ok| self.register_infer_ok_obligations(infer_ok))
+            .map_err(|e| self.err_ctxt().report_mismatched_types(cause, expected, actual, e))
     }
 
     pub fn demand_coerce(
@@ -234,12 +228,17 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         expected_ty_expr: Option<&'tcx hir::Expr<'tcx>>,
         allow_two_phase: AllowTwoPhase,
     ) -> Ty<'tcx> {
-        let (ty, err) =
-            self.demand_coerce_diag(expr, checked_ty, expected, expected_ty_expr, allow_two_phase);
-        if let Some(err) = err {
-            err.emit();
+        match self.demand_coerce_diag(expr, checked_ty, expected, expected_ty_expr, allow_two_phase)
+        {
+            Ok(ty) => ty,
+            Err(err) => {
+                err.emit();
+                // Return the original type instead of an error type here, otherwise the type of `x` in
+                // `let x: u32 = ();` will be a type error, causing all subsequent usages of `x` to not
+                // report errors, even though `x` is definitely `u32`.
+                expected
+            }
         }
-        ty
     }
 
     /// Checks that the type of `expr` can be coerced to `expected`.
@@ -248,17 +247,17 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     /// will be permitted if the diverges flag is currently "always".
     #[instrument(level = "debug", skip(self, expr, expected_ty_expr, allow_two_phase))]
     pub fn demand_coerce_diag(
-        &self,
+        &'a self,
         mut expr: &'tcx hir::Expr<'tcx>,
         checked_ty: Ty<'tcx>,
         expected: Ty<'tcx>,
         mut expected_ty_expr: Option<&'tcx hir::Expr<'tcx>>,
         allow_two_phase: AllowTwoPhase,
-    ) -> (Ty<'tcx>, Option<Diag<'tcx>>) {
+    ) -> Result<Ty<'tcx>, Diag<'a>> {
         let expected = self.resolve_vars_with_obligations(expected);
 
         let e = match self.coerce(expr, checked_ty, expected, allow_two_phase, None) {
-            Ok(ty) => return (ty, None),
+            Ok(ty) => return Ok(ty),
             Err(e) => e,
         };
 
@@ -275,7 +274,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
 
         self.emit_coerce_suggestions(&mut err, expr, expr_ty, expected, expected_ty_expr, Some(e));
 
-        (expected, Some(err))
+        Err(err)
     }
 
     /// Notes the point at which a variable is constrained to some type incompatible
@@ -327,8 +326,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         }
 
         let mut expr_finder = FindExprs { hir_id: local_hir_id, uses: init.into_iter().collect() };
-        let body =
-            hir.body(hir.maybe_body_owned_by(self.body_id).expect("expected item to have body"));
+        let body = hir.body_owned_by(self.body_id);
         expr_finder.visit_expr(body.value);
 
         // Replaces all of the variables in the given type with a fresh inference variable.
@@ -351,7 +349,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             lt_op: |_| self.tcx.lifetimes.re_erased,
             ct_op: |ct| {
                 if let ty::ConstKind::Infer(_) = ct.kind() {
-                    self.next_const_var(ct.ty(), DUMMY_SP)
+                    self.next_const_var(DUMMY_SP)
                 } else {
                     ct
                 }
@@ -828,7 +826,8 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         ) else {
             return;
         };
-        let in_scope_methods = self.probe_for_name_many(
+
+        let Ok(in_scope_methods) = self.probe_for_name_many(
             probe::Mode::MethodCall,
             path.ident,
             Some(expected),
@@ -836,11 +835,14 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             self_ty,
             deref.hir_id,
             probe::ProbeScope::TraitsInScope,
-        );
+        ) else {
+            return;
+        };
+
         let other_methods_in_scope: Vec<_> =
             in_scope_methods.iter().filter(|c| c.item.def_id != pick.item.def_id).collect();
 
-        let all_methods = self.probe_for_name_many(
+        let Ok(all_methods) = self.probe_for_name_many(
             probe::Mode::MethodCall,
             path.ident,
             Some(expected),
@@ -848,7 +850,10 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             self_ty,
             deref.hir_id,
             probe::ProbeScope::AllTraits,
-        );
+        ) else {
+            return;
+        };
+
         let suggestions: Vec<_> = all_methods
             .into_iter()
             .filter(|c| c.item.def_id != pick.item.def_id)

@@ -23,6 +23,7 @@ use rustc_span::{Span, DUMMY_SP};
 use std::fmt::Write;
 use std::mem;
 use thin_vec::{thin_vec, ThinVec};
+use tracing::debug;
 
 impl<'a> Parser<'a> {
     /// Parses a source module as a crate. This is the main entry point for the parser.
@@ -225,10 +226,11 @@ impl<'a> Parser<'a> {
             self.expect_keyword(kw::Extern)?;
             self.parse_item_foreign_mod(attrs, safety)?
         } else if self.is_static_global() {
+            let safety = self.parse_safety(Case::Sensitive);
             // STATIC ITEM
             self.bump(); // `static`
             let mutability = self.parse_mutability();
-            let (ident, item) = self.parse_static_item(mutability)?;
+            let (ident, item) = self.parse_static_item(safety, mutability)?;
             (ident, ItemKind::Static(Box::new(item)))
         } else if let Const::Yes(const_span) = self.parse_constness(Case::Sensitive) {
             // CONST ITEM
@@ -631,7 +633,7 @@ impl<'a> Parser<'a> {
                     // This notably includes paths passed through `ty` macro fragments (#46438).
                     TyKind::Path(None, path) => path,
                     other => {
-                        if let TyKind::ImplTrait(_, bounds, None) = other
+                        if let TyKind::ImplTrait(_, bounds) = other
                             && let [bound] = bounds.as_slice()
                         {
                             // Suggest removing extra `impl` keyword:
@@ -705,15 +707,25 @@ impl<'a> Parser<'a> {
         };
 
         let (ident, item_kind) = if self.eat(&token::PathSep) {
-            let (suffixes, _) = self.parse_delim_comma_seq(Delimiter::Brace, |p| {
-                Ok((p.parse_path_segment_ident()?, rename(p)?))
-            })?;
+            let suffixes = if self.eat(&token::BinOp(token::Star)) {
+                None
+            } else {
+                let parse_suffix = |p: &mut Self| Ok((p.parse_path_segment_ident()?, rename(p)?));
+                Some(self.parse_delim_comma_seq(Delimiter::Brace, parse_suffix)?.0)
+            };
             let deleg = DelegationMac { qself, prefix: path, suffixes, body: body(self)? };
             (Ident::empty(), ItemKind::DelegationMac(Box::new(deleg)))
         } else {
             let rename = rename(self)?;
             let ident = rename.unwrap_or_else(|| path.segments.last().unwrap().ident);
-            let deleg = Delegation { id: DUMMY_NODE_ID, qself, path, rename, body: body(self)? };
+            let deleg = Delegation {
+                id: DUMMY_NODE_ID,
+                qself,
+                path,
+                rename,
+                body: body(self)?,
+                from_glob: false,
+            };
             (ident, ItemKind::Delegation(Box::new(deleg)))
         };
 
@@ -951,7 +963,7 @@ impl<'a> Parser<'a> {
                 let kind = match AssocItemKind::try_from(kind) {
                     Ok(kind) => kind,
                     Err(kind) => match kind {
-                        ItemKind::Static(box StaticItem { ty, mutability: _, expr }) => {
+                        ItemKind::Static(box StaticItem { ty, safety: _, mutability: _, expr }) => {
                             self.dcx().emit_err(errors::AssociatedStaticItemNotAllowed { span });
                             AssocItemKind::Const(Box::new(ConstItem {
                                 defaultness: Defaultness::Final,
@@ -1216,10 +1228,11 @@ impl<'a> Parser<'a> {
                                 ident_span: ident.span,
                                 const_span,
                             });
-                            ForeignItemKind::Static(Box::new(StaticForeignItem {
+                            ForeignItemKind::Static(Box::new(StaticItem {
                                 ty,
                                 mutability: Mutability::Not,
                                 expr,
+                                safety: Safety::Default,
                             }))
                         }
                         _ => return self.error_bad_item_kind(span, &kind, "`extern` blocks"),
@@ -1234,7 +1247,11 @@ impl<'a> Parser<'a> {
         // FIXME(#100717): needs variant for each `ItemKind` (instead of using `ItemKind::descr()`)
         let span = self.psess.source_map().guess_head_span(span);
         let descr = kind.descr();
-        self.dcx().emit_err(errors::BadItemKind { span, descr, ctx });
+        let help = match kind {
+            ItemKind::DelegationMac(deleg) if deleg.suffixes.is_none() => None,
+            _ => Some(()),
+        };
+        self.dcx().emit_err(errors::BadItemKind { span, descr, ctx, help });
         None
     }
 
@@ -1242,7 +1259,7 @@ impl<'a> Parser<'a> {
         self.token.is_keyword(kw::Unsafe)
             && self.is_keyword_ahead(1, &[kw::Extern])
             && self.look_ahead(
-                2 + self.look_ahead(2, |t| t.can_begin_literal_maybe_minus() as usize),
+                2 + self.look_ahead(2, |t| t.can_begin_string_literal() as usize),
                 |t| t.kind == token::OpenDelim(Delimiter::Brace),
             )
     }
@@ -1257,7 +1274,10 @@ impl<'a> Parser<'a> {
                 matches!(token.kind, token::BinOp(token::Or) | token::OrOr)
             })
         } else {
-            false
+            let quals: &[Symbol] = &[kw::Unsafe, kw::Safe];
+            // `$qual static`
+            quals.iter().any(|&kw| self.check_keyword(kw))
+                && self.look_ahead(1, |t| t.is_keyword(kw::Static))
         }
     }
 
@@ -1318,7 +1338,11 @@ impl<'a> Parser<'a> {
     /// ```ebnf
     /// Static = "static" "mut"? $ident ":" $ty (= $expr)? ";" ;
     /// ```
-    fn parse_static_item(&mut self, mutability: Mutability) -> PResult<'a, (Ident, StaticItem)> {
+    fn parse_static_item(
+        &mut self,
+        safety: Safety,
+        mutability: Mutability,
+    ) -> PResult<'a, (Ident, StaticItem)> {
         let ident = self.parse_ident()?;
 
         if self.token.kind == TokenKind::Lt && self.may_recover() {
@@ -1339,7 +1363,7 @@ impl<'a> Parser<'a> {
 
         self.expect_semi()?;
 
-        Ok((ident, StaticItem { ty, mutability, expr }))
+        Ok((ident, StaticItem { ty, safety, mutability, expr }))
     }
 
     /// Parse a constant item with the prefix `"const"` already parsed.
@@ -1956,7 +1980,7 @@ impl<'a> Parser<'a> {
         if self.token.kind == token::Not {
             if let Err(mut err) = self.unexpected() {
                 // Encounter the macro invocation
-                err.subdiagnostic(self.dcx(), MacroExpandsToAdtField { adt_ty });
+                err.subdiagnostic(MacroExpandsToAdtField { adt_ty });
                 return Err(err);
             }
         }
@@ -2255,7 +2279,7 @@ pub(crate) struct FnParseMode {
     ///     to true.
     ///   * The span is from Edition 2015. In particular, you can get a
     ///     2015 span inside a 2021 crate using macros.
-    pub req_name: ReqName,
+    pub(super) req_name: ReqName,
     /// If this flag is set to `true`, then plain, semicolon-terminated function
     /// prototypes are not allowed here.
     ///
@@ -2274,7 +2298,7 @@ pub(crate) struct FnParseMode {
     /// This field should only be set to false if the item is inside of a trait
     /// definition or extern block. Within an impl block or a module, it should
     /// always be set to true.
-    pub req_body: bool,
+    pub(super) req_body: bool,
 }
 
 /// Parsing of functions and methods.
@@ -2372,13 +2396,10 @@ impl<'a> Parser<'a> {
                             .into_iter()
                             .any(|s| self.prev_token.is_ident_named(s));
 
-                        err.subdiagnostic(
-                            self.dcx(),
-                            errors::FnTraitMissingParen {
-                                span: self.prev_token.span,
-                                machine_applicable,
-                            },
-                        );
+                        err.subdiagnostic(errors::FnTraitMissingParen {
+                            span: self.prev_token.span,
+                            machine_applicable,
+                        });
                     }
                     return Err(err);
                 }
@@ -2399,9 +2420,9 @@ impl<'a> Parser<'a> {
         // `pub` is added in case users got confused with the ordering like `async pub fn`,
         // only if it wasn't preceded by `default` as `default pub` is invalid.
         let quals: &[Symbol] = if check_pub {
-            &[kw::Pub, kw::Gen, kw::Const, kw::Async, kw::Unsafe, kw::Extern]
+            &[kw::Pub, kw::Gen, kw::Const, kw::Async, kw::Unsafe, kw::Safe, kw::Extern]
         } else {
-            &[kw::Gen, kw::Const, kw::Async, kw::Unsafe, kw::Extern]
+            &[kw::Gen, kw::Const, kw::Async, kw::Unsafe, kw::Safe, kw::Extern]
         };
         self.check_keyword_case(kw::Fn, case) // Definitely an `fn`.
             // `$qual fn` or `$qual $qual`:
@@ -2427,7 +2448,7 @@ impl<'a> Parser<'a> {
                 })
             // `extern ABI fn`
             || self.check_keyword_case(kw::Extern, case)
-                && self.look_ahead(1, |t| t.can_begin_literal_maybe_minus())
+                && self.look_ahead(1, |t| t.can_begin_string_literal())
                 && (self.look_ahead(2, |t| t.is_keyword_case(kw::Fn, case)) ||
                     // this branch is only for better diagnostic in later, `pub` is not allowed here
                     (self.may_recover()
@@ -2536,8 +2557,24 @@ impl<'a> Parser<'a> {
                     } else if self.check_keyword(kw::Unsafe) {
                         match safety {
                             Safety::Unsafe(sp) => Some(WrongKw::Duplicated(sp)),
+                            Safety::Safe(sp) => {
+                                recover_safety = Safety::Unsafe(self.token.span);
+                                Some(WrongKw::Misplaced(sp))
+                            }
                             Safety::Default => {
                                 recover_safety = Safety::Unsafe(self.token.span);
+                                Some(WrongKw::Misplaced(ext_start_sp))
+                            }
+                        }
+                    } else if self.check_keyword(kw::Safe) {
+                        match safety {
+                            Safety::Safe(sp) => Some(WrongKw::Duplicated(sp)),
+                            Safety::Unsafe(sp) => {
+                                recover_safety = Safety::Safe(self.token.span);
+                                Some(WrongKw::Misplaced(sp))
+                            }
+                            Safety::Default => {
+                                recover_safety = Safety::Safe(self.token.span);
                                 Some(WrongKw::Misplaced(ext_start_sp))
                             }
                         }

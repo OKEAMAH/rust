@@ -14,6 +14,7 @@ use rustc_middle::{
 };
 use rustc_span::symbol::{sym, Symbol};
 use rustc_target::abi::Size;
+use tracing::trace;
 
 use super::{
     err_inval, err_ub_custom, err_unsup_format, memory::MemoryKind, throw_inval, throw_ub_custom,
@@ -97,7 +98,7 @@ pub(crate) fn eval_nullary_intrinsic<'tcx>(
     })
 }
 
-impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
+impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
     /// Returns `true` if emulation happened.
     /// Here we implement the intrinsics that are common to all Miri instances; individual machines can add their own
     /// intrinsic handling.
@@ -196,7 +197,7 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
                 // rotate_right: (X << ((BW - S) % BW)) | (X >> (S % BW))
                 let layout_val = self.layout_of(instance_args.type_at(0))?;
                 let val = self.read_scalar(&args[0])?;
-                let val_bits = val.to_bits(layout_val.size)?;
+                let val_bits = val.to_bits(layout_val.size)?; // sign is ignored here
 
                 let layout_raw_shift = self.layout_of(self.tcx.types.u32)?;
                 let raw_shift = self.read_scalar(&args[1])?;
@@ -431,12 +432,14 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
 
             sym::vtable_size => {
                 let ptr = self.read_pointer(&args[0])?;
-                let (size, _align) = self.get_vtable_size_and_align(ptr)?;
+                // `None` because we don't know which trait to expect here; any vtable is okay.
+                let (size, _align) = self.get_vtable_size_and_align(ptr, None)?;
                 self.write_scalar(Scalar::from_target_usize(size.bytes(), self), dest)?;
             }
             sym::vtable_align => {
                 let ptr = self.read_pointer(&args[0])?;
-                let (_size, align) = self.get_vtable_size_and_align(ptr)?;
+                // `None` because we don't know which trait to expect here; any vtable is okay.
+                let (_size, align) = self.get_vtable_size_and_align(ptr, None)?;
                 self.write_scalar(Scalar::from_target_usize(align.bytes(), self), dest)?;
             }
 
@@ -483,7 +486,7 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
         ret_layout: TyAndLayout<'tcx>,
     ) -> InterpResult<'tcx, Scalar<M::Provenance>> {
         assert!(layout.ty.is_integral(), "invalid type for numeric intrinsic: {}", layout.ty);
-        let bits = val.to_bits(layout.size)?;
+        let bits = val.to_bits(layout.size)?; // these operations all ignore the sign
         let extra = 128 - u128::from(layout.size.bits());
         let bits_out = match name {
             sym::ctpop => u128::from(bits.count_ones()),
@@ -518,7 +521,8 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
         // `x % y != 0` or `y == 0` or `x == T::MIN && y == -1`.
         // First, check x % y != 0 (or if that computation overflows).
         let rem = self.binary_op(BinOp::Rem, a, b)?;
-        if rem.to_scalar().assert_bits(a.layout.size) != 0 {
+        // sign does not matter for 0 test, so `to_bits` is fine
+        if rem.to_scalar().to_bits(a.layout.size)? != 0 {
             throw_ub_custom!(
                 fluent::const_eval_exact_div_has_remainder,
                 a = format!("{a}"),
@@ -544,22 +548,19 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
             self.binary_op(mir_op.wrapping_to_overflowing().unwrap(), l, r)?.to_scalar_pair();
         Ok(if overflowed.to_bool()? {
             let size = l.layout.size;
-            let num_bits = size.bits();
             if l.layout.abi.is_signed() {
                 // For signed ints the saturated value depends on the sign of the first
                 // term since the sign of the second term can be inferred from this and
                 // the fact that the operation has overflowed (if either is 0 no
                 // overflow can occur)
-                let first_term: u128 = l.to_scalar().to_bits(l.layout.size)?;
-                let first_term_positive = first_term & (1 << (num_bits - 1)) == 0;
-                if first_term_positive {
+                let first_term: i128 = l.to_scalar().to_int(l.layout.size)?;
+                if first_term >= 0 {
                     // Negative overflow not possible since the positive first term
                     // can only increase an (in range) negative term for addition
-                    // or corresponding negated positive term for subtraction
+                    // or corresponding negated positive term for subtraction.
                     Scalar::from_int(size.signed_int_max(), size)
                 } else {
-                    // Positive overflow not possible for similar reason
-                    // max negative
+                    // Positive overflow not possible for similar reason.
                     Scalar::from_int(size.signed_int_min(), size)
                 }
             } else {
@@ -604,9 +605,9 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
     /// Copy `count*size_of::<T>()` many bytes from `*src` to `*dst`.
     pub(crate) fn copy_intrinsic(
         &mut self,
-        src: &OpTy<'tcx, <M as Machine<'mir, 'tcx>>::Provenance>,
-        dst: &OpTy<'tcx, <M as Machine<'mir, 'tcx>>::Provenance>,
-        count: &OpTy<'tcx, <M as Machine<'mir, 'tcx>>::Provenance>,
+        src: &OpTy<'tcx, <M as Machine<'tcx>>::Provenance>,
+        dst: &OpTy<'tcx, <M as Machine<'tcx>>::Provenance>,
+        count: &OpTy<'tcx, <M as Machine<'tcx>>::Provenance>,
         nonoverlapping: bool,
     ) -> InterpResult<'tcx> {
         let count = self.read_target_usize(count)?;
@@ -633,8 +634,8 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
     /// Does a *typed* swap of `*left` and `*right`.
     fn typed_swap_intrinsic(
         &mut self,
-        left: &OpTy<'tcx, <M as Machine<'mir, 'tcx>>::Provenance>,
-        right: &OpTy<'tcx, <M as Machine<'mir, 'tcx>>::Provenance>,
+        left: &OpTy<'tcx, <M as Machine<'tcx>>::Provenance>,
+        right: &OpTy<'tcx, <M as Machine<'tcx>>::Provenance>,
     ) -> InterpResult<'tcx> {
         let left = self.deref_pointer(left)?;
         let right = self.deref_pointer(right)?;
@@ -650,9 +651,9 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
 
     pub(crate) fn write_bytes_intrinsic(
         &mut self,
-        dst: &OpTy<'tcx, <M as Machine<'mir, 'tcx>>::Provenance>,
-        byte: &OpTy<'tcx, <M as Machine<'mir, 'tcx>>::Provenance>,
-        count: &OpTy<'tcx, <M as Machine<'mir, 'tcx>>::Provenance>,
+        dst: &OpTy<'tcx, <M as Machine<'tcx>>::Provenance>,
+        byte: &OpTy<'tcx, <M as Machine<'tcx>>::Provenance>,
+        count: &OpTy<'tcx, <M as Machine<'tcx>>::Provenance>,
     ) -> InterpResult<'tcx> {
         let layout = self.layout_of(dst.layout.ty.builtin_deref(true).unwrap())?;
 
@@ -672,9 +673,9 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
 
     pub(crate) fn compare_bytes_intrinsic(
         &mut self,
-        left: &OpTy<'tcx, <M as Machine<'mir, 'tcx>>::Provenance>,
-        right: &OpTy<'tcx, <M as Machine<'mir, 'tcx>>::Provenance>,
-        byte_count: &OpTy<'tcx, <M as Machine<'mir, 'tcx>>::Provenance>,
+        left: &OpTy<'tcx, <M as Machine<'tcx>>::Provenance>,
+        right: &OpTy<'tcx, <M as Machine<'tcx>>::Provenance>,
+        byte_count: &OpTy<'tcx, <M as Machine<'tcx>>::Provenance>,
     ) -> InterpResult<'tcx, Scalar<M::Provenance>> {
         let left = self.read_pointer(left)?;
         let right = self.read_pointer(right)?;
@@ -690,14 +691,14 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
 
     pub(crate) fn raw_eq_intrinsic(
         &mut self,
-        lhs: &OpTy<'tcx, <M as Machine<'mir, 'tcx>>::Provenance>,
-        rhs: &OpTy<'tcx, <M as Machine<'mir, 'tcx>>::Provenance>,
+        lhs: &OpTy<'tcx, <M as Machine<'tcx>>::Provenance>,
+        rhs: &OpTy<'tcx, <M as Machine<'tcx>>::Provenance>,
     ) -> InterpResult<'tcx, Scalar<M::Provenance>> {
         let layout = self.layout_of(lhs.layout.ty.builtin_deref(true).unwrap())?;
         assert!(layout.is_sized());
 
-        let get_bytes = |this: &InterpCx<'mir, 'tcx, M>,
-                         op: &OpTy<'tcx, <M as Machine<'mir, 'tcx>>::Provenance>,
+        let get_bytes = |this: &InterpCx<'tcx, M>,
+                         op: &OpTy<'tcx, <M as Machine<'tcx>>::Provenance>,
                          size|
          -> InterpResult<'tcx, &[u8]> {
             let ptr = this.read_pointer(op)?;

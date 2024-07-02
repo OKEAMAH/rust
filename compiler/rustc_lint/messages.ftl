@@ -14,6 +14,7 @@ lint_associated_const_elided_lifetime = {$elided ->
         *[false] `'_` cannot be used here
     }
     .suggestion = use the `'static` lifetime
+    .note = cannot automatically infer `'static` because of other lifetimes in scope
 
 lint_async_fn_in_trait = use of `async fn` in public traits is discouraged as auto trait bounds cannot be specified
     .note = you can suppress this lint if you plan to use the trait only in your own code, or do not care about auto traits like `Send` on the `Future`
@@ -55,8 +56,6 @@ lint_builtin_asm_labels = avoid using named labels in inline assembly
     .help = only local labels of the form `<number>:` should be used in inline asm
     .note = see the asm section of Rust By Example <https://doc.rust-lang.org/nightly/rust-by-example/unsafe/asm.html#labels> for more information
 
-lint_builtin_box_pointers = type uses owned (Box type) pointers: {$ty}
-
 lint_builtin_clashing_extern_diff_name = `{$this}` redeclares `{$orig}` with a different signature
     .previous_decl_label = `{$orig}` previously declared here
     .mismatch_label = this signature doesn't match the previous declaration
@@ -74,7 +73,7 @@ lint_builtin_deprecated_attr_default_suggestion = remove this attribute
 lint_builtin_deprecated_attr_link = use of deprecated attribute `{$name}`: {$reason}. See {$link}
     .msg_suggestion = {$msg}
     .default_suggestion = remove this attribute
-lint_builtin_deprecated_attr_used = use of deprecated attribute `{$name}`: no longer used.
+lint_builtin_deprecated_attr_used = use of deprecated attribute `{$name}`: no longer used
 lint_builtin_deref_nullptr = dereferencing a null pointer
     .label = this code causes undefined behavior when executed
 
@@ -212,7 +211,7 @@ lint_default_hash_types = prefer `{$preferred}` over `{$used}`, it has better pe
 lint_default_source = `forbid` lint level is the default for {$id}
 
 lint_deprecated_lint_name =
-    lint name `{$name}` is deprecated and may not have an effect in the future.
+    lint name `{$name}` is deprecated and may not have an effect in the future
     .suggestion = change it to
     .help = change it to {$replace}
 
@@ -232,11 +231,9 @@ lint_drop_trait_constraints =
 
 lint_dropping_copy_types = calls to `std::mem::drop` with a value that implements `Copy` does nothing
     .label = argument has type `{$arg_ty}`
-    .note = use `let _ = ...` to ignore the expression or result
 
 lint_dropping_references = calls to `std::mem::drop` with a reference instead of an owned value does nothing
     .label = argument has type `{$arg_ty}`
-    .note = use `let _ = ...` to ignore the expression or result
 
 lint_duplicate_macro_attribute =
     duplicated attribute
@@ -245,11 +242,11 @@ lint_duplicate_matcher_binding = duplicate matcher binding
 
 lint_enum_intrinsics_mem_discriminant =
     the return value of `mem::discriminant` is unspecified when called with a non-enum type
-    .note = the argument to `discriminant` should be a reference to an enum, but it was passed a reference to a `{$ty_param}`, which is not an enum.
+    .note = the argument to `discriminant` should be a reference to an enum, but it was passed a reference to a `{$ty_param}`, which is not an enum
 
 lint_enum_intrinsics_mem_variant =
     the return value of `mem::variant_count` is unspecified when called with a non-enum type
-    .note = the type parameter of `variant_count` should be an enum, but it was instantiated with the type `{$ty_param}`, which is not an enum.
+    .note = the type parameter of `variant_count` should be an enum, but it was instantiated with the type `{$ty_param}`, which is not an enum
 
 lint_expectation = this lint expectation is unfulfilled
     .note = the `unfulfilled_lint_expectations` lint can't be expected and will always produce this message
@@ -271,10 +268,9 @@ lint_for_loops_over_fallibles =
 
 lint_forgetting_copy_types = calls to `std::mem::forget` with a value that implements `Copy` does nothing
     .label = argument has type `{$arg_ty}`
-    .note = use `let _ = ...` to ignore the expression or result
+
 lint_forgetting_references = calls to `std::mem::forget` with a reference instead of an owned value does nothing
     .label = argument has type `{$arg_ty}`
-    .note = use `let _ = ...` to ignore the expression or result
 
 lint_hidden_glob_reexport = private item shadows public glob re-export
     .note_glob_reexport = the name `{$name}` in the {$namespace} namespace is supposed to be publicly re-exported here
@@ -448,7 +444,8 @@ lint_macro_is_private = macro `{$ident}` is private
 lint_macro_rule_never_used = rule #{$n} of macro `{$name}` is never used
 
 lint_macro_use_deprecated =
-    deprecated `#[macro_use]` attribute used to import macros should be replaced at use sites with a `use` item to import the macro instead
+    applying the `#[macro_use]` attribute to an `extern crate` item is deprecated
+    .help = remove it and import macros at use sites with a `use` item instead
 
 lint_malformed_attribute = malformed lint attribute input
 
@@ -459,11 +456,14 @@ lint_map_unit_fn = `Iterator::map` call that discard the iterator's values
     .map_label = after this call to map, the resulting iterator is `impl Iterator<Item = ()>`, which means the only information carried by the iterator is the number of items
     .suggestion = you might have meant to use `Iterator::for_each`
 
-lint_metavariable_still_repeating = variable '{$name}' is still repeating at this depth
+lint_metavariable_still_repeating = variable `{$name}` is still repeating at this depth
 
 lint_metavariable_wrong_operator = meta-variable repeats with different Kleene operator
 
 lint_missing_fragment_specifier = missing fragment specifier
+
+lint_missing_unsafe_on_extern = extern blocks should be unsafe
+    .suggestion = needs `unsafe` before the extern keyword
 
 lint_mixed_script_confusables =
     the usage of Script Group `{$set}` in this crate consists solely of mixed script confusables
@@ -542,17 +542,23 @@ lint_non_local_definitions_cargo_update = the {$macro_kind} `{$macro_name}` may 
 
 lint_non_local_definitions_deprecation = this lint may become deny-by-default in the edition 2024 and higher, see the tracking issue <https://github.com/rust-lang/rust/issues/120363>
 
-lint_non_local_definitions_impl = non-local `impl` definition, they should be avoided as they go against expectation
-    .help =
-        move this `impl` block outside the of the current {$body_kind_descr} {$depth ->
-            [one] `{$body_name}`
-           *[other] `{$body_name}` and up {$depth} bodies
-        }
-    .non_local = an `impl` definition is non-local if it is nested inside an item and may impact type checking outside of that item. This can be the case if neither the trait or the self type are at the same nesting level as the `impl`
-    .exception = one exception to the rule are anon-const (`const _: () = {"{"} ... {"}"}`) at top-level module and anon-const at the same nesting as the trait or type
+lint_non_local_definitions_impl = non-local `impl` definition, `impl` blocks should be written at the same level as their item
+    .remove_help = remove `{$may_remove_part}` to make the `impl` local
+    .without_trait = methods and associated constants are still usable outside the current expression, only `impl Local` and `impl dyn Local` can ever be private, and only if the type is nested in the same item as the `impl`
+    .with_trait = an `impl` is never scoped, even when it is nested inside an item, as it may impact type checking outside of that item, which can be the case if neither the trait or the self type are at the same nesting level as the `impl`
+    .bounds = `impl` may be usable in bounds, etc. from outside the expression, which might e.g. make something constructible that previously wasn't, because it's still on a publicly-visible type
+    .doctest = make this doc-test a standalone test with its own `fn main() {"{"} ... {"}"}`
+    .exception = items in an anonymous const item (`const _: () = {"{"} ... {"}"}`) are treated as in the same scope as the anonymous const's declaration for the purpose of this lint
     .const_anon = use a const-anon item to suppress this lint
+    .macro_to_change = the {$macro_kind} `{$macro_to_change}` defines the non-local `impl`, and may need to be changed
 
-lint_non_local_definitions_macro_rules = non-local `macro_rules!` definition, they should be avoided as they go against expectation
+lint_non_local_definitions_impl_move_help =
+    move the `impl` block outside of this {$body_kind_descr} {$depth ->
+        [one] `{$body_name}`
+       *[other] `{$body_name}` and up {$depth} bodies
+    }
+
+lint_non_local_definitions_macro_rules = non-local `macro_rules!` definition, `#[macro_export]` macro should be written at top level module
     .help =
         remove the `#[macro_export]` or move this `macro_rules!` outside the of the current {$body_kind_descr} {$depth ->
             [one] `{$body_name}`
@@ -561,7 +567,12 @@ lint_non_local_definitions_macro_rules = non-local `macro_rules!` definition, th
     .help_doctest =
         remove the `#[macro_export]` or make this doc-test a standalone test with its own `fn main() {"{"} ... {"}"}`
     .non_local = a `macro_rules!` definition is non-local if it is nested inside an item and has a `#[macro_export]` attribute
-    .exception = one exception to the rule are anon-const (`const _: () = {"{"} ... {"}"}`) at top-level module
+
+lint_non_local_definitions_may_move = may need to be moved as well
+
+lint_non_local_definitions_of_trait_not_local = `{$of_trait_str}` is not local
+
+lint_non_local_definitions_self_ty_not_local = `{$self_ty_str}` is not local
 
 lint_non_snake_case = {$sort} `{$name}` should have a snake case name
     .rename_or_convert_suggestion = rename the identifier or convert it to a snake case raw identifier
@@ -590,6 +601,9 @@ lint_opaque_hidden_inferred_bound_sugg = add this bound
 
 lint_or_patterns_back_compat = the meaning of the `pat` fragment specifier is changing in Rust 2021, which may affect this macro
     .suggestion = use pat_param to preserve semantics
+
+lint_out_of_scope_macro_calls = cannot find macro `{$path}` in this scope
+    .help = import `macro_rules` with `use` to make it callable above its definition
 
 lint_overflowing_bin_hex = literal out of range for `{$ty}`
     .negative_note = the literal `{$lit}` (decimal `{$dec}`) does not fit into the type `{$ty}`
@@ -626,11 +640,8 @@ lint_pattern_in_bodiless = patterns aren't allowed in functions without bodies
 lint_pattern_in_foreign = patterns aren't allowed in foreign function declarations
     .label = pattern not allowed in foreign function
 
-lint_private_extern_crate_reexport =
-    extern crate `{$ident}` is private, and cannot be re-exported, consider declaring with `pub`
-
-lint_proc_macro_back_compat = using an old version of `{$crate_name}`
-    .note = older versions of the `{$crate_name}` crate will stop compiling in future versions of Rust; please update to `{$crate_name}` v{$fixed_version}, or switch to one of the `{$crate_name}` alternatives
+lint_private_extern_crate_reexport = extern crate `{$ident}` is private and cannot be re-exported
+    .suggestion = consider making the `extern crate` item publicly accessible
 
 lint_proc_macro_derive_resolution_fallback = cannot find {$ns} `{$ident}` in this scope
     .label = names from parent modules are not accessible without an explicit import
@@ -815,6 +826,10 @@ lint_unnameable_test_items = cannot test inner items
 lint_unnecessary_qualification = unnecessary qualification
     .suggestion = remove the unnecessary path segments
 
+lint_unsafe_attr_outside_unsafe = unsafe attribute used without unsafe
+    .label = usage of unsafe attribute
+lint_unsafe_attr_outside_unsafe_suggestion = wrap the attribute in `unsafe(...)`
+
 lint_unsupported_group = `{$lint_group}` lint group is not supported with ´--force-warn´
 
 lint_untranslatable_diag = diagnostics should be created using translatable messages
@@ -841,7 +856,8 @@ lint_unused_coroutine =
     }{$post} that must be used
     .note = coroutines are lazy and do nothing unless resumed
 
-lint_unused_crate_dependency = external crate `{$extern_crate}` unused in `{$local_crate}`: remove the dependency or add `use {$extern_crate} as _;`
+lint_unused_crate_dependency = extern crate `{$extern_crate}` is unused in crate `{$local_crate}`
+    .help = remove the dependency or add `use {$extern_crate} as _;` to the crate root
 
 lint_unused_def = unused {$pre}`{$def}`{$post} that must be used
     .suggestion = use `let _ = ...` to ignore the resulting value
@@ -883,6 +899,8 @@ lint_unused_op = unused {$op} that must be used
     .suggestion = use `let _ = ...` to ignore the resulting value
 
 lint_unused_result = unused result of type `{$ty}`
+
+lint_use_let_underscore_ignore_suggestion = use `let _ = ...` to ignore the expression or result
 
 lint_variant_size_differences =
     enum variant is more than three times larger ({$largest} bytes) than the next largest

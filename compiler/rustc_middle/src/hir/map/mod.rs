@@ -254,13 +254,13 @@ impl<'hir> Map<'hir> {
 
     /// Given a `LocalDefId`, returns the `BodyId` associated with it,
     /// if the node is a body owner, otherwise returns `None`.
-    pub fn maybe_body_owned_by(self, id: LocalDefId) -> Option<BodyId> {
-        self.tcx.hir_node_by_def_id(id).body_id()
+    pub fn maybe_body_owned_by(self, id: LocalDefId) -> Option<&'hir Body<'hir>> {
+        Some(self.body(self.tcx.hir_node_by_def_id(id).body_id()?))
     }
 
     /// Given a body owner's id, returns the `BodyId` associated with it.
     #[track_caller]
-    pub fn body_owned_by(self, id: LocalDefId) -> BodyId {
+    pub fn body_owned_by(self, id: LocalDefId) -> &'hir Body<'hir> {
         self.maybe_body_owned_by(id).unwrap_or_else(|| {
             let hir_id = self.tcx.local_def_id_to_hir_id(id);
             span_bug!(
@@ -290,7 +290,9 @@ impl<'hir> Map<'hir> {
             DefKind::InlineConst => BodyOwnerKind::Const { inline: true },
             DefKind::Ctor(..) | DefKind::Fn | DefKind::AssocFn => BodyOwnerKind::Fn,
             DefKind::Closure => BodyOwnerKind::Closure,
-            DefKind::Static { mutability, nested: false } => BodyOwnerKind::Static(mutability),
+            DefKind::Static { safety: _, mutability, nested: false } => {
+                BodyOwnerKind::Static(mutability)
+            }
             dk => bug!("{:?} is not a body node: {:?}", def_id, dk),
         }
     }
@@ -861,7 +863,7 @@ impl<'hir> Map<'hir> {
             Node::Variant(variant) => named_span(variant.span, variant.ident, None),
             Node::ImplItem(item) => named_span(item.span, item.ident, Some(item.generics)),
             Node::ForeignItem(item) => match item.kind {
-                ForeignItemKind::Fn(decl, _, _) => until_within(item.span, decl.output.span()),
+                ForeignItemKind::Fn(decl, _, _, _) => until_within(item.span, decl.output.span()),
                 _ => named_span(item.span, item.ident, None),
             },
             Node::Ctor(_) => return self.span(self.tcx.parent_hir_id(hir_id)),
@@ -901,7 +903,7 @@ impl<'hir> Map<'hir> {
                     .with_hi(seg.args.map_or_else(|| ident_span.hi(), |args| args.span_ext.hi()))
             }
             Node::Ty(ty) => ty.span,
-            Node::TypeBinding(tb) => tb.span,
+            Node::AssocItemConstraint(constraint) => constraint.span,
             Node::TraitRef(tr) => tr.path.span,
             Node::Pat(pat) => pat.span,
             Node::PatField(field) => field.span,
@@ -1016,7 +1018,7 @@ pub(super) fn crate_hash(tcx: TyCtxt<'_>, _: LocalCrate) -> Svh {
     let krate = tcx.hir_crate(());
     let hir_body_hash = krate.opt_hir_hash.expect("HIR hash missing while computing crate hash");
 
-    let upstream_crates = upstream_crates_for_hashing(tcx);
+    let upstream_crates = upstream_crates(tcx);
 
     let resolutions = tcx.resolutions(());
 
@@ -1085,9 +1087,9 @@ pub(super) fn crate_hash(tcx: TyCtxt<'_>, _: LocalCrate) -> Svh {
     Svh::new(crate_hash)
 }
 
-fn upstream_crates_for_hashing(tcx: TyCtxt<'_>) -> Vec<(StableCrateId, Svh)> {
+fn upstream_crates(tcx: TyCtxt<'_>) -> Vec<(StableCrateId, Svh)> {
     let mut upstream_crates: Vec<_> = tcx
-        .crates_including_speculative(())
+        .crates(())
         .iter()
         .map(|&cnum| {
             let stable_crate_id = tcx.stable_crate_id(cnum);
@@ -1167,7 +1169,7 @@ fn hir_id_to_string(map: Map<'_>, id: HirId) -> String {
         Node::Stmt(_) => node_str("stmt"),
         Node::PathSegment(_) => node_str("path segment"),
         Node::Ty(_) => node_str("type"),
-        Node::TypeBinding(_) => node_str("type binding"),
+        Node::AssocItemConstraint(_) => node_str("assoc item constraint"),
         Node::TraitRef(_) => node_str("trait ref"),
         Node::Pat(_) => node_str("pat"),
         Node::PatField(_) => node_str("pattern field"),

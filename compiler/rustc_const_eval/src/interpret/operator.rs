@@ -7,10 +7,11 @@ use rustc_middle::ty::layout::{LayoutOf, TyAndLayout};
 use rustc_middle::ty::{self, FloatTy, ScalarInt};
 use rustc_middle::{bug, span_bug};
 use rustc_span::symbol::sym;
+use tracing::trace;
 
-use super::{err_ub, throw_ub, ImmTy, InterpCx, Machine};
+use super::{err_ub, throw_ub, ImmTy, InterpCx, Machine, MemPlaceMeta};
 
-impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
+impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
     fn three_way_compare<T: Ord>(&self, lhs: T, rhs: T) -> ImmTy<'tcx, M::Provenance> {
         let res = Ord::cmp(&lhs, &rhs);
         return ImmTy::from_ordering(res, *self.tcx);
@@ -94,10 +95,10 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
         let l = left.to_scalar_int()?;
         let r = right.to_scalar_int()?;
         // Prepare to convert the values to signed or unsigned form.
-        let l_signed = || l.assert_int(left.layout.size);
-        let l_unsigned = || l.assert_uint(left.layout.size);
-        let r_signed = || r.assert_int(right.layout.size);
-        let r_unsigned = || r.assert_uint(right.layout.size);
+        let l_signed = || l.to_int(left.layout.size);
+        let l_unsigned = || l.to_uint(left.layout.size);
+        let r_signed = || r.to_int(right.layout.size);
+        let r_unsigned = || r.to_uint(right.layout.size);
 
         let throw_ub_on_overflow = match bin_op {
             AddUnchecked => Some(sym::unchecked_add),
@@ -111,25 +112,20 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
 
         // Shift ops can have an RHS with a different numeric type.
         if matches!(bin_op, Shl | ShlUnchecked | Shr | ShrUnchecked) {
-            let size = left.layout.size.bits();
+            let l_bits = left.layout.size.bits();
             // Compute the equivalent shift modulo `size` that is in the range `0..size`. (This is
             // the one MIR operator that does *not* directly map to a single LLVM operation.)
             let (shift_amount, overflow) = if right.layout.abi.is_signed() {
                 let shift_amount = r_signed();
-                let overflow = shift_amount < 0 || shift_amount >= i128::from(size);
-                // Deliberately wrapping `as` casts: shift_amount *can* be negative, but the result
-                // of the `as` will be equal modulo `size` (since it is a power of two).
-                let masked_amount = (shift_amount as u128) % u128::from(size);
-                assert_eq!(overflow, shift_amount != i128::try_from(masked_amount).unwrap());
-                (masked_amount, overflow)
+                let rem = shift_amount.rem_euclid(l_bits.into());
+                // `rem` is guaranteed positive, so the `unwrap` cannot fail
+                (u128::try_from(rem).unwrap(), rem != shift_amount)
             } else {
                 let shift_amount = r_unsigned();
-                let overflow = shift_amount >= u128::from(size);
-                let masked_amount = shift_amount % u128::from(size);
-                assert_eq!(overflow, shift_amount != masked_amount);
-                (masked_amount, overflow)
+                let rem = shift_amount.rem_euclid(l_bits.into());
+                (rem, rem != shift_amount)
             };
-            let shift_amount = u32::try_from(shift_amount).unwrap(); // we masked so this will always fit
+            let shift_amount = u32::try_from(shift_amount).unwrap(); // we brought this in the range `0..size` so this will always fit
             // Compute the shifted result.
             let result = if left.layout.abi.is_signed() {
                 let l = l_signed();
@@ -361,14 +357,18 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
                 let left = left.to_scalar();
                 let right = right.to_scalar();
                 Ok(match fty {
-                    FloatTy::F16 => unimplemented!("f16_f128"),
+                    FloatTy::F16 => {
+                        self.binary_float_op(bin_op, layout, left.to_f16()?, right.to_f16()?)
+                    }
                     FloatTy::F32 => {
                         self.binary_float_op(bin_op, layout, left.to_f32()?, right.to_f32()?)
                     }
                     FloatTy::F64 => {
                         self.binary_float_op(bin_op, layout, left.to_f64()?, right.to_f64()?)
                     }
-                    FloatTy::F128 => unimplemented!("f16_f128"),
+                    FloatTy::F128 => {
+                        self.binary_float_op(bin_op, layout, left.to_f128()?, right.to_f128()?)
+                    }
                 })
             }
             _ if left.layout.ty.is_integral() => {
@@ -414,11 +414,11 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
         use rustc_middle::mir::UnOp::*;
 
         let layout = val.layout;
-        let val = val.to_scalar();
         trace!("Running unary op {:?}: {:?} ({})", un_op, val, layout.ty);
 
         match layout.ty.kind() {
             ty::Bool => {
+                let val = val.to_scalar();
                 let val = val.to_bool()?;
                 let res = match un_op {
                     Not => !val,
@@ -427,30 +427,56 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
                 Ok(ImmTy::from_bool(res, *self.tcx))
             }
             ty::Float(fty) => {
+                let val = val.to_scalar();
+                if un_op != Neg {
+                    span_bug!(self.cur_span(), "Invalid float op {:?}", un_op);
+                }
+
                 // No NaN adjustment here, `-` is a bitwise operation!
-                let res = match (un_op, fty) {
-                    (Neg, FloatTy::F32) => Scalar::from_f32(-val.to_f32()?),
-                    (Neg, FloatTy::F64) => Scalar::from_f64(-val.to_f64()?),
-                    _ => span_bug!(self.cur_span(), "Invalid float op {:?}", un_op),
+                let res = match fty {
+                    FloatTy::F16 => Scalar::from_f16(-val.to_f16()?),
+                    FloatTy::F32 => Scalar::from_f32(-val.to_f32()?),
+                    FloatTy::F64 => Scalar::from_f64(-val.to_f64()?),
+                    FloatTy::F128 => Scalar::from_f128(-val.to_f128()?),
                 };
                 Ok(ImmTy::from_scalar(res, layout))
             }
-            _ => {
-                assert!(layout.ty.is_integral());
-                let val = val.to_bits(layout.size)?;
+            ty::Int(..) => {
+                let val = val.to_scalar().to_int(layout.size)?;
                 let res = match un_op {
-                    Not => self.truncate(!val, layout), // bitwise negation, then truncate
-                    Neg => {
-                        // arithmetic negation
-                        assert!(layout.abi.is_signed());
-                        let val = self.sign_extend(val, layout) as i128;
-                        let res = val.wrapping_neg();
-                        let res = res as u128;
-                        // Truncate to target type.
-                        self.truncate(res, layout)
-                    }
+                    Not => !val,
+                    Neg => val.wrapping_neg(),
+                    _ => span_bug!(self.cur_span(), "Invalid integer op {:?}", un_op),
                 };
-                Ok(ImmTy::from_uint(res, layout))
+                let res = ScalarInt::truncate_from_int(res, layout.size).0;
+                Ok(ImmTy::from_scalar(res.into(), layout))
+            }
+            ty::Uint(..) => {
+                let val = val.to_scalar().to_uint(layout.size)?;
+                let res = match un_op {
+                    Not => !val,
+                    _ => span_bug!(self.cur_span(), "Invalid unsigned integer op {:?}", un_op),
+                };
+                let res = ScalarInt::truncate_from_uint(res, layout.size).0;
+                Ok(ImmTy::from_scalar(res.into(), layout))
+            }
+            ty::RawPtr(..) | ty::Ref(..) => {
+                assert_eq!(un_op, PtrMetadata);
+                let (_, meta) = val.to_scalar_and_meta();
+                Ok(match meta {
+                    MemPlaceMeta::Meta(scalar) => {
+                        let ty = un_op.ty(*self.tcx, val.layout.ty);
+                        let layout = self.layout_of(ty)?;
+                        ImmTy::from_scalar(scalar, layout)
+                    }
+                    MemPlaceMeta::None => {
+                        let unit_layout = self.layout_of(self.tcx.types.unit)?;
+                        ImmTy::uninit(unit_layout)
+                    }
+                })
+            }
+            _ => {
+                bug!("Unexpected unary op argument {val:?}")
             }
         }
     }

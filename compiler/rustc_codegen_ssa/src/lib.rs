@@ -1,22 +1,21 @@
-#![doc(html_root_url = "https://doc.rust-lang.org/nightly/nightly-rustc/")]
-#![doc(rust_logo)]
-#![feature(rustdoc_internals)]
+// tidy-alphabetical-start
 #![allow(internal_features)]
 #![allow(rustc::diagnostic_outside_of_impl)]
 #![allow(rustc::untranslatable_diagnostic)]
+#![doc(html_root_url = "https://doc.rust-lang.org/nightly/nightly-rustc/")]
+#![doc(rust_logo)]
 #![feature(box_patterns)]
 #![feature(if_let_guard)]
 #![feature(let_chains)]
 #![feature(negative_impls)]
+#![feature(rustdoc_internals)]
 #![feature(strict_provenance)]
 #![feature(try_blocks)]
+// tidy-alphabetical-end
 
 //! This crate contains codegen code that is used by all codegen backends (LLVM and others).
 //! The backend-agnostic functions of this crate use functions defined in various traits that
 //! have to be implemented by each backend.
-
-#[macro_use]
-extern crate tracing;
 
 use rustc_ast as ast;
 use rustc_data_structures::fx::FxHashSet;
@@ -107,6 +106,24 @@ pub struct CompiledModule {
     pub bytecode: Option<PathBuf>,
     pub assembly: Option<PathBuf>, // --emit=asm
     pub llvm_ir: Option<PathBuf>,  // --emit=llvm-ir, llvm-bc is in bytecode
+}
+
+impl CompiledModule {
+    /// Call `emit` function with every artifact type currently compiled
+    pub fn for_each_output(&self, mut emit: impl FnMut(&Path, OutputType)) {
+        if let Some(path) = self.object.as_deref() {
+            emit(path, OutputType::Object);
+        }
+        if let Some(path) = self.bytecode.as_deref() {
+            emit(path, OutputType::Bitcode);
+        }
+        if let Some(path) = self.llvm_ir.as_deref() {
+            emit(path, OutputType::LlvmAssembly);
+        }
+        if let Some(path) = self.assembly.as_deref() {
+            emit(path, OutputType::Assembly);
+        }
+    }
 }
 
 pub struct CachedModuleCodegen {

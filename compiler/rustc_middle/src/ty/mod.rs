@@ -16,7 +16,6 @@ pub use self::visit::{TypeSuperVisitable, TypeVisitable, TypeVisitableExt, TypeV
 pub use self::AssocItemContainer::*;
 pub use self::BorrowKind::*;
 pub use self::IntVarValue::*;
-pub use self::Variance::*;
 use crate::error::{OpaqueHiddenTypeMismatch, TypeMismatchReason};
 use crate::metadata::ModChild;
 use crate::middle::privacy::EffectiveVisibilities;
@@ -60,7 +59,8 @@ use rustc_span::symbol::{kw, sym, Ident, Symbol};
 use rustc_span::{ExpnId, ExpnKind, Span};
 use rustc_target::abi::{Align, FieldIdx, Integer, IntegerType, VariantIdx};
 pub use rustc_target::abi::{ReprFlags, ReprOptions};
-pub use rustc_type_ir::{DebugWithInfcx, InferCtxtLike, WithInfcx};
+pub use rustc_type_ir::relate::VarianceDiagInfo;
+use tracing::{debug, instrument};
 pub use vtable::*;
 
 use std::assert_matches::assert_matches;
@@ -86,14 +86,15 @@ pub use self::closure::{
     CAPTURE_STRUCT_LOCAL,
 };
 pub use self::consts::{
-    Const, ConstData, ConstInt, ConstKind, Expr, ScalarInt, UnevaluatedConst, ValTree,
+    Const, ConstInt, ConstKind, Expr, ExprKind, ScalarInt, UnevaluatedConst, ValTree,
 };
 pub use self::context::{
     tls, CtxtInterners, CurrentGcx, DeducedParamAttrs, Feed, FreeRegionInfo, GlobalCtxt, Lift,
     TyCtxt, TyCtxtFeed,
 };
-pub use self::instance::{Instance, InstanceDef, ReifyReason, ShortInstance, UnusedGenericParams};
+pub use self::instance::{Instance, InstanceKind, ReifyReason, ShortInstance, UnusedGenericParams};
 pub use self::list::{List, ListWithCachedTypeInfo};
+pub use self::opaque_types::OpaqueTypeKey;
 pub use self::parameterized::ParameterizedOverTcx;
 pub use self::pattern::{Pattern, PatternKind};
 pub use self::predicate::{
@@ -112,10 +113,8 @@ pub use self::region::{
 pub use self::rvalue_scopes::RvalueScopes;
 pub use self::sty::{
     AliasTy, Article, Binder, BoundTy, BoundTyKind, BoundVariableKind, CanonicalPolyFnSig,
-    ClosureArgs, ClosureArgsParts, CoroutineArgs, CoroutineArgsParts, CoroutineClosureArgs,
-    CoroutineClosureArgsParts, CoroutineClosureSignature, FnSig, GenSig, InlineConstArgs,
-    InlineConstArgsParts, ParamConst, ParamTy, PolyFnSig, TyKind, TypeAndMut, UpvarArgs,
-    VarianceDiagInfo,
+    CoroutineArgsExt, EarlyBinder, FnSig, InlineConstArgs, InlineConstArgsParts, ParamConst,
+    ParamTy, PolyFnSig, TyKind, TypeAndMut, UpvarArgs,
 };
 pub use self::trait_def::TraitDef;
 pub use self::typeck_results::{
@@ -123,7 +122,6 @@ pub use self::typeck_results::{
     TypeckResults, UserType, UserTypeAnnotationIndex,
 };
 
-pub mod _match;
 pub mod abstract_const;
 pub mod adjustment;
 pub mod cast;
@@ -265,7 +263,7 @@ pub struct ImplHeader<'tcx> {
 
 #[derive(Copy, Clone, Debug, TyEncodable, TyDecodable, HashStable)]
 pub struct ImplTraitHeader<'tcx> {
-    pub trait_ref: ty::EarlyBinder<ty::TraitRef<'tcx>>,
+    pub trait_ref: ty::EarlyBinder<'tcx, ty::TraitRef<'tcx>>,
     pub polarity: ImplPolarity,
     pub safety: hir::Safety,
 }
@@ -310,38 +308,6 @@ impl Visibility {
                 }
             }
             ty::Visibility::Public => "pub".to_string(),
-        }
-    }
-}
-
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, HashStable, TyEncodable, TyDecodable)]
-pub enum BoundConstness {
-    /// `Type: Trait`
-    NotConst,
-    /// `Type: const Trait`
-    Const,
-    /// `Type: ~const Trait`
-    ///
-    /// Requires resolving to const only when we are in a const context.
-    ConstIfConst,
-}
-
-impl BoundConstness {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::NotConst => "",
-            Self::Const => "const",
-            Self::ConstIfConst => "~const",
-        }
-    }
-}
-
-impl fmt::Display for BoundConstness {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::NotConst => f.write_str("normal"),
-            Self::Const => f.write_str("const"),
-            Self::ConstIfConst => f.write_str("~const"),
         }
     }
 }
@@ -522,6 +488,8 @@ pub struct Term<'tcx> {
     marker: PhantomData<(Ty<'tcx>, Const<'tcx>)>,
 }
 
+impl<'tcx> rustc_type_ir::inherent::Term<TyCtxt<'tcx>> for Term<'tcx> {}
+
 impl<'tcx> rustc_type_ir::inherent::IntoKind for Term<'tcx> {
     type Kind = TermKind<'tcx>;
 
@@ -618,19 +586,27 @@ impl<'tcx> Term<'tcx> {
                     ptr.cast::<WithCachedTypeInfo<ty::TyKind<'tcx>>>().as_ref(),
                 ))),
                 CONST_TAG => TermKind::Const(ty::Const(Interned::new_unchecked(
-                    ptr.cast::<WithCachedTypeInfo<ty::ConstData<'tcx>>>().as_ref(),
+                    ptr.cast::<WithCachedTypeInfo<ty::ConstKind<'tcx>>>().as_ref(),
                 ))),
                 _ => core::intrinsics::unreachable(),
             }
         }
     }
 
-    pub fn ty(&self) -> Option<Ty<'tcx>> {
+    pub fn as_type(&self) -> Option<Ty<'tcx>> {
         if let TermKind::Ty(ty) = self.unpack() { Some(ty) } else { None }
     }
 
-    pub fn ct(&self) -> Option<Const<'tcx>> {
+    pub fn expect_type(&self) -> Ty<'tcx> {
+        self.as_type().expect("expected a type, but found a const")
+    }
+
+    pub fn as_const(&self) -> Option<Const<'tcx>> {
         if let TermKind::Const(c) = self.unpack() { Some(c) } else { None }
+    }
+
+    pub fn expect_const(&self) -> Const<'tcx> {
+        self.as_const().expect("expected a const, but found a type")
     }
 
     pub fn into_arg(self) -> GenericArg<'tcx> {
@@ -783,45 +759,6 @@ impl<'a, 'tcx> IntoIterator for &'a InstantiatedPredicates<'tcx> {
     }
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, HashStable, TyEncodable, TyDecodable)]
-#[derive(TypeFoldable, TypeVisitable)]
-pub struct OpaqueTypeKey<'tcx> {
-    pub def_id: LocalDefId,
-    pub args: GenericArgsRef<'tcx>,
-}
-
-impl<'tcx> OpaqueTypeKey<'tcx> {
-    pub fn iter_captured_args(
-        self,
-        tcx: TyCtxt<'tcx>,
-    ) -> impl Iterator<Item = (usize, GenericArg<'tcx>)> {
-        std::iter::zip(self.args, tcx.variances_of(self.def_id)).enumerate().filter_map(
-            |(i, (arg, v))| match (arg.unpack(), v) {
-                (_, ty::Invariant) => Some((i, arg)),
-                (ty::GenericArgKind::Lifetime(_), ty::Bivariant) => None,
-                _ => bug!("unexpected opaque type arg variance"),
-            },
-        )
-    }
-
-    pub fn fold_captured_lifetime_args(
-        self,
-        tcx: TyCtxt<'tcx>,
-        mut f: impl FnMut(Region<'tcx>) -> Region<'tcx>,
-    ) -> Self {
-        let Self { def_id, args } = self;
-        let args = std::iter::zip(args, tcx.variances_of(def_id)).map(|(arg, v)| {
-            match (arg.unpack(), v) {
-                (ty::GenericArgKind::Lifetime(_), ty::Bivariant) => arg,
-                (ty::GenericArgKind::Lifetime(lt), _) => f(lt).into(),
-                _ => arg,
-            }
-        });
-        let args = tcx.mk_args_from_iter(args);
-        Self { def_id, args }
-    }
-}
-
 #[derive(Copy, Clone, Debug, TypeFoldable, TypeVisitable, HashStable, TyEncodable, TyDecodable)]
 pub struct OpaqueHiddenType<'tcx> {
     /// The span of this particular definition of the opaque type. So
@@ -927,6 +864,30 @@ pub struct Placeholder<T> {
     pub universe: UniverseIndex,
     pub bound: T,
 }
+impl Placeholder<BoundVar> {
+    pub fn find_const_ty_from_env<'tcx>(self, env: ParamEnv<'tcx>) -> Ty<'tcx> {
+        let mut candidates = env.caller_bounds().iter().filter_map(|clause| {
+            // `ConstArgHasType` are never desugared to be higher ranked.
+            match clause.kind().skip_binder() {
+                ty::ClauseKind::ConstArgHasType(placeholder_ct, ty) => {
+                    assert!(!(placeholder_ct, ty).has_escaping_bound_vars());
+
+                    match placeholder_ct.kind() {
+                        ty::ConstKind::Placeholder(placeholder_ct) if placeholder_ct == self => {
+                            Some(ty)
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            }
+        });
+
+        let ty = candidates.next().unwrap();
+        assert!(candidates.next().is_none());
+        ty
+    }
+}
 
 pub type PlaceholderRegion = Placeholder<BoundRegion>;
 
@@ -1027,6 +988,16 @@ pub struct ParamEnv<'tcx> {
     ///
     /// Note: This is packed, use the reveal() method to access it.
     packed: CopyTaggedPtr<Clauses<'tcx>, ParamTag, true>,
+}
+
+impl<'tcx> rustc_type_ir::inherent::ParamEnv<TyCtxt<'tcx>> for ParamEnv<'tcx> {
+    fn reveal(self) -> Reveal {
+        self.reveal()
+    }
+
+    fn caller_bounds(self) -> impl IntoIterator<Item = ty::Clause<'tcx>> {
+        self.caller_bounds()
+    }
 }
 
 #[derive(Copy, Clone)]
@@ -1169,6 +1140,15 @@ pub struct Destructor {
     pub did: DefId,
     /// The constness of the destructor method
     pub constness: hir::Constness,
+}
+
+// FIXME: consider combining this definition with regular `Destructor`
+#[derive(Copy, Clone, Debug, HashStable, Encodable, Decodable)]
+pub struct AsyncDestructor {
+    /// The `DefId` of the async destructor future constructor
+    pub ctor: DefId,
+    /// The `DefId` of the async destructor future type
+    pub future: DefId,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, HashStable, TyEncodable, TyDecodable)]
@@ -1628,7 +1608,7 @@ impl<'tcx> TyCtxt<'tcx> {
         }
     }
 
-    /// If the def-id is an associated type that was desugared from a
+    /// If the `def_id` is an associated type that was desugared from a
     /// return-position `impl Trait` from a trait, then provide the source info
     /// about where that RPITIT came from.
     pub fn opt_rpitit_info(self, def_id: DefId) -> Option<ImplTraitInTraitData> {
@@ -1636,6 +1616,16 @@ impl<'tcx> TyCtxt<'tcx> {
             self.associated_item(def_id).opt_rpitit_info
         } else {
             None
+        }
+    }
+
+    /// Whether the `def_id` is an associated type that was desugared from a
+    /// `#[const_trait]` or `impl_const`.
+    pub fn is_effects_desugared_assoc_ty(self, def_id: DefId) -> bool {
+        if let DefKind::AssocTy = self.def_kind(def_id) {
+            self.associated_item(def_id).is_effects_desugaring
+        } else {
+            false
         }
     }
 
@@ -1723,11 +1713,11 @@ impl<'tcx> TyCtxt<'tcx> {
         }
     }
 
-    /// Returns the possibly-auto-generated MIR of a [`ty::InstanceDef`].
+    /// Returns the possibly-auto-generated MIR of a [`ty::InstanceKind`].
     #[instrument(skip(self), level = "debug")]
-    pub fn instance_mir(self, instance: ty::InstanceDef<'tcx>) -> &'tcx Body<'tcx> {
+    pub fn instance_mir(self, instance: ty::InstanceKind<'tcx>) -> &'tcx Body<'tcx> {
         match instance {
-            ty::InstanceDef::Item(def) => {
+            ty::InstanceKind::Item(def) => {
                 debug!("calling def_kind on def: {:?}", def);
                 let def_kind = self.def_kind(def);
                 debug!("returned from def_kind: {:?}", def_kind);
@@ -1743,19 +1733,19 @@ impl<'tcx> TyCtxt<'tcx> {
                     _ => self.optimized_mir(def),
                 }
             }
-            ty::InstanceDef::VTableShim(..)
-            | ty::InstanceDef::ReifyShim(..)
-            | ty::InstanceDef::Intrinsic(..)
-            | ty::InstanceDef::FnPtrShim(..)
-            | ty::InstanceDef::Virtual(..)
-            | ty::InstanceDef::ClosureOnceShim { .. }
-            | ty::InstanceDef::ConstructCoroutineInClosureShim { .. }
-            | ty::InstanceDef::CoroutineKindShim { .. }
-            | ty::InstanceDef::DropGlue(..)
-            | ty::InstanceDef::CloneShim(..)
-            | ty::InstanceDef::ThreadLocalShim(..)
-            | ty::InstanceDef::FnPtrAddrShim(..)
-            | ty::InstanceDef::AsyncDropGlueCtorShim(..) => self.mir_shims(instance),
+            ty::InstanceKind::VTableShim(..)
+            | ty::InstanceKind::ReifyShim(..)
+            | ty::InstanceKind::Intrinsic(..)
+            | ty::InstanceKind::FnPtrShim(..)
+            | ty::InstanceKind::Virtual(..)
+            | ty::InstanceKind::ClosureOnceShim { .. }
+            | ty::InstanceKind::ConstructCoroutineInClosureShim { .. }
+            | ty::InstanceKind::CoroutineKindShim { .. }
+            | ty::InstanceKind::DropGlue(..)
+            | ty::InstanceKind::CloneShim(..)
+            | ty::InstanceKind::ThreadLocalShim(..)
+            | ty::InstanceKind::FnPtrAddrShim(..)
+            | ty::InstanceKind::AsyncDropGlueCtorShim(..) => self.mir_shims(instance),
         }
     }
 

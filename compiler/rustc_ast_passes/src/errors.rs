@@ -93,13 +93,6 @@ pub struct FnParamTooMany {
 }
 
 #[derive(Diagnostic)]
-#[diag(ast_passes_fn_param_c_var_args_only)]
-pub struct FnParamCVarArgsOnly {
-    #[primary_span]
-    pub span: Span,
-}
-
-#[derive(Diagnostic)]
 #[diag(ast_passes_fn_param_c_var_args_not_last)]
 pub struct FnParamCVarArgsNotLast {
     #[primary_span]
@@ -221,6 +214,29 @@ pub enum ExternBlockSuggestion {
         end_span: Span,
         abi: Symbol,
     },
+}
+
+#[derive(Diagnostic)]
+#[diag(ast_passes_extern_invalid_safety)]
+pub struct InvalidSafetyOnExtern {
+    #[primary_span]
+    pub item_span: Span,
+    #[suggestion(code = "unsafe ", applicability = "machine-applicable", style = "verbose")]
+    pub block: Option<Span>,
+}
+
+#[derive(Diagnostic)]
+#[diag(ast_passes_item_invalid_safety)]
+pub struct InvalidSafetyOnItem {
+    #[primary_span]
+    pub span: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag(ast_passes_bare_fn_invalid_safety)]
+pub struct InvalidSafetyOnBareFn {
+    #[primary_span]
+    pub span: Span,
 }
 
 #[derive(Diagnostic)]
@@ -490,6 +506,13 @@ pub struct UnsafeItem {
     #[primary_span]
     pub span: Span,
     pub kind: &'static str,
+}
+
+#[derive(Diagnostic)]
+#[diag(ast_passes_missing_unsafe_on_extern)]
+pub struct MissingUnsafeOnExtern {
+    #[primary_span]
+    pub span: Span,
 }
 
 #[derive(Diagnostic)]
@@ -834,4 +857,21 @@ pub struct MatchArmWithNoBody {
     pub span: Span,
     #[suggestion(code = " => todo!(),", applicability = "has-placeholders")]
     pub suggestion: Span,
+}
+
+#[derive(Diagnostic)]
+#[diag(ast_passes_precise_capturing_not_allowed_here)]
+pub struct PreciseCapturingNotAllowedHere {
+    #[primary_span]
+    pub span: Span,
+    pub loc: &'static str,
+}
+
+#[derive(Diagnostic)]
+#[diag(ast_passes_precise_capturing_duplicated)]
+pub struct DuplicatePreciseCapturing {
+    #[primary_span]
+    pub bound1: Span,
+    #[label]
+    pub bound2: Span,
 }

@@ -3,6 +3,7 @@
 //! The main entry point is the `step` method.
 
 use either::Either;
+use tracing::{info, instrument, trace};
 
 use rustc_index::IndexSlice;
 use rustc_middle::mir;
@@ -15,7 +16,7 @@ use super::{
 };
 use crate::util;
 
-impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
+impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
     /// Returns `true` as long as there are more things to do.
     ///
     /// This is used by [priroda](https://github.com/oli-obk/priroda)
@@ -252,7 +253,10 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
                         Scalar::from_target_usize(val, self)
                     }
                     mir::NullOp::OffsetOf(fields) => {
-                        let val = layout.offset_of_subfield(self, fields.iter()).bytes();
+                        let val = self
+                            .tcx
+                            .offset_of_subfield(self.param_env, layout, fields.iter())
+                            .bytes();
                         Scalar::from_target_usize(val, self)
                     }
                     mir::NullOp::UbChecks => Scalar::from_bool(self.tcx.sess.ub_checks()),

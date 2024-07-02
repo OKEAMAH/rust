@@ -25,9 +25,10 @@
 //!
 //! This API is completely unstable and subject to change.
 
+// tidy-alphabetical-start
+#![allow(internal_features)]
 #![doc(html_root_url = "https://doc.rust-lang.org/nightly/nightly-rustc/")]
 #![doc(rust_logo)]
-#![feature(rustdoc_internals)]
 #![feature(array_windows)]
 #![feature(box_patterns)]
 #![feature(control_flow_enum)]
@@ -35,12 +36,10 @@
 #![feature(if_let_guard)]
 #![feature(iter_order_by)]
 #![feature(let_chains)]
-#![feature(trait_upcasting)]
 #![feature(rustc_attrs)]
-#![allow(internal_features)]
-
-#[macro_use]
-extern crate tracing;
+#![feature(rustdoc_internals)]
+#![feature(trait_upcasting)]
+// tidy-alphabetical-end
 
 mod async_fn_in_trait;
 pub mod builtin;
@@ -188,7 +187,6 @@ late_lint_methods!(
             ImproperCTypesDefinitions: ImproperCTypesDefinitions,
             InvalidFromUtf8: InvalidFromUtf8,
             VariantSizeDifferences: VariantSizeDifferences,
-            BoxPointers: BoxPointers,
             PathStatements: PathStatements,
             LetUnderscore: LetUnderscore,
             InvalidReferenceCasting: InvalidReferenceCasting,
@@ -541,6 +539,20 @@ fn register_builtins(store: &mut LintStore) {
         "const_patterns_without_partial_eq",
         "converted into hard error, see RFC #3535 \
          <https://rust-lang.github.io/rfcs/3535-constants-in-patterns.html> for more information",
+    );
+    store.register_removed(
+        "indirect_structural_match",
+        "converted into hard error, see RFC #3535 \
+         <https://rust-lang.github.io/rfcs/3535-constants-in-patterns.html> for more information",
+    );
+    store.register_removed(
+        "pointer_structural_match",
+        "converted into hard error, see RFC #3535 \
+         <https://rust-lang.github.io/rfcs/3535-constants-in-patterns.html> for more information",
+    );
+    store.register_removed(
+        "box_pointers",
+        "it does not detect other kinds of allocations, and existed only for historical reasons",
     );
 }
 

@@ -104,15 +104,18 @@ fn main() {}
 
 struct D;
 
+/* FIXME(effects)
 impl const Drop for D {
     fn drop(&mut self) {
         todo!();
     }
 }
+*/
 
 // Lint this, since it can be dropped in const contexts
 // FIXME(effects)
 fn d(this: D) {}
+//~^ ERROR: this could be a `const fn`
 
 mod msrv {
     struct Foo(*const u8, &'static u8);
@@ -139,5 +142,35 @@ mod msrv {
         //~^ ERROR: this could be a `const fn`
         let bar = Bar { val: 1 };
         let _ = unsafe { bar.val };
+    }
+}
+
+mod issue12677 {
+    pub struct Wrapper {
+        pub strings: Vec<String>,
+    }
+
+    impl Wrapper {
+        #[must_use]
+        pub fn new(strings: Vec<String>) -> Self {
+            Self { strings }
+        }
+
+        #[must_use]
+        pub fn empty() -> Self {
+            Self { strings: Vec::new() }
+        }
+    }
+
+    pub struct Other {
+        pub text: String,
+        pub vec: Vec<String>,
+    }
+
+    impl Other {
+        pub fn new(text: String) -> Self {
+            let vec = Vec::new();
+            Self { text, vec }
+        }
     }
 }

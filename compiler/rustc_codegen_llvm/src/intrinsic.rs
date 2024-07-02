@@ -21,6 +21,7 @@ use rustc_middle::{bug, span_bug};
 use rustc_span::{sym, Span, Symbol};
 use rustc_target::abi::{self, Align, Float, HasDataLayout, Primitive, Size};
 use rustc_target::spec::{HasTargetSpec, PanicStrategy};
+use tracing::debug;
 
 use std::cmp::Ordering;
 
@@ -481,8 +482,60 @@ impl<'ll, 'tcx> IntrinsicCallMethods<'tcx> for Builder<'_, 'll, 'tcx> {
             }
 
             _ if name.as_str().starts_with("simd_") => {
+                // Unpack non-power-of-2 #[repr(packed, simd)] arguments.
+                // This gives them the expected layout of a regular #[repr(simd)] vector.
+                let mut loaded_args = Vec::new();
+                for (ty, arg) in arg_tys.iter().zip(args) {
+                    loaded_args.push(
+                        // #[repr(packed, simd)] vectors are passed like arrays (as references,
+                        // with reduced alignment and no padding) rather than as immediates.
+                        // We can use a vector load to fix the layout and turn the argument
+                        // into an immediate.
+                        if ty.is_simd()
+                            && let OperandValue::Ref(place) = arg.val
+                        {
+                            let (size, elem_ty) = ty.simd_size_and_type(self.tcx());
+                            let elem_ll_ty = match elem_ty.kind() {
+                                ty::Float(f) => self.type_float_from_ty(*f),
+                                ty::Int(i) => self.type_int_from_ty(*i),
+                                ty::Uint(u) => self.type_uint_from_ty(*u),
+                                ty::RawPtr(_, _) => self.type_ptr(),
+                                _ => unreachable!(),
+                            };
+                            let loaded =
+                                self.load_from_place(self.type_vector(elem_ll_ty, size), place);
+                            OperandRef::from_immediate_or_packed_pair(self, loaded, arg.layout)
+                        } else {
+                            *arg
+                        },
+                    );
+                }
+
+                let llret_ty = if ret_ty.is_simd()
+                    && let abi::Abi::Aggregate { .. } = self.layout_of(ret_ty).layout.abi
+                {
+                    let (size, elem_ty) = ret_ty.simd_size_and_type(self.tcx());
+                    let elem_ll_ty = match elem_ty.kind() {
+                        ty::Float(f) => self.type_float_from_ty(*f),
+                        ty::Int(i) => self.type_int_from_ty(*i),
+                        ty::Uint(u) => self.type_uint_from_ty(*u),
+                        ty::RawPtr(_, _) => self.type_ptr(),
+                        _ => unreachable!(),
+                    };
+                    self.type_vector(elem_ll_ty, size)
+                } else {
+                    llret_ty
+                };
+
                 match generic_simd_intrinsic(
-                    self, name, callee_ty, fn_args, args, ret_ty, llret_ty, span,
+                    self,
+                    name,
+                    callee_ty,
+                    fn_args,
+                    &loaded_args,
+                    ret_ty,
+                    llret_ty,
+                    span,
                 ) {
                     Ok(llval) => llval,
                     Err(()) => return Ok(()),
@@ -1056,10 +1109,12 @@ fn generic_simd_intrinsic<'ll, 'tcx>(
         tcx.normalize_erasing_late_bound_regions(ty::ParamEnv::reveal_all(), callee_ty.fn_sig(tcx));
     let arg_tys = sig.inputs();
 
-    // Vectors must be immediates (non-power-of-2 #[repr(packed)] are not)
-    for (ty, arg) in arg_tys.iter().zip(args) {
-        if ty.is_simd() && !matches!(arg.val, OperandValue::Immediate(_)) {
-            return_error!(InvalidMonomorphization::SimdArgument { span, name, ty: *ty });
+    // Sanity-check: all vector arguments must be immediates.
+    if cfg!(debug_assertions) {
+        for (ty, arg) in arg_tys.iter().zip(args) {
+            if ty.is_simd() {
+                assert!(matches!(arg.val, OperandValue::Immediate(_)));
+            }
         }
     }
 
@@ -1148,6 +1203,7 @@ fn generic_simd_intrinsic<'ll, 'tcx>(
             .expect_const()
             .eval(tcx, ty::ParamEnv::reveal_all(), span)
             .unwrap()
+            .1
             .unwrap_branch();
         let n = idx.len() as u64;
 
@@ -1167,7 +1223,7 @@ fn generic_simd_intrinsic<'ll, 'tcx>(
             .iter()
             .enumerate()
             .map(|(arg_idx, val)| {
-                let idx = val.unwrap_leaf().try_to_i32().unwrap();
+                let idx = val.unwrap_leaf().to_i32();
                 if idx >= i32::try_from(total_len).unwrap() {
                     bx.sess().dcx().emit_err(InvalidMonomorphization::SimdIndexOutOfBounds {
                         span,

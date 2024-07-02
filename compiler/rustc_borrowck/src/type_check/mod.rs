@@ -27,8 +27,9 @@ use rustc_middle::ty::adjustment::PointerCoercion;
 use rustc_middle::ty::cast::CastTy;
 use rustc_middle::ty::visit::TypeVisitableExt;
 use rustc_middle::ty::{
-    self, Binder, CanonicalUserTypeAnnotation, CanonicalUserTypeAnnotations, Dynamic,
-    OpaqueHiddenType, OpaqueTypeKey, RegionVid, Ty, TyCtxt, UserType, UserTypeAnnotationIndex,
+    self, Binder, CanonicalUserTypeAnnotation, CanonicalUserTypeAnnotations, CoroutineArgsExt,
+    Dynamic, OpaqueHiddenType, OpaqueTypeKey, RegionVid, Ty, TyCtxt, UserType,
+    UserTypeAnnotationIndex,
 };
 use rustc_middle::ty::{GenericArgsRef, UserArgs};
 use rustc_middle::{bug, span_bug};
@@ -128,11 +129,10 @@ pub(crate) fn type_check<'mir, 'tcx>(
     location_table: &LocationTable,
     borrow_set: &BorrowSet<'tcx>,
     all_facts: &mut Option<AllFacts>,
-    flow_inits: &mut ResultsCursor<'mir, 'tcx, MaybeInitializedPlaces<'mir, 'tcx>>,
+    flow_inits: &mut ResultsCursor<'mir, 'tcx, MaybeInitializedPlaces<'_, 'mir, 'tcx>>,
     move_data: &MoveData<'tcx>,
     elements: &Rc<DenseLocationMap>,
     upvars: &[&ty::CapturedPlace<'tcx>],
-    use_polonius: bool,
 ) -> MirTypeckResults<'tcx> {
     let implicit_region_bound = ty::Region::new_var(infcx.tcx, universal_regions.fr_fn_body);
     let mut constraints = MirTypeckRegionConstraints {
@@ -188,15 +188,7 @@ pub(crate) fn type_check<'mir, 'tcx>(
     checker.equate_inputs_and_outputs(body, universal_regions, &normalized_inputs_and_output);
     checker.check_signature_annotation(body);
 
-    liveness::generate(
-        &mut checker,
-        body,
-        elements,
-        flow_inits,
-        move_data,
-        location_table,
-        use_polonius,
-    );
+    liveness::generate(&mut checker, body, elements, flow_inits, move_data);
 
     translate_outlives_facts(&mut checker);
     let opaque_type_values = infcx.take_opaque_types();
@@ -308,10 +300,10 @@ impl<'a, 'b, 'tcx> Visitor<'tcx> for TypeVerifier<'a, 'b, 'tcx> {
         self.sanitize_place(place, location, context);
     }
 
-    fn visit_constant(&mut self, constant: &ConstOperand<'tcx>, location: Location) {
-        debug!(?constant, ?location, "visit_constant");
+    fn visit_const_operand(&mut self, constant: &ConstOperand<'tcx>, location: Location) {
+        debug!(?constant, ?location, "visit_const_operand");
 
-        self.super_constant(constant, location);
+        self.super_const_operand(constant, location);
         let ty = self.sanitize_type(constant, constant.const_.ty());
 
         self.cx.infcx.tcx.for_each_free_region(&ty, |live_region| {
@@ -335,7 +327,7 @@ impl<'a, 'b, 'tcx> Visitor<'tcx> for TypeVerifier<'a, 'b, 'tcx> {
         if let Some(annotation_index) = constant.user_ty {
             if let Err(terr) = self.cx.relate_type_and_user_type(
                 constant.const_.ty(),
-                ty::Variance::Invariant,
+                ty::Invariant,
                 &UserTypeProjection { base: annotation_index, projs: vec![] },
                 locations,
                 ConstraintCategory::Boring,
@@ -353,7 +345,7 @@ impl<'a, 'b, 'tcx> Visitor<'tcx> for TypeVerifier<'a, 'b, 'tcx> {
         } else {
             let tcx = self.tcx();
             let maybe_uneval = match constant.const_ {
-                Const::Ty(ct) => match ct.kind() {
+                Const::Ty(_, ct) => match ct.kind() {
                     ty::ConstKind::Unevaluated(_) => {
                         bug!("should not encounter unevaluated Const::Ty here, got {:?}", ct)
                     }
@@ -458,7 +450,7 @@ impl<'a, 'b, 'tcx> Visitor<'tcx> for TypeVerifier<'a, 'b, 'tcx> {
 
                 if let Err(terr) = self.cx.relate_type_and_user_type(
                     ty,
-                    ty::Variance::Invariant,
+                    ty::Invariant,
                     user_ty,
                     Locations::All(*span),
                     ConstraintCategory::TypeAnnotation,
@@ -1102,7 +1094,7 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
     ) -> Result<(), NoSolution> {
         // Use this order of parameters because the sup type is usually the
         // "expected" type in diagnostics.
-        self.relate_types(sup, ty::Variance::Contravariant, sub, locations, category)
+        self.relate_types(sup, ty::Contravariant, sub, locations, category)
     }
 
     #[instrument(skip(self, category), level = "debug")]
@@ -1113,7 +1105,7 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
         locations: Locations,
         category: ConstraintCategory<'tcx>,
     ) -> Result<(), NoSolution> {
-        self.relate_types(expected, ty::Variance::Invariant, found, locations, category)
+        self.relate_types(expected, ty::Invariant, found, locations, category)
     }
 
     #[instrument(skip(self), level = "debug")]
@@ -1153,7 +1145,7 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
         trace!(?curr_projected_ty);
 
         let ty = curr_projected_ty.ty;
-        self.relate_types(ty, v.xform(ty::Variance::Contravariant), a, locations, category)?;
+        self.relate_types(ty, v.xform(ty::Contravariant), a, locations, category)?;
 
         Ok(())
     }
@@ -1255,7 +1247,7 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
                 if let Some(annotation_index) = self.rvalue_user_ty(rv) {
                     if let Err(terr) = self.relate_type_and_user_type(
                         rv_ty,
-                        ty::Variance::Invariant,
+                        ty::Invariant,
                         &UserTypeProjection { base: annotation_index, projs: vec![] },
                         location.to_locations(),
                         ConstraintCategory::Boring,
@@ -1863,7 +1855,7 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
 
         if let Operand::Constant(constant) = op {
             let maybe_uneval = match constant.const_ {
-                Const::Val(..) | Const::Ty(_) => None,
+                Const::Val(..) | Const::Ty(_, _) => None,
                 Const::Unevaluated(uv, _) => Some(uv),
             };
 
