@@ -1,27 +1,25 @@
+use std::rc::Rc;
+
 use rustc_data_structures::frozen::Frozen;
 use rustc_data_structures::transitive_relation::{TransitiveRelation, TransitiveRelationBuilder};
 use rustc_hir::def::DefKind;
 use rustc_infer::infer::canonical::QueryRegionConstraints;
-use rustc_infer::infer::outlives;
 use rustc_infer::infer::outlives::env::RegionBoundPairs;
 use rustc_infer::infer::region_constraints::GenericKind;
-use rustc_infer::infer::InferCtxt;
+use rustc_infer::infer::{InferCtxt, outlives};
 use rustc_middle::mir::ConstraintCategory;
-use rustc_middle::traits::query::OutlivesBound;
 use rustc_middle::traits::ObligationCause;
+use rustc_middle::traits::query::OutlivesBound;
 use rustc_middle::ty::{self, RegionVid, Ty, TypeVisitableExt};
 use rustc_span::{ErrorGuaranteed, Span};
+use rustc_trait_selection::error_reporting::InferCtxtErrorExt;
 use rustc_trait_selection::solve::deeply_normalize;
-use rustc_trait_selection::traits::error_reporting::TypeErrCtxtExt;
 use rustc_trait_selection::traits::query::type_op::{self, TypeOp};
-use std::rc::Rc;
+use tracing::{debug, instrument};
 use type_op::TypeOpOutput;
 
-use crate::{
-    type_check::constraint_conversion,
-    type_check::{Locations, MirTypeckRegionConstraints},
-    universal_regions::UniversalRegions,
-};
+use crate::type_check::{Locations, MirTypeckRegionConstraints, constraint_conversion};
+use crate::universal_regions::UniversalRegions;
 
 #[derive(Debug)]
 pub(crate) struct UniversalRegionRelations<'tcx> {
@@ -56,7 +54,7 @@ pub(crate) fn create<'tcx>(
     infcx: &InferCtxt<'tcx>,
     param_env: ty::ParamEnv<'tcx>,
     implicit_region_bound: ty::Region<'tcx>,
-    universal_regions: &Rc<UniversalRegions<'tcx>>,
+    universal_regions: Rc<UniversalRegions<'tcx>>,
     constraints: &mut MirTypeckRegionConstraints<'tcx>,
 ) -> CreateResult<'tcx> {
     UniversalRegionRelationsBuilder {
@@ -64,7 +62,7 @@ pub(crate) fn create<'tcx>(
         param_env,
         implicit_region_bound,
         constraints,
-        universal_regions: universal_regions.clone(),
+        universal_regions,
         region_bound_pairs: Default::default(),
         outlives: Default::default(),
         inverse_outlives: Default::default(),
@@ -183,12 +181,12 @@ impl UniversalRegionRelations<'_> {
     }
 }
 
-struct UniversalRegionRelationsBuilder<'this, 'tcx> {
-    infcx: &'this InferCtxt<'tcx>,
+struct UniversalRegionRelationsBuilder<'a, 'tcx> {
+    infcx: &'a InferCtxt<'tcx>,
     param_env: ty::ParamEnv<'tcx>,
     universal_regions: Rc<UniversalRegions<'tcx>>,
     implicit_region_bound: ty::Region<'tcx>,
-    constraints: &'this mut MirTypeckRegionConstraints<'tcx>,
+    constraints: &'a mut MirTypeckRegionConstraints<'tcx>,
 
     // outputs:
     outlives: TransitiveRelationBuilder<RegionVid>,

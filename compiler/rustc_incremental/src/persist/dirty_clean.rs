@@ -19,20 +19,20 @@
 //! Errors are reported if we are in the suitable configuration but
 //! the required condition is not met.
 
-use crate::errors;
-use rustc_ast::{self as ast, Attribute, NestedMetaItem};
+use rustc_ast::{self as ast, Attribute, MetaItemInner};
 use rustc_data_structures::fx::FxHashSet;
 use rustc_data_structures::unord::UnordSet;
 use rustc_hir::def_id::LocalDefId;
-use rustc_hir::intravisit;
-use rustc_hir::Node as HirNode;
-use rustc_hir::{ImplItemKind, ItemKind as HirItem, TraitItemKind};
-use rustc_middle::dep_graph::{label_strs, DepNode, DepNodeExt};
+use rustc_hir::{ImplItemKind, ItemKind as HirItem, Node as HirNode, TraitItemKind, intravisit};
+use rustc_middle::dep_graph::{DepNode, DepNodeExt, label_strs};
 use rustc_middle::hir::nested_filter;
 use rustc_middle::ty::TyCtxt;
-use rustc_span::symbol::{sym, Symbol};
 use rustc_span::Span;
+use rustc_span::symbol::{Symbol, sym};
 use thin_vec::ThinVec;
+use tracing::debug;
+
+use crate::errors;
 
 const LOADED_FROM_DISK: Symbol = sym::loaded_from_disk;
 const EXCEPT: Symbol = sym::except;
@@ -106,10 +106,11 @@ const LABELS_FN_IN_TRAIT: &[&[&str]] =
 const LABELS_HIR_ONLY: &[&[&str]] = &[BASE_HIR];
 
 /// Impl `DepNode`s.
-const LABELS_TRAIT: &[&[&str]] = &[
-    BASE_HIR,
-    &[label_strs::associated_item_def_ids, label_strs::predicates_of, label_strs::generics_of],
-];
+const LABELS_TRAIT: &[&[&str]] = &[BASE_HIR, &[
+    label_strs::associated_item_def_ids,
+    label_strs::predicates_of,
+    label_strs::generics_of,
+]];
 
 /// Impl `DepNode`s.
 const LABELS_IMPL: &[&[&str]] = &[BASE_HIR, BASE_IMPL];
@@ -133,7 +134,7 @@ struct Assertion {
     loaded_from_disk: Labels,
 }
 
-pub fn check_dirty_clean_annotations(tcx: TyCtxt<'_>) {
+pub(crate) fn check_dirty_clean_annotations(tcx: TyCtxt<'_>) {
     if !tcx.sess.opts.unstable_opts.query_dep_graph {
         return;
     }
@@ -174,7 +175,7 @@ pub fn check_dirty_clean_annotations(tcx: TyCtxt<'_>) {
     })
 }
 
-pub struct DirtyCleanVisitor<'tcx> {
+struct DirtyCleanVisitor<'tcx> {
     tcx: TyCtxt<'tcx>,
     checked_attrs: FxHashSet<ast::AttrId>,
 }
@@ -306,7 +307,7 @@ impl<'tcx> DirtyCleanVisitor<'tcx> {
         (name, labels)
     }
 
-    fn resolve_labels(&self, item: &NestedMetaItem, value: Symbol) -> Labels {
+    fn resolve_labels(&self, item: &MetaItemInner, value: Symbol) -> Labels {
         let mut out = Labels::default();
         for label in value.as_str().split(',') {
             let label = label.trim();
@@ -414,22 +415,20 @@ fn check_config(tcx: TyCtxt<'_>, attr: &Attribute) -> bool {
     }
 }
 
-fn expect_associated_value(tcx: TyCtxt<'_>, item: &NestedMetaItem) -> Symbol {
+fn expect_associated_value(tcx: TyCtxt<'_>, item: &MetaItemInner) -> Symbol {
     if let Some(value) = item.value_str() {
         value
+    } else if let Some(ident) = item.ident() {
+        tcx.dcx().emit_fatal(errors::AssociatedValueExpectedFor { span: item.span(), ident });
     } else {
-        if let Some(ident) = item.ident() {
-            tcx.dcx().emit_fatal(errors::AssociatedValueExpectedFor { span: item.span(), ident });
-        } else {
-            tcx.dcx().emit_fatal(errors::AssociatedValueExpected { span: item.span() });
-        }
+        tcx.dcx().emit_fatal(errors::AssociatedValueExpected { span: item.span() });
     }
 }
 
 /// A visitor that collects all `#[rustc_clean]` attributes from
 /// the HIR. It is used to verify that we really ran checks for all annotated
 /// nodes.
-pub struct FindAllAttrs<'tcx> {
+struct FindAllAttrs<'tcx> {
     tcx: TyCtxt<'tcx>,
     found_attrs: Vec<&'tcx Attribute>,
 }

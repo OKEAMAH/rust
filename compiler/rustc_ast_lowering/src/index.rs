@@ -6,7 +6,7 @@ use rustc_hir::*;
 use rustc_index::IndexVec;
 use rustc_middle::span_bug;
 use rustc_middle::ty::TyCtxt;
-use rustc_span::{Span, DUMMY_SP};
+use rustc_span::{DUMMY_SP, Span};
 use tracing::{debug, instrument};
 
 /// A visitor that walks over the HIR and collects `Node`s into a HIR map.
@@ -78,26 +78,24 @@ impl<'a, 'hir> NodeCollector<'a, 'hir> {
 
         // Make sure that the DepNode of some node coincides with the HirId
         // owner of that node.
-        if cfg!(debug_assertions) {
-            if hir_id.owner != self.owner {
-                span_bug!(
-                    span,
-                    "inconsistent HirId at `{:?}` for `{:?}`: \
+        if cfg!(debug_assertions) && hir_id.owner != self.owner {
+            span_bug!(
+                span,
+                "inconsistent HirId at `{:?}` for `{:?}`: \
                      current_dep_node_owner={} ({:?}), hir_id.owner={} ({:?})",
-                    self.tcx.sess.source_map().span_to_diagnostic_string(span),
-                    node,
-                    self.tcx
-                        .definitions_untracked()
-                        .def_path(self.owner.def_id)
-                        .to_string_no_crate_verbose(),
-                    self.owner,
-                    self.tcx
-                        .definitions_untracked()
-                        .def_path(hir_id.owner.def_id)
-                        .to_string_no_crate_verbose(),
-                    hir_id.owner,
-                )
-            }
+                self.tcx.sess.source_map().span_to_diagnostic_string(span),
+                node,
+                self.tcx
+                    .definitions_untracked()
+                    .def_path(self.owner.def_id)
+                    .to_string_no_crate_verbose(),
+                self.owner,
+                self.tcx
+                    .definitions_untracked()
+                    .def_path(hir_id.owner.def_id)
+                    .to_string_no_crate_verbose(),
+                hir_id.owner,
+            )
         }
 
         self.nodes[hir_id.local_id] = ParentedNode { parent: self.parent_node, node };
@@ -181,7 +179,7 @@ impl<'a, 'hir> Visitor<'hir> for NodeCollector<'a, 'hir> {
         intravisit::walk_generic_param(self, param);
     }
 
-    fn visit_const_param_default(&mut self, param: HirId, ct: &'hir AnonConst) {
+    fn visit_const_param_default(&mut self, param: HirId, ct: &'hir ConstArg<'hir>) {
         self.with_parent(param, |this| {
             intravisit::walk_const_param_default(this, ct);
         })
@@ -228,7 +226,16 @@ impl<'a, 'hir> Visitor<'hir> for NodeCollector<'a, 'hir> {
         });
     }
 
+    fn visit_opaque_ty(&mut self, opaq: &'hir OpaqueTy<'hir>) {
+        self.insert(opaq.span, opaq.hir_id, Node::OpaqueTy(opaq));
+
+        self.with_parent(opaq.hir_id, |this| {
+            intravisit::walk_opaque_ty(this, opaq);
+        });
+    }
+
     fn visit_anon_const(&mut self, constant: &'hir AnonConst) {
+        // FIXME: use real span?
         self.insert(DUMMY_SP, constant.hir_id, Node::AnonConst(constant));
 
         self.with_parent(constant.hir_id, |this| {
@@ -241,6 +248,15 @@ impl<'a, 'hir> Visitor<'hir> for NodeCollector<'a, 'hir> {
 
         self.with_parent(constant.hir_id, |this| {
             intravisit::walk_inline_const(this, constant);
+        });
+    }
+
+    fn visit_const_arg(&mut self, const_arg: &'hir ConstArg<'hir>) {
+        // FIXME: use real span?
+        self.insert(DUMMY_SP, const_arg.hir_id, Node::ConstArg(const_arg));
+
+        self.with_parent(const_arg.hir_id, |this| {
+            intravisit::walk_const_arg(this, const_arg);
         });
     }
 
@@ -333,10 +349,10 @@ impl<'a, 'hir> Visitor<'hir> for NodeCollector<'a, 'hir> {
         });
     }
 
-    fn visit_assoc_type_binding(&mut self, type_binding: &'hir TypeBinding<'hir>) {
-        self.insert(type_binding.span, type_binding.hir_id, Node::TypeBinding(type_binding));
-        self.with_parent(type_binding.hir_id, |this| {
-            intravisit::walk_assoc_type_binding(this, type_binding)
+    fn visit_assoc_item_constraint(&mut self, constraint: &'hir AssocItemConstraint<'hir>) {
+        self.insert(constraint.span, constraint.hir_id, Node::AssocItemConstraint(constraint));
+        self.with_parent(constraint.hir_id, |this| {
+            intravisit::walk_assoc_item_constraint(this, constraint)
         })
     }
 

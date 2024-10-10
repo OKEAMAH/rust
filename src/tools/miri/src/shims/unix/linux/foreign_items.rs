@@ -1,27 +1,26 @@
 use rustc_span::Symbol;
 use rustc_target::spec::abi::Abi;
 
-use crate::machine::SIGRTMAX;
-use crate::machine::SIGRTMIN;
+use self::shims::unix::linux::epoll::EvalContextExt as _;
+use self::shims::unix::linux::eventfd::EvalContextExt as _;
+use self::shims::unix::linux::mem::EvalContextExt as _;
+use self::shims::unix::linux::sync::futex;
+use crate::machine::{SIGRTMAX, SIGRTMIN};
 use crate::shims::unix::*;
 use crate::*;
-use shims::unix::linux::epoll::EvalContextExt as _;
-use shims::unix::linux::eventfd::EvalContextExt as _;
-use shims::unix::linux::mem::EvalContextExt as _;
-use shims::unix::linux::sync::futex;
 
 pub fn is_dyn_sym(name: &str) -> bool {
     matches!(name, "statx")
 }
 
-impl<'mir, 'tcx: 'mir> EvalContextExt<'mir, 'tcx> for crate::MiriInterpCx<'mir, 'tcx> {}
-pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
+impl<'tcx> EvalContextExt<'tcx> for crate::MiriInterpCx<'tcx> {}
+pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
     fn emulate_foreign_item_inner(
         &mut self,
         link_name: Symbol,
         abi: Abi,
-        args: &[OpTy<'tcx, Provenance>],
-        dest: &MPlaceTy<'tcx, Provenance>,
+        args: &[OpTy<'tcx>],
+        dest: &MPlaceTy<'tcx>,
     ) -> InterpResult<'tcx, EmulateItemResult> {
         let this = self.eval_context_mut();
 
@@ -44,7 +43,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 let [dirfd, pathname, flags, mask, statxbuf] =
                     this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
                 let result = this.linux_statx(dirfd, pathname, flags, mask, statxbuf)?;
-                this.write_scalar(Scalar::from_i32(result), dest)?;
+                this.write_scalar(result, dest)?;
             }
 
             // epoll, eventfd
@@ -62,8 +61,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             "epoll_wait" => {
                 let [epfd, events, maxevents, timeout] =
                     this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
-                let result = this.epoll_wait(epfd, events, maxevents, timeout)?;
-                this.write_scalar(result, dest)?;
+                this.epoll_wait(epfd, events, maxevents, timeout, dest)?;
             }
             "eventfd" => {
                 let [val, flag] =
@@ -94,6 +92,11 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 )?;
                 this.write_scalar(res, dest)?;
             }
+            "gettid" => {
+                let [] = this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
+                let result = this.linux_gettid()?;
+                this.write_scalar(result, dest)?;
+            }
 
             // Dynamically invoked syscalls
             "syscall" => {
@@ -119,19 +122,19 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                     id if id == sys_getrandom => {
                         // Used by getrandom 0.1
                         // The first argument is the syscall id, so skip over it.
-                        if args.len() < 4 {
+                        let [_, ptr, len, flags, ..] = args else {
                             throw_ub_format!(
                                 "incorrect number of arguments for `getrandom` syscall: got {}, expected at least 4",
                                 args.len()
                             );
-                        }
+                        };
 
-                        let ptr = this.read_pointer(&args[1])?;
-                        let len = this.read_target_usize(&args[2])?;
+                        let ptr = this.read_pointer(ptr)?;
+                        let len = this.read_target_usize(len)?;
                         // The only supported flags are GRND_RANDOM and GRND_NONBLOCK,
                         // neither of which have any effect on our current PRNG.
                         // See <https://github.com/rust-lang/rust/pull/79196> for a discussion of argument sizes.
-                        let _flags = this.read_scalar(&args[3])?.to_i32();
+                        let _flags = this.read_scalar(flags)?.to_i32()?;
 
                         this.gen_random(ptr, len)?;
                         this.write_scalar(Scalar::from_target_usize(len, this), dest)?;
@@ -144,7 +147,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                         this.handle_unsupported_foreign_item(format!(
                             "can't execute syscall with ID {id}"
                         ))?;
-                        return Ok(EmulateItemResult::AlreadyJumped);
+                        return interp_ok(EmulateItemResult::AlreadyJumped);
                     }
                 }
             }
@@ -171,25 +174,12 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             "__libc_current_sigrtmin" => {
                 let [] = this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
 
-                this.write_scalar(Scalar::from_i32(SIGRTMIN), dest)?;
+                this.write_int(SIGRTMIN, dest)?;
             }
             "__libc_current_sigrtmax" => {
                 let [] = this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
 
-                this.write_scalar(Scalar::from_i32(SIGRTMAX), dest)?;
-            }
-            "sched_getaffinity" => {
-                // This shim isn't useful, aside from the fact that it makes `num_cpus`
-                // fall back to `sysconf` where it will successfully determine the number of CPUs.
-                let [pid, cpusetsize, mask] =
-                    this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
-                this.read_scalar(pid)?.to_i32()?;
-                this.read_target_usize(cpusetsize)?;
-                this.deref_pointer_as(mask, this.libc_ty_layout("cpu_set_t"))?;
-                // FIXME: we just return an error.
-                let einval = this.eval_libc("EINVAL");
-                this.set_last_error(einval)?;
-                this.write_scalar(Scalar::from_i32(-1), dest)?;
+                this.write_int(SIGRTMAX, dest)?;
             }
 
             // Incomplete shims that we "stub out" just to get pre-main initialization code to work.
@@ -200,9 +190,9 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 this.write_null(dest)?;
             }
 
-            _ => return Ok(EmulateItemResult::NotSupported),
+            _ => return interp_ok(EmulateItemResult::NotSupported),
         };
 
-        Ok(EmulateItemResult::NeedsReturn)
+        interp_ok(EmulateItemResult::NeedsReturn)
     }
 }

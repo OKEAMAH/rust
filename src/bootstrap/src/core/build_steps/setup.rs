@@ -5,20 +5,21 @@
 //! allows setting up things that cannot be simply captured inside the config.toml, in addition to
 //! leading people away from manually editing most of the config.toml values.
 
-use crate::core::builder::{Builder, RunConfig, ShouldRun, Step};
-use crate::t;
-use crate::utils::change_tracker::CONFIG_CHANGE_HISTORY;
-use crate::utils::helpers::hex_encode;
-use crate::Config;
-use sha2::Digest;
 use std::env::consts::EXE_SUFFIX;
 use std::fmt::Write as _;
 use std::fs::File;
 use std::io::Write;
-use std::path::{Path, PathBuf, MAIN_SEPARATOR_STR};
-use std::process::Command;
+use std::path::{MAIN_SEPARATOR_STR, Path, PathBuf};
 use std::str::FromStr;
 use std::{fmt, fs, io};
+
+use sha2::Digest;
+
+use crate::core::builder::{Builder, RunConfig, ShouldRun, Step};
+use crate::utils::change_tracker::CONFIG_CHANGE_HISTORY;
+use crate::utils::exec::command;
+use crate::utils::helpers::{self, hex_encode};
+use crate::{Config, t};
 
 #[cfg(test)]
 mod tests;
@@ -33,20 +34,6 @@ pub enum Profile {
 }
 
 static PROFILE_DIR: &str = "src/bootstrap/defaults";
-
-/// A list of historical hashes of `src/etc/rust_analyzer_settings.json`.
-/// New entries should be appended whenever this is updated so we can detect
-/// outdated vs. user-modified settings files.
-static SETTINGS_HASHES: &[&str] = &[
-    "ea67e259dedf60d4429b6c349a564ffcd1563cf41c920a856d1f5b16b4701ac8",
-    "56e7bf011c71c5d81e0bf42e84938111847a810eee69d906bba494ea90b51922",
-    "af1b5efe196aed007577899db9dae15d6dbc923d6fa42fa0934e68617ba9bbe0",
-    "3468fea433c25fff60be6b71e8a215a732a7b1268b6a83bf10d024344e140541",
-    "47d227f424bf889b0d899b9cc992d5695e1b78c406e183cd78eafefbe5488923",
-    "b526bd58d0262dd4dda2bff5bc5515b705fb668a46235ace3e057f807963a11a",
-    "828666b021d837a33e78d870b56d34c88a5e2c85de58b693607ec574f0c27000",
-];
-static RUST_ANALYZER_SETTINGS: &str = include_str!("../../../../etc/rust_analyzer_settings.json");
 
 impl Profile {
     fn include_path(&self, src_path: &Path) -> PathBuf {
@@ -246,9 +233,11 @@ pub struct Link;
 impl Step for Link {
     type Output = ();
     const DEFAULT: bool = true;
+
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
         run.alias("link")
     }
+
     fn make_run(run: RunConfig<'_>) {
         if run.builder.config.dry_run() {
             return;
@@ -261,25 +250,30 @@ impl Step for Link {
     }
     fn run(self, builder: &Builder<'_>) -> Self::Output {
         let config = &builder.config;
+
         if config.dry_run() {
             return;
         }
+
+        if !rustup_installed(builder) {
+            println!("WARNING: `rustup` is not installed; Skipping `stage1` toolchain linking.");
+            return;
+        }
+
         let stage_path =
             ["build", config.build.rustc_target_arg(), "stage1"].join(MAIN_SEPARATOR_STR);
-        if !rustup_installed() {
-            eprintln!("`rustup` is not installed; cannot link `stage1` toolchain");
-        } else if stage_dir_exists(&stage_path[..]) && !config.dry_run() {
-            attempt_toolchain_link(&stage_path[..]);
+
+        if stage_dir_exists(&stage_path[..]) && !config.dry_run() {
+            attempt_toolchain_link(builder, &stage_path[..]);
         }
     }
 }
 
-fn rustup_installed() -> bool {
-    Command::new("rustup")
-        .arg("--version")
-        .stdout(std::process::Stdio::null())
-        .output()
-        .map_or(false, |output| output.status.success())
+fn rustup_installed(builder: &Builder<'_>) -> bool {
+    let mut rustup = command("rustup");
+    rustup.arg("--version");
+
+    rustup.allow_failure().run_always().run_capture_stdout(builder).is_success()
 }
 
 fn stage_dir_exists(stage_path: &str) -> bool {
@@ -289,8 +283,8 @@ fn stage_dir_exists(stage_path: &str) -> bool {
     }
 }
 
-fn attempt_toolchain_link(stage_path: &str) {
-    if toolchain_is_linked() {
+fn attempt_toolchain_link(builder: &Builder<'_>, stage_path: &str) {
+    if toolchain_is_linked(builder) {
         return;
     }
 
@@ -301,7 +295,7 @@ fn attempt_toolchain_link(stage_path: &str) {
         return;
     }
 
-    if try_link_toolchain(stage_path) {
+    if try_link_toolchain(builder, stage_path) {
         println!(
             "Added `stage1` rustup toolchain; try `cargo +stage1 build` on a separate rust project to run a newly-built toolchain"
         );
@@ -315,14 +309,15 @@ fn attempt_toolchain_link(stage_path: &str) {
     }
 }
 
-fn toolchain_is_linked() -> bool {
-    match Command::new("rustup")
+fn toolchain_is_linked(builder: &Builder<'_>) -> bool {
+    match command("rustup")
+        .allow_failure()
         .args(["toolchain", "list"])
-        .stdout(std::process::Stdio::piped())
-        .output()
+        .run_capture_stdout(builder)
+        .stdout_if_ok()
     {
-        Ok(toolchain_list) => {
-            if !String::from_utf8_lossy(&toolchain_list.stdout).contains("stage1") {
+        Some(toolchain_list) => {
+            if !toolchain_list.contains("stage1") {
                 return false;
             }
             // The toolchain has already been linked.
@@ -330,7 +325,7 @@ fn toolchain_is_linked() -> bool {
                 "`stage1` toolchain already linked; not attempting to link `stage1` toolchain"
             );
         }
-        Err(_) => {
+        None => {
             // In this case, we don't know if the `stage1` toolchain has been linked;
             // but `rustup` failed, so let's not go any further.
             println!(
@@ -341,12 +336,11 @@ fn toolchain_is_linked() -> bool {
     true
 }
 
-fn try_link_toolchain(stage_path: &str) -> bool {
-    Command::new("rustup")
-        .stdout(std::process::Stdio::null())
+fn try_link_toolchain(builder: &Builder<'_>, stage_path: &str) -> bool {
+    command("rustup")
         .args(["toolchain", "link", "stage1", stage_path])
-        .output()
-        .map_or(false, |output| output.status.success())
+        .run_capture_stdout(builder)
+        .is_success()
 }
 
 fn ensure_stage1_toolchain_placeholder_exists(stage_path: &str) -> bool {
@@ -476,16 +470,17 @@ impl Step for Hook {
         if config.dry_run() {
             return;
         }
-        t!(install_git_hook_maybe(config));
+        t!(install_git_hook_maybe(builder, config));
     }
 }
 
 // install a git hook to automatically run tidy, if they want
-fn install_git_hook_maybe(config: &Config) -> io::Result<()> {
-    let git = config.git().args(["rev-parse", "--git-common-dir"]).output().map(|output| {
-        assert!(output.status.success(), "failed to run `git`");
-        PathBuf::from(t!(String::from_utf8(output.stdout)).trim())
-    })?;
+fn install_git_hook_maybe(builder: &Builder<'_>, config: &Config) -> io::Result<()> {
+    let git = helpers::git(Some(&config.src))
+        .args(["rev-parse", "--git-common-dir"])
+        .run_capture(builder)
+        .stdout();
+    let git = PathBuf::from(git.trim());
     let hooks_dir = git.join("hooks");
     let dst = hooks_dir.join("pre-push");
     if dst.exists() {
@@ -523,46 +518,162 @@ undesirable, simply delete the `pre-push` file from .git/hooks."
     Ok(())
 }
 
-/// Sets up or displays `src/etc/rust_analyzer_settings.json`
-#[derive(Clone, Debug, Eq, PartialEq, Hash)]
-pub struct Vscode;
+/// Handles editor-specific setup differences
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum EditorKind {
+    Vscode,
+    Vim,
+    Emacs,
+    Helix,
+}
 
-impl Step for Vscode {
+impl EditorKind {
+    fn prompt_user() -> io::Result<Option<EditorKind>> {
+        let prompt_str = "Available editors:
+1. vscode
+2. vim
+3. emacs
+4. helix
+
+Select which editor you would like to set up [default: None]: ";
+
+        let mut input = String::new();
+        loop {
+            print!("{}", prompt_str);
+            io::stdout().flush()?;
+            input.clear();
+            io::stdin().read_line(&mut input)?;
+            match input.trim().to_lowercase().as_str() {
+                "1" | "vscode" => return Ok(Some(EditorKind::Vscode)),
+                "2" | "vim" => return Ok(Some(EditorKind::Vim)),
+                "3" | "emacs" => return Ok(Some(EditorKind::Emacs)),
+                "4" | "helix" => return Ok(Some(EditorKind::Helix)),
+                "" => return Ok(None),
+                _ => {
+                    eprintln!("ERROR: unrecognized option '{}'", input.trim());
+                    eprintln!("NOTE: press Ctrl+C to exit");
+                }
+            };
+        }
+    }
+
+    /// A list of historical hashes of each LSP settings file
+    /// New entries should be appended whenever this is updated so we can detect
+    /// outdated vs. user-modified settings files.
+    fn hashes(&self) -> Vec<&str> {
+        match self {
+            EditorKind::Vscode | EditorKind::Vim => vec![
+                "ea67e259dedf60d4429b6c349a564ffcd1563cf41c920a856d1f5b16b4701ac8",
+                "56e7bf011c71c5d81e0bf42e84938111847a810eee69d906bba494ea90b51922",
+                "af1b5efe196aed007577899db9dae15d6dbc923d6fa42fa0934e68617ba9bbe0",
+                "3468fea433c25fff60be6b71e8a215a732a7b1268b6a83bf10d024344e140541",
+                "47d227f424bf889b0d899b9cc992d5695e1b78c406e183cd78eafefbe5488923",
+                "b526bd58d0262dd4dda2bff5bc5515b705fb668a46235ace3e057f807963a11a",
+                "828666b021d837a33e78d870b56d34c88a5e2c85de58b693607ec574f0c27000",
+                "811fb3b063c739d261fd8590dd30242e117908f5a095d594fa04585daa18ec4d",
+            ],
+            EditorKind::Emacs => vec![
+                "51068d4747a13732440d1a8b8f432603badb1864fa431d83d0fd4f8fa57039e0",
+                "d29af4d949bbe2371eac928a3c31cf9496b1701aa1c45f11cd6c759865ad5c45",
+            ],
+            EditorKind::Helix => {
+                vec!["2d3069b8cf1b977e5d4023965eb6199597755e6c96c185ed5f2854f98b83d233"]
+            }
+        }
+    }
+
+    fn settings_path(&self, config: &Config) -> PathBuf {
+        config.src.join(self.settings_short_path())
+    }
+
+    fn settings_short_path(&self) -> PathBuf {
+        self.settings_folder().join(match self {
+            EditorKind::Vscode => "settings.json",
+            EditorKind::Vim => "coc-settings.json",
+            EditorKind::Emacs => ".dir-locals.el",
+            EditorKind::Helix => "languages.toml",
+        })
+    }
+
+    fn settings_folder(&self) -> PathBuf {
+        match self {
+            EditorKind::Vscode => PathBuf::from(".vscode"),
+            EditorKind::Vim => PathBuf::from(".vim"),
+            EditorKind::Emacs => PathBuf::new(),
+            EditorKind::Helix => PathBuf::from(".helix"),
+        }
+    }
+
+    fn settings_template(&self) -> &str {
+        match self {
+            EditorKind::Vscode | EditorKind::Vim => {
+                include_str!("../../../../etc/rust_analyzer_settings.json")
+            }
+            EditorKind::Emacs => include_str!("../../../../etc/rust_analyzer_eglot.el"),
+            EditorKind::Helix => include_str!("../../../../etc/rust_analyzer_helix.toml"),
+        }
+    }
+
+    fn backup_extension(&self) -> String {
+        format!("{}.bak", self.settings_short_path().extension().unwrap().to_str().unwrap())
+    }
+}
+
+/// Sets up or displays the LSP config for one of the supported editors
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub struct Editor;
+
+impl Step for Editor {
     type Output = ();
     const DEFAULT: bool = true;
+
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
-        run.alias("vscode")
+        run.alias("editor")
     }
+
     fn make_run(run: RunConfig<'_>) {
         if run.builder.config.dry_run() {
             return;
         }
         if let [cmd] = &run.paths[..] {
-            if cmd.assert_single_path().path.as_path().as_os_str() == "vscode" {
-                run.builder.ensure(Vscode);
+            if cmd.assert_single_path().path.as_path().as_os_str() == "editor" {
+                run.builder.ensure(Editor);
             }
         }
     }
+
     fn run(self, builder: &Builder<'_>) -> Self::Output {
         let config = &builder.config;
         if config.dry_run() {
             return;
         }
-        while !t!(create_vscode_settings_maybe(config)) {}
+        match EditorKind::prompt_user() {
+            Ok(editor_kind) => {
+                if let Some(editor_kind) = editor_kind {
+                    while !t!(create_editor_settings_maybe(config, editor_kind.clone())) {}
+                } else {
+                    println!("Ok, skipping editor setup!");
+                }
+            }
+            Err(e) => eprintln!("Could not determine the editor: {e}"),
+        }
     }
 }
 
-/// Create a `.vscode/settings.json` file for rustc development, or just print it
+/// Create the recommended editor LSP config file for rustc development, or just print it
 /// If this method should be re-called, it returns `false`.
-fn create_vscode_settings_maybe(config: &Config) -> io::Result<bool> {
-    let (current_hash, historical_hashes) = SETTINGS_HASHES.split_last().unwrap();
-    let vscode_settings = config.src.join(".vscode").join("settings.json");
-    // If None, no settings.json exists
+fn create_editor_settings_maybe(config: &Config, editor: EditorKind) -> io::Result<bool> {
+    let hashes = editor.hashes();
+    let (current_hash, historical_hashes) = hashes.split_last().unwrap();
+    let settings_path = editor.settings_path(config);
+    let settings_short_path = editor.settings_short_path();
+    let settings_filename = settings_short_path.to_str().unwrap();
+    // If None, no settings file exists
     // If Some(true), is a previous version of settings.json
     // If Some(false), is not a previous version (i.e. user modified)
     // If it's up to date we can just skip this
     let mut mismatched_settings = None;
-    if let Ok(current) = fs::read_to_string(&vscode_settings) {
+    if let Ok(current) = fs::read_to_string(&settings_path) {
         let mut hasher = sha2::Sha256::new();
         hasher.update(&current);
         let hash = hex_encode(hasher.finalize().as_slice());
@@ -575,20 +686,21 @@ fn create_vscode_settings_maybe(config: &Config) -> io::Result<bool> {
         }
     }
     println!(
-        "\nx.py can automatically install the recommended `.vscode/settings.json` file for rustc development"
+        "\nx.py can automatically install the recommended `{settings_filename}` file for rustc development"
     );
+
     match mismatched_settings {
-        Some(true) => eprintln!(
-            "WARNING: existing `.vscode/settings.json` is out of date, x.py will update it"
-        ),
+        Some(true) => {
+            eprintln!("WARNING: existing `{settings_filename}` is out of date, x.py will update it")
+        }
         Some(false) => eprintln!(
-            "WARNING: existing `.vscode/settings.json` has been modified by user, x.py will back it up and replace it"
+            "WARNING: existing `{settings_filename}` has been modified by user, x.py will back it up and replace it"
         ),
         _ => (),
     }
-    let should_create = match prompt_user(
-        "Would you like to create/update settings.json? (Press 'p' to preview values): [y/N]",
-    )? {
+    let should_create = match prompt_user(&format!(
+        "Would you like to create/update `{settings_filename}`? (Press 'p' to preview values): [y/N]"
+    ))? {
         Some(PromptResult::Yes) => true,
         Some(PromptResult::Print) => false,
         _ => {
@@ -597,9 +709,9 @@ fn create_vscode_settings_maybe(config: &Config) -> io::Result<bool> {
         }
     };
     if should_create {
-        let path = config.src.join(".vscode");
-        if !path.exists() {
-            fs::create_dir(&path)?;
+        let settings_folder_path = config.src.join(editor.settings_folder());
+        if !settings_folder_path.exists() {
+            fs::create_dir(settings_folder_path)?;
         }
         let verb = match mismatched_settings {
             // exists but outdated, we can replace this
@@ -607,18 +719,21 @@ fn create_vscode_settings_maybe(config: &Config) -> io::Result<bool> {
             // exists but user modified, back it up
             Some(false) => {
                 // exists and is not current version or outdated, so back it up
-                let mut backup = vscode_settings.clone();
-                backup.set_extension("json.bak");
-                eprintln!("WARNING: copying `settings.json` to `settings.json.bak`");
-                fs::copy(&vscode_settings, &backup)?;
+                let backup = settings_path.clone().with_extension(editor.backup_extension());
+                eprintln!(
+                    "WARNING: copying `{}` to `{}`",
+                    settings_path.file_name().unwrap().to_str().unwrap(),
+                    backup.file_name().unwrap().to_str().unwrap(),
+                );
+                fs::copy(&settings_path, &backup)?;
                 "Updated"
             }
             _ => "Created",
         };
-        fs::write(&vscode_settings, RUST_ANALYZER_SETTINGS)?;
-        println!("{verb} `.vscode/settings.json`");
+        fs::write(&settings_path, editor.settings_template())?;
+        println!("{verb} `{}`", settings_filename);
     } else {
-        println!("\n{RUST_ANALYZER_SETTINGS}");
+        println!("\n{}", editor.settings_template());
     }
     Ok(should_create)
 }

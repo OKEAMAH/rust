@@ -143,6 +143,41 @@ mod m {
 }
 
 #[test]
+fn desugar_for_loop() {
+    let (db, body, def) = lower(
+        r#"
+//- minicore: iterator
+fn main() {
+    for ident in 0..10 {
+        foo();
+        bar()
+    }
+}
+"#,
+    );
+
+    expect![[r#"
+        fn main() -> () {
+            match builtin#lang(into_iter)(
+                (0) ..(10) ,
+            ) {
+                mut <ra@gennew>11 => loop {
+                    match builtin#lang(next)(
+                        &mut <ra@gennew>11,
+                    ) {
+                        builtin#lang(None) => break,
+                        builtin#lang(Some)(ident) => {
+                            foo();
+                            bar()
+                        },
+                    }
+                },
+            }
+        }"#]]
+    .assert_eq(&body.pretty_print(&db, def, Edition::CURRENT))
+}
+
+#[test]
 fn desugar_builtin_format_args() {
     let (db, body, def) = lower(
         r#"
@@ -150,18 +185,18 @@ fn desugar_builtin_format_args() {
 fn main() {
     let are = "are";
     let count = 10;
-    builtin#format_args("hello {count:02} {} friends, we {are:?} {0}{last}", "fancy", last = "!");
+    builtin#format_args("\u{1b}hello {count:02} {} friends, we {are:?} {0}{last}", "fancy", last = "!");
 }
 "#,
     );
 
     expect![[r#"
-        fn main() {
+        fn main() -> () {
             let are = "are";
             let count = 10;
             builtin#lang(Arguments::new_v1_formatted)(
                 &[
-                    "hello ", " ", " friends, we ", " ", "",
+                    "\u{1b}hello ", " ", " friends, we ", " ", "",
                 ],
                 &[
                     builtin#lang(Argument::new_display)(
@@ -219,7 +254,7 @@ fn main() {
                 },
             );
         }"#]]
-    .assert_eq(&body.pretty_print(&db, def))
+    .assert_eq(&body.pretty_print(&db, def, Edition::CURRENT))
 }
 
 #[test]
@@ -258,7 +293,7 @@ impl SsrError {
 
     assert_eq!(db.body_with_source_map(def).1.diagnostics(), &[]);
     expect![[r#"
-        fn main() {
+        fn main() -> () {
             _ = $crate::error::SsrError::new(
                 builtin#lang(Arguments::new_v1_formatted)(
                     &[
@@ -285,7 +320,7 @@ impl SsrError {
                 ),
             );
         }"#]]
-    .assert_eq(&body.pretty_print(&db, def))
+    .assert_eq(&body.pretty_print(&db, def, Edition::CURRENT))
 }
 
 #[test]
@@ -303,7 +338,7 @@ macro_rules! m {
     };
 }
 
-fn f() {
+fn f(a: i32, b: u32) -> String {
     m!();
 }
 "#,
@@ -317,7 +352,7 @@ fn f() {
     }
 
     expect![[r#"
-        fn f() {
+        fn f(a: i32, b: u32) -> String {
             {
                 $crate::panicking::panic_fmt(
                     builtin#lang(Arguments::new_v1_formatted)(
@@ -333,5 +368,5 @@ fn f() {
                 );
             };
         }"#]]
-    .assert_eq(&body.pretty_print(&db, def))
+    .assert_eq(&body.pretty_print(&db, def, Edition::CURRENT))
 }

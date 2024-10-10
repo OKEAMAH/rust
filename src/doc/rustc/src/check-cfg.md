@@ -11,8 +11,8 @@ development process.
 In order to accomplish that goal, `rustc` accepts the `--check-cfg` flag, which specifies
 whether to check conditions and how to check them.
 
-> **Note:** No implicit expectation is added when using `--cfg`. Users are expected to
-pass all expected names and values using the _check cfg specification_.
+> **Note:** For interacting with this through Cargo,
+see [Cargo Specifics](check-cfg/cargo-specifics.md) page.
 
 [^reachable]: `rustc` promises to at least check reachable `#[cfg]`, and while non-reachable
 `#[cfg]` are not currently checked, they may well be checked in the future without it being a
@@ -22,6 +22,9 @@ breaking change.
 
 To specify expected names and values, the _check cfg specification_ provides the `cfg(...)`
 option which enables specifying for an expected config name and it's expected values.
+
+> **Note:** No implicit expectation is added when using `--cfg`. Users are expected to
+pass all expected names and values using the _check cfg specification_.
 
 It has this basic form:
 
@@ -96,7 +99,7 @@ the need to specify them manually.
 Well known names and values are implicitly added as long as at least one `--check-cfg` argument
 is present.
 
-As of `2024-05-06T`, the list of known names is as follows:
+As of `2024-08-20T`, the list of known names is as follows:
 
 <!--- See CheckCfg::fill_well_known in compiler/rustc_session/src/config.rs -->
 
@@ -104,6 +107,7 @@ As of `2024-05-06T`, the list of known names is as follows:
  - `debug_assertions`
  - `doc`
  - `doctest`
+ - `fmt_debug`
  - `miri`
  - `overflow_checks`
  - `panic`

@@ -1,10 +1,11 @@
-#![feature(let_chains)]
-#![feature(lazy_cell)]
-#![feature(option_get_or_insert_default)]
-#![feature(rustc_attrs)]
-#![feature(map_many_mut)]
-#![feature(iter_intersperse)]
+// tidy-alphabetical-start
 #![allow(internal_features)]
+#![feature(iter_intersperse)]
+#![feature(let_chains)]
+#![feature(map_many_mut)]
+#![feature(rustc_attrs)]
+#![warn(unreachable_pub)]
+// tidy-alphabetical-end
 
 pub mod errors;
 

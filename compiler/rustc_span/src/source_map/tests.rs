@@ -229,10 +229,10 @@ fn t10() {
     let SourceFile {
         name,
         src_hash,
+        checksum_hash,
         source_len,
         lines,
         multibyte_chars,
-        non_narrow_chars,
         normalized_pos,
         stable_id,
         ..
@@ -241,12 +241,12 @@ fn t10() {
     let imported_src_file = sm.new_imported_source_file(
         name,
         src_hash,
+        checksum_hash,
         stable_id,
         source_len.to_u32(),
         CrateNum::ZERO,
         FreezeLock::new(lines.read().clone()),
         multibyte_chars,
-        non_narrow_chars,
         normalized_pos,
         0,
     );
@@ -257,7 +257,7 @@ fn t10() {
     );
     imported_src_file.add_external_src(|| Some(unnormalized.to_string()));
     assert_eq!(
-        imported_src_file.external_src.borrow().get_source().unwrap().as_ref(),
+        imported_src_file.external_src.borrow().get_source().unwrap(),
         normalized,
         "imported source file should be normalized"
     );

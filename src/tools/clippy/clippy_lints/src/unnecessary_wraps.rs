@@ -1,17 +1,18 @@
+use clippy_config::Conf;
 use clippy_utils::diagnostics::span_lint_and_then;
 use clippy_utils::source::snippet;
 use clippy_utils::visitors::find_all_ret_expressions;
 use clippy_utils::{contains_return, is_res_lang_ctor, path_res, return_ty};
 use rustc_errors::Applicability;
-use rustc_hir::intravisit::FnKind;
 use rustc_hir::LangItem::{OptionSome, ResultOk};
+use rustc_hir::intravisit::FnKind;
 use rustc_hir::{Body, ExprKind, FnDecl, Impl, ItemKind, Node};
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_middle::ty;
 use rustc_session::impl_lint_pass;
+use rustc_span::Span;
 use rustc_span::def_id::LocalDefId;
 use rustc_span::symbol::sym;
-use rustc_span::Span;
 
 declare_clippy_lint! {
     /// ### What it does
@@ -63,9 +64,9 @@ pub struct UnnecessaryWraps {
 impl_lint_pass!(UnnecessaryWraps => [UNNECESSARY_WRAPS]);
 
 impl UnnecessaryWraps {
-    pub fn new(avoid_breaking_exported_api: bool) -> Self {
+    pub fn new(conf: &'static Conf) -> Self {
         Self {
-            avoid_breaking_exported_api,
+            avoid_breaking_exported_api: conf.avoid_breaking_exported_api,
         }
     }
 }
@@ -144,7 +145,9 @@ impl<'tcx> LateLintPass<'tcx> for UnnecessaryWraps {
                 (
                     "this function's return value is unnecessary".to_string(),
                     "remove the return type...".to_string(),
-                    snippet(cx, fn_decl.output.span(), "..").to_string(),
+                    // FIXME: we should instead get the span including the `->` and suggest an
+                    // empty string for this case.
+                    "()".to_string(),
                     "...and then remove returned values",
                 )
             } else {

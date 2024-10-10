@@ -3,13 +3,13 @@ use std::iter::Peekable;
 
 use base_db::CrateId;
 use cfg::{CfgAtom, CfgExpr};
+use intern::{sym, Symbol};
 use rustc_hash::FxHashSet;
 use syntax::{
-    ast::{self, Attr, HasAttrs, Meta, VariantList},
+    ast::{self, Attr, HasAttrs, Meta, TokenTree, VariantList},
     AstNode, NodeOrToken, SyntaxElement, SyntaxKind, SyntaxNode, T,
 };
 use tracing::{debug, warn};
-use tt::SmolStr;
 
 use crate::{db::ExpandDatabase, proc_macro::ProcMacroKind, MacroCallLoc, MacroDefKind};
 
@@ -17,7 +17,7 @@ fn check_cfg(db: &dyn ExpandDatabase, attr: &Attr, krate: CrateId) -> Option<boo
     if !attr.simple_name().as_deref().map(|v| v == "cfg")? {
         return None;
     }
-    let cfg = parse_from_attr_meta(attr.meta()?)?;
+    let cfg = parse_from_attr_token_tree(&attr.meta()?.token_tree()?)?;
     let enabled = db.crate_graph()[krate].cfg_options.check(&cfg) != Some(false);
     Some(enabled)
 }
@@ -26,7 +26,15 @@ fn check_cfg_attr(db: &dyn ExpandDatabase, attr: &Attr, krate: CrateId) -> Optio
     if !attr.simple_name().as_deref().map(|v| v == "cfg_attr")? {
         return None;
     }
-    let cfg_expr = parse_from_attr_meta(attr.meta()?)?;
+    check_cfg_attr_value(db, &attr.token_tree()?, krate)
+}
+
+pub fn check_cfg_attr_value(
+    db: &dyn ExpandDatabase,
+    attr: &TokenTree,
+    krate: CrateId,
+) -> Option<bool> {
+    let cfg_expr = parse_from_attr_token_tree(attr)?;
     let enabled = db.crate_graph()[krate].cfg_options.check(&cfg_expr) != Some(false);
     Some(enabled)
 }
@@ -189,8 +197,8 @@ pub(crate) fn process_cfg_attrs(
     // FIXME: #[cfg_eval] is not implemented. But it is not stable yet
     let is_derive = match loc.def.kind {
         MacroDefKind::BuiltInDerive(..)
-        | MacroDefKind::ProcMacro(_, ProcMacroKind::CustomDerive, _) => true,
-        MacroDefKind::BuiltInAttr(expander, _) => expander.is_derive(),
+        | MacroDefKind::ProcMacro(_, _, ProcMacroKind::CustomDerive) => true,
+        MacroDefKind::BuiltInAttr(_, expander) => expander.is_derive(),
         _ => false,
     };
     if !is_derive {
@@ -238,8 +246,7 @@ pub(crate) fn process_cfg_attrs(
     Some(remove)
 }
 /// Parses a `cfg` attribute from the meta
-fn parse_from_attr_meta(meta: Meta) -> Option<CfgExpr> {
-    let tt = meta.token_tree()?;
+fn parse_from_attr_token_tree(tt: &TokenTree) -> Option<CfgExpr> {
     let mut iter = tt
         .token_trees_and_tokens()
         .filter(is_not_whitespace)
@@ -263,13 +270,13 @@ where
     let name = match iter.next() {
         None => return None,
         Some(NodeOrToken::Token(element)) => match element.kind() {
-            syntax::T![ident] => SmolStr::new(element.text()),
+            syntax::T![ident] => Symbol::intern(element.text()),
             _ => return Some(CfgExpr::Invalid),
         },
         Some(_) => return Some(CfgExpr::Invalid),
     };
-    let result = match name.as_str() {
-        "all" | "any" | "not" => {
+    let result = match &name {
+        s if [&sym::all, &sym::any, &sym::not].contains(&s) => {
             let mut preds = Vec::new();
             let Some(NodeOrToken::Node(tree)) = iter.next() else {
                 return Some(CfgExpr::Invalid);
@@ -286,10 +293,12 @@ where
                     preds.push(pred);
                 }
             }
-            let group = match name.as_str() {
-                "all" => CfgExpr::All(preds),
-                "any" => CfgExpr::Any(preds),
-                "not" => CfgExpr::Not(Box::new(preds.pop().unwrap_or(CfgExpr::Invalid))),
+            let group = match &name {
+                s if *s == sym::all => CfgExpr::All(preds.into_boxed_slice()),
+                s if *s == sym::any => CfgExpr::Any(preds.into_boxed_slice()),
+                s if *s == sym::not => {
+                    CfgExpr::Not(Box::new(preds.pop().unwrap_or(CfgExpr::Invalid)))
+                }
                 _ => unreachable!(),
             };
             Some(group)
@@ -302,8 +311,10 @@ where
                         if (value_token.kind() == syntax::SyntaxKind::STRING) =>
                     {
                         let value = value_token.text();
-                        let value = SmolStr::new(value.trim_matches('"'));
-                        Some(CfgExpr::Atom(CfgAtom::KeyValue { key: name, value }))
+                        Some(CfgExpr::Atom(CfgAtom::KeyValue {
+                            key: name,
+                            value: Symbol::intern(value.trim_matches('"')),
+                        }))
                     }
                     _ => None,
                 }
@@ -324,7 +335,7 @@ mod tests {
     use expect_test::{expect, Expect};
     use syntax::{ast::Attr, AstNode, SourceFile};
 
-    use crate::cfg_process::parse_from_attr_meta;
+    use crate::cfg_process::parse_from_attr_token_tree;
 
     fn check_dnf_from_syntax(input: &str, expect: Expect) {
         let parse = SourceFile::parse(input, span::Edition::CURRENT);
@@ -338,8 +349,8 @@ mod tests {
         let node = node.clone_subtree();
         assert_eq!(node.syntax().text_range().start(), 0.into());
 
-        let cfg = parse_from_attr_meta(node.meta().unwrap()).unwrap();
-        let actual = format!("#![cfg({})]", DnfExpr::new(cfg));
+        let cfg = parse_from_attr_token_tree(&node.meta().unwrap().token_tree().unwrap()).unwrap();
+        let actual = format!("#![cfg({})]", DnfExpr::new(&cfg));
         expect.assert_eq(&actual);
     }
     #[test]

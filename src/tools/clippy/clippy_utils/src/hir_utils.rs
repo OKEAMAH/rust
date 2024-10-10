@@ -1,20 +1,20 @@
-use crate::consts::constant_simple;
+use crate::consts::ConstEvalCtxt;
 use crate::macros::macro_backtrace;
-use crate::source::{get_source_text, snippet_opt, walk_span_to_context, SpanRange};
+use crate::source::{SpanRange, SpanRangeExt, walk_span_to_context};
 use crate::tokenize_with_text;
 use rustc_ast::ast::InlineAsmTemplatePiece;
 use rustc_data_structures::fx::FxHasher;
-use rustc_hir::def::Res;
 use rustc_hir::MatchSource::TryDesugar;
+use rustc_hir::def::Res;
 use rustc_hir::{
-    ArrayLen, BinOpKind, BindingMode, Block, BodyId, Closure, Expr, ExprField, ExprKind, FnRetTy, GenericArg,
-    GenericArgs, HirId, HirIdMap, InlineAsmOperand, LetExpr, Lifetime, LifetimeName, Pat, PatField, PatKind, Path,
-    PathSegment, PrimTy, QPath, Stmt, StmtKind, Ty, TyKind, TypeBinding,
+    ArrayLen, AssocItemConstraint, BinOpKind, BindingMode, Block, BodyId, Closure, ConstArg, ConstArgKind, Expr,
+    ExprField, ExprKind, FnRetTy, GenericArg, GenericArgs, HirId, HirIdMap, InlineAsmOperand, LetExpr, Lifetime,
+    LifetimeName, Pat, PatField, PatKind, Path, PathSegment, PrimTy, QPath, Stmt, StmtKind, Ty, TyKind,
 };
-use rustc_lexer::{tokenize, TokenKind};
+use rustc_lexer::{TokenKind, tokenize};
 use rustc_lint::LateContext;
 use rustc_middle::ty::TypeckResults;
-use rustc_span::{sym, BytePos, ExpnKind, MacroKind, Symbol, SyntaxContext};
+use rustc_span::{BytePos, ExpnKind, MacroKind, Symbol, SyntaxContext, sym};
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
 
@@ -121,9 +121,9 @@ impl HirEqInterExpr<'_, '_, '_> {
 
                 // eq_pat adds the HirIds to the locals map. We therefore call it last to make sure that
                 // these only get added if the init and type is equal.
-                both(&l.init, &r.init, |l, r| self.eq_expr(l, r))
-                    && both(&l.ty, &r.ty, |l, r| self.eq_ty(l, r))
-                    && both(&l.els, &r.els, |l, r| self.eq_block(l, r))
+                both(l.init.as_ref(), r.init.as_ref(), |l, r| self.eq_expr(l, r))
+                    && both(l.ty.as_ref(), r.ty.as_ref(), |l, r| self.eq_ty(l, r))
+                    && both(l.els.as_ref(), r.els.as_ref(), |l, r| self.eq_block(l, r))
                     && self.eq_pat(l.pat, r.pat)
             },
             (&StmtKind::Expr(l), &StmtKind::Expr(r)) | (&StmtKind::Semi(l), &StmtKind::Semi(r)) => self.eq_expr(l, r),
@@ -142,7 +142,9 @@ impl HirEqInterExpr<'_, '_, '_> {
         if lspan.ctxt != SyntaxContext::root() && rspan.ctxt != SyntaxContext::root() {
             // Don't try to check in between statements inside macros.
             return over(left.stmts, right.stmts, |left, right| self.eq_stmt(left, right))
-                && both(&left.expr, &right.expr, |left, right| self.eq_expr(left, right));
+                && both(left.expr.as_ref(), right.expr.as_ref(), |left, right| {
+                    self.eq_expr(left, right)
+                });
         }
         if lspan.ctxt != rspan.ctxt {
             return false;
@@ -227,7 +229,7 @@ impl HirEqInterExpr<'_, '_, '_> {
     pub fn eq_array_length(&mut self, left: ArrayLen<'_>, right: ArrayLen<'_>) -> bool {
         match (left, right) {
             (ArrayLen::Infer(..), ArrayLen::Infer(..)) => true,
-            (ArrayLen::Body(l_ct), ArrayLen::Body(r_ct)) => self.eq_body(l_ct.body, r_ct.body),
+            (ArrayLen::Body(l_ct), ArrayLen::Body(r_ct)) => self.eq_const_arg(l_ct, r_ct),
             (_, _) => false,
         }
     }
@@ -255,8 +257,8 @@ impl HirEqInterExpr<'_, '_, '_> {
         if let Some((typeck_lhs, typeck_rhs)) = self.inner.maybe_typeck_results
             && typeck_lhs.expr_ty(left) == typeck_rhs.expr_ty(right)
             && let (Some(l), Some(r)) = (
-                constant_simple(self.inner.cx, typeck_lhs, left),
-                constant_simple(self.inner.cx, typeck_rhs, right),
+                ConstEvalCtxt::with_env(self.inner.cx.tcx, self.inner.cx.param_env, typeck_lhs).eval_simple(left),
+                ConstEvalCtxt::with_env(self.inner.cx.tcx, self.inner.cx.param_env, typeck_rhs).eval_simple(right),
             )
             && l == r
         {
@@ -285,8 +287,8 @@ impl HirEqInterExpr<'_, '_, '_> {
                     })
             },
             (&ExprKind::Break(li, ref le), &ExprKind::Break(ri, ref re)) => {
-                both(&li.label, &ri.label, |l, r| l.ident.name == r.ident.name)
-                    && both(le, re, |l, r| self.eq_expr(l, r))
+                both(li.label.as_ref(), ri.label.as_ref(), |l, r| l.ident.name == r.ident.name)
+                    && both(le.as_ref(), re.as_ref(), |l, r| self.eq_expr(l, r))
             },
             (&ExprKind::Call(l_fun, l_args), &ExprKind::Call(r_fun, r_args)) => {
                 self.inner.allow_side_effects && self.eq_expr(l_fun, r_fun) && self.eq_exprs(l_args, r_args)
@@ -297,7 +299,7 @@ impl HirEqInterExpr<'_, '_, '_> {
             (&ExprKind::Closure(_l), &ExprKind::Closure(_r)) => false,
             (&ExprKind::ConstBlock(lb), &ExprKind::ConstBlock(rb)) => self.eq_body(lb.body, rb.body),
             (&ExprKind::Continue(li), &ExprKind::Continue(ri)) => {
-                both(&li.label, &ri.label, |l, r| l.ident.name == r.ident.name)
+                both(li.label.as_ref(), ri.label.as_ref(), |l, r| l.ident.name == r.ident.name)
             },
             (&ExprKind::DropTemps(le), &ExprKind::DropTemps(re)) => self.eq_expr(le, re),
             (&ExprKind::Field(l_f_exp, ref l_f_ident), &ExprKind::Field(r_f_exp, ref r_f_ident)) => {
@@ -305,21 +307,25 @@ impl HirEqInterExpr<'_, '_, '_> {
             },
             (&ExprKind::Index(la, li, _), &ExprKind::Index(ra, ri, _)) => self.eq_expr(la, ra) && self.eq_expr(li, ri),
             (&ExprKind::If(lc, lt, ref le), &ExprKind::If(rc, rt, ref re)) => {
-                self.eq_expr(lc, rc) && self.eq_expr(lt, rt) && both(le, re, |l, r| self.eq_expr(l, r))
+                self.eq_expr(lc, rc) && self.eq_expr(lt, rt)
+                    && both(le.as_ref(), re.as_ref(), |l, r| self.eq_expr(l, r))
             },
             (&ExprKind::Let(l), &ExprKind::Let(r)) => {
-                self.eq_pat(l.pat, r.pat) && both(&l.ty, &r.ty, |l, r| self.eq_ty(l, r)) && self.eq_expr(l.init, r.init)
+                self.eq_pat(l.pat, r.pat)
+                    && both(l.ty.as_ref(), r.ty.as_ref(), |l, r| self.eq_ty(l, r))
+                    && self.eq_expr(l.init, r.init)
             },
             (ExprKind::Lit(l), ExprKind::Lit(r)) => l.node == r.node,
             (&ExprKind::Loop(lb, ref ll, ref lls, _), &ExprKind::Loop(rb, ref rl, ref rls, _)) => {
-                lls == rls && self.eq_block(lb, rb) && both(ll, rl, |l, r| l.ident.name == r.ident.name)
+                lls == rls && self.eq_block(lb, rb)
+                    && both(ll.as_ref(), rl.as_ref(), |l, r| l.ident.name == r.ident.name)
             },
             (&ExprKind::Match(le, la, ref ls), &ExprKind::Match(re, ra, ref rs)) => {
                 (ls == rs || (matches!((ls, rs), (TryDesugar(_), TryDesugar(_)))))
                     && self.eq_expr(le, re)
                     && over(la, ra, |l, r| {
                         self.eq_pat(l.pat, r.pat)
-                            && both(&l.guard, &r.guard, |l, r| self.eq_expr(l, r))
+                            && both(l.guard.as_ref(), r.guard.as_ref(), |l, r| self.eq_expr(l, r))
                             && self.eq_expr(l.body, r.body)
                     })
             },
@@ -339,10 +345,10 @@ impl HirEqInterExpr<'_, '_, '_> {
             (&ExprKind::Repeat(le, ll), &ExprKind::Repeat(re, rl)) => {
                 self.eq_expr(le, re) && self.eq_array_length(ll, rl)
             },
-            (ExprKind::Ret(l), ExprKind::Ret(r)) => both(l, r, |l, r| self.eq_expr(l, r)),
+            (ExprKind::Ret(l), ExprKind::Ret(r)) => both(l.as_ref(), r.as_ref(), |l, r| self.eq_expr(l, r)),
             (&ExprKind::Struct(l_path, lf, ref lo), &ExprKind::Struct(r_path, rf, ref ro)) => {
                 self.eq_qpath(l_path, r_path)
-                    && both(lo, ro, |l, r| self.eq_expr(l, r))
+                    && both(lo.as_ref(), ro.as_ref(), |l, r| self.eq_expr(l, r))
                     && over(lf, rf, |l, r| self.eq_expr_field(l, r))
             },
             (&ExprKind::Tup(l_tup), &ExprKind::Tup(r_tup)) => self.eq_exprs(l_tup, r_tup),
@@ -411,11 +417,22 @@ impl HirEqInterExpr<'_, '_, '_> {
 
     fn eq_generic_arg(&mut self, left: &GenericArg<'_>, right: &GenericArg<'_>) -> bool {
         match (left, right) {
-            (GenericArg::Const(l), GenericArg::Const(r)) => self.eq_body(l.value.body, r.value.body),
+            (GenericArg::Const(l), GenericArg::Const(r)) => self.eq_const_arg(l, r),
             (GenericArg::Lifetime(l_lt), GenericArg::Lifetime(r_lt)) => Self::eq_lifetime(l_lt, r_lt),
             (GenericArg::Type(l_ty), GenericArg::Type(r_ty)) => self.eq_ty(l_ty, r_ty),
             (GenericArg::Infer(l_inf), GenericArg::Infer(r_inf)) => self.eq_ty(&l_inf.to_ty(), &r_inf.to_ty()),
             _ => false,
+        }
+    }
+
+    fn eq_const_arg(&mut self, left: &ConstArg<'_>, right: &ConstArg<'_>) -> bool {
+        match (&left.kind, &right.kind) {
+            (ConstArgKind::Path(l_p), ConstArgKind::Path(r_p)) => self.eq_qpath(l_p, r_p),
+            (ConstArgKind::Anon(l_an), ConstArgKind::Anon(r_an)) => self.eq_body(l_an.body, r_an.body),
+            // Use explicit match for now since ConstArg is undergoing flux.
+            (ConstArgKind::Path(..), ConstArgKind::Anon(..)) | (ConstArgKind::Anon(..), ConstArgKind::Path(..)) => {
+                false
+            },
         }
     }
 
@@ -439,7 +456,7 @@ impl HirEqInterExpr<'_, '_, '_> {
                 self.eq_qpath(lp, rp) && over(la, ra, |l, r| self.eq_pat(l, r)) && ls == rs
             },
             (&PatKind::Binding(lb, li, _, ref lp), &PatKind::Binding(rb, ri, _, ref rp)) => {
-                let eq = lb == rb && both(lp, rp, |l, r| self.eq_pat(l, r));
+                let eq = lb == rb && both(lp.as_ref(), rp.as_ref(), |l, r| self.eq_pat(l, r));
                 if eq {
                     self.locals.insert(li, ri);
                 }
@@ -449,13 +466,15 @@ impl HirEqInterExpr<'_, '_, '_> {
             (&PatKind::Lit(l), &PatKind::Lit(r)) => self.eq_expr(l, r),
             (&PatKind::Tuple(l, ls), &PatKind::Tuple(r, rs)) => ls == rs && over(l, r, |l, r| self.eq_pat(l, r)),
             (&PatKind::Range(ref ls, ref le, li), &PatKind::Range(ref rs, ref re, ri)) => {
-                both(ls, rs, |a, b| self.eq_expr(a, b)) && both(le, re, |a, b| self.eq_expr(a, b)) && (li == ri)
+                both(ls.as_ref(), rs.as_ref(), |a, b| self.eq_expr(a, b))
+                    && both(le.as_ref(), re.as_ref(), |a, b| self.eq_expr(a, b))
+                    && (li == ri)
             },
             (&PatKind::Ref(le, ref lm), &PatKind::Ref(re, ref rm)) => lm == rm && self.eq_pat(le, re),
             (&PatKind::Slice(ls, ref li, le), &PatKind::Slice(rs, ref ri, re)) => {
                 over(ls, rs, |l, r| self.eq_pat(l, r))
                     && over(le, re, |l, r| self.eq_pat(l, r))
-                    && both(li, ri, |l, r| self.eq_pat(l, r))
+                    && both(li.as_ref(), ri.as_ref(), |l, r| self.eq_pat(l, r))
             },
             (&PatKind::Wild, &PatKind::Wild) => true,
             _ => false,
@@ -465,7 +484,7 @@ impl HirEqInterExpr<'_, '_, '_> {
     fn eq_qpath(&mut self, left: &QPath<'_>, right: &QPath<'_>) -> bool {
         match (left, right) {
             (&QPath::Resolved(ref lty, lpath), &QPath::Resolved(ref rty, rpath)) => {
-                both(lty, rty, |l, r| self.eq_ty(l, r)) && self.eq_path(lpath, rpath)
+                both(lty.as_ref(), rty.as_ref(), |l, r| self.eq_ty(l, r)) && self.eq_path(lpath, rpath)
             },
             (&QPath::TypeRelative(lty, lseg), &QPath::TypeRelative(rty, rseg)) => {
                 self.eq_ty(lty, rty) && self.eq_path_segment(lseg, rseg)
@@ -486,7 +505,7 @@ impl HirEqInterExpr<'_, '_, '_> {
     fn eq_path_parameters(&mut self, left: &GenericArgs<'_>, right: &GenericArgs<'_>) -> bool {
         if left.parenthesized == right.parenthesized {
             over(left.args, right.args, |l, r| self.eq_generic_arg(l, r)) // FIXME(flip1995): may not work
-                && over(left.bindings, right.bindings, |l, r| self.eq_type_binding(l, r))
+                && over(left.constraints, right.constraints, |l, r| self.eq_assoc_type_binding(l, r))
         } else {
             false
         }
@@ -499,7 +518,10 @@ impl HirEqInterExpr<'_, '_, '_> {
     pub fn eq_path_segment(&mut self, left: &PathSegment<'_>, right: &PathSegment<'_>) -> bool {
         // The == of idents doesn't work with different contexts,
         // we have to be explicit about hygiene
-        left.ident.name == right.ident.name && both(&left.args, &right.args, |l, r| self.eq_path_parameters(l, r))
+        left.ident.name == right.ident.name
+            && both(left.args.as_ref(), right.args.as_ref(), |l, r| {
+                self.eq_path_parameters(l, r)
+            })
     }
 
     pub fn eq_ty(&mut self, left: &Ty<'_>, right: &Ty<'_>) -> bool {
@@ -518,8 +540,12 @@ impl HirEqInterExpr<'_, '_, '_> {
         }
     }
 
-    fn eq_type_binding(&mut self, left: &TypeBinding<'_>, right: &TypeBinding<'_>) -> bool {
-        left.ident.name == right.ident.name && self.eq_ty(left.ty(), right.ty())
+    fn eq_assoc_type_binding(&mut self, left: &AssocItemConstraint<'_>, right: &AssocItemConstraint<'_>) -> bool {
+        left.ident.name == right.ident.name
+            && self.eq_ty(
+                left.ty().expect("expected assoc type binding"),
+                right.ty().expect("expected assoc type binding"),
+            )
     }
 
     fn check_ctxt(&mut self, left: SyntaxContext, right: SyntaxContext) -> bool {
@@ -573,10 +599,9 @@ fn reduce_exprkind<'hir>(cx: &LateContext<'_>, kind: &'hir ExprKind<'hir>) -> &'
             // block with an empty span.
             ([], None) if block.span.is_empty() => &ExprKind::Tup(&[]),
             // `{}` => `()`
-            ([], None) => match snippet_opt(cx, block.span) {
-                // Don't reduce if there are any tokens contained in the braces
-                Some(snip)
-                    if tokenize(&snip)
+            ([], None)
+                if block.span.check_source_text(cx, |src| {
+                    tokenize(src)
                         .map(|t| t.kind)
                         .filter(|t| {
                             !matches!(
@@ -584,11 +609,10 @@ fn reduce_exprkind<'hir>(cx: &LateContext<'_>, kind: &'hir ExprKind<'hir>) -> &'
                                 TokenKind::LineComment { .. } | TokenKind::BlockComment { .. } | TokenKind::Whitespace
                             )
                         })
-                        .ne([TokenKind::OpenBrace, TokenKind::CloseBrace].iter().copied()) =>
-                {
-                    kind
-                },
-                _ => &ExprKind::Tup(&[]),
+                        .eq([TokenKind::OpenBrace, TokenKind::CloseBrace].iter().copied())
+                }) =>
+            {
+                &ExprKind::Tup(&[])
             },
             ([], Some(expr)) => match expr.kind {
                 // `{ return .. }` => `return ..`
@@ -636,7 +660,7 @@ fn swap_binop<'a>(
 
 /// Checks if the two `Option`s are both `None` or some equal values as per
 /// `eq_fn`.
-pub fn both<X>(l: &Option<X>, r: &Option<X>, mut eq_fn: impl FnMut(&X, &X) -> bool) -> bool {
+pub fn both<X>(l: Option<&X>, r: Option<&X>, mut eq_fn: impl FnMut(&X, &X) -> bool) -> bool {
     l.as_ref()
         .map_or_else(|| r.is_none(), |x| r.as_ref().map_or(false, |y| eq_fn(x, y)))
 }
@@ -699,9 +723,9 @@ impl<'a, 'tcx> SpanlessHash<'a, 'tcx> {
 
     #[expect(clippy::too_many_lines)]
     pub fn hash_expr(&mut self, e: &Expr<'_>) {
-        let simple_const = self
-            .maybe_typeck_results
-            .and_then(|typeck_results| constant_simple(self.cx, typeck_results, e));
+        let simple_const = self.maybe_typeck_results.and_then(|typeck_results| {
+            ConstEvalCtxt::with_env(self.cx.tcx, self.cx.param_env, typeck_results).eval_simple(e)
+        });
 
         // const hashing may result in the same hash as some unrelated node, so add a sort of
         // discriminant depending on which path we're choosing next
@@ -1102,9 +1126,8 @@ impl<'a, 'tcx> SpanlessHash<'a, 'tcx> {
                 }
             },
             TyKind::Path(ref qpath) => self.hash_qpath(qpath),
-            TyKind::OpaqueDef(_, arg_list, in_trait) => {
+            TyKind::OpaqueDef(_, arg_list) => {
                 self.hash_generic_args(arg_list);
-                in_trait.hash(&mut self.s);
             },
             TyKind::TraitObject(_, lifetime, _) => {
                 self.hash_lifetime(lifetime);
@@ -1119,7 +1142,7 @@ impl<'a, 'tcx> SpanlessHash<'a, 'tcx> {
     pub fn hash_array_length(&mut self, length: ArrayLen<'_>) {
         match length {
             ArrayLen::Infer(..) => {},
-            ArrayLen::Body(anon_const) => self.hash_body(anon_const.body),
+            ArrayLen::Body(ct) => self.hash_const_arg(ct),
         }
     }
 
@@ -1130,12 +1153,19 @@ impl<'a, 'tcx> SpanlessHash<'a, 'tcx> {
         self.maybe_typeck_results = old_maybe_typeck_results;
     }
 
+    fn hash_const_arg(&mut self, const_arg: &ConstArg<'_>) {
+        match &const_arg.kind {
+            ConstArgKind::Path(path) => self.hash_qpath(path),
+            ConstArgKind::Anon(anon) => self.hash_body(anon.body),
+        }
+    }
+
     fn hash_generic_args(&mut self, arg_list: &[GenericArg<'_>]) {
         for arg in arg_list {
             match *arg {
                 GenericArg::Lifetime(l) => self.hash_lifetime(l),
                 GenericArg::Type(ty) => self.hash_ty(ty),
-                GenericArg::Const(ref ca) => self.hash_body(ca.value.body),
+                GenericArg::Const(ca) => self.hash_const_arg(ca),
                 GenericArg::Infer(ref inf) => self.hash_ty(&inf.to_ty()),
             }
         }
@@ -1169,13 +1199,13 @@ fn eq_span_tokens(
     pred: impl Fn(TokenKind) -> bool,
 ) -> bool {
     fn f(cx: &LateContext<'_>, left: Range<BytePos>, right: Range<BytePos>, pred: impl Fn(TokenKind) -> bool) -> bool {
-        if let Some(lsrc) = get_source_text(cx, left)
+        if let Some(lsrc) = left.get_source_range(cx)
             && let Some(lsrc) = lsrc.as_str()
-            && let Some(rsrc) = get_source_text(cx, right)
+            && let Some(rsrc) = right.get_source_range(cx)
             && let Some(rsrc) = rsrc.as_str()
         {
-            let pred = |t: &(_, _)| pred(t.0);
-            let map = |(_, x)| x;
+            let pred = |&(token, ..): &(TokenKind, _, _)| pred(token);
+            let map = |(_, source, _)| source;
 
             let ltok = tokenize_with_text(lsrc).filter(pred).map(map);
             let rtok = tokenize_with_text(rsrc).filter(pred).map(map);

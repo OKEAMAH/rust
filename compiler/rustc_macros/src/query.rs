@@ -4,8 +4,8 @@ use syn::parse::{Parse, ParseStream, Result};
 use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
 use syn::{
-    braced, parenthesized, parse_macro_input, parse_quote, token, AttrStyle, Attribute, Block,
-    Error, Expr, Ident, Pat, ReturnType, Token, Type,
+    AttrStyle, Attribute, Block, Error, Expr, Ident, Pat, ReturnType, Token, Type, braced,
+    parenthesized, parse_macro_input, parse_quote, token,
 };
 
 mod kw {
@@ -307,13 +307,24 @@ fn add_query_desc_cached_impl(
     });
 }
 
-pub fn rustc_queries(input: TokenStream) -> TokenStream {
+pub(super) fn rustc_queries(input: TokenStream) -> TokenStream {
     let queries = parse_macro_input!(input as List<Query>);
 
     let mut query_stream = quote! {};
     let mut query_description_stream = quote! {};
     let mut query_cached_stream = quote! {};
     let mut feedable_queries = quote! {};
+    let mut errors = quote! {};
+
+    macro_rules! assert {
+        ( $cond:expr, $span:expr, $( $tt:tt )+ ) => {
+            if !$cond {
+                errors.extend(
+                    Error::new($span, format!($($tt)+)).into_compile_error(),
+                );
+            }
+        }
+    }
 
     for query in queries.0 {
         let Query { name, arg, modifiers, .. } = &query;
@@ -369,10 +380,15 @@ pub fn rustc_queries(input: TokenStream) -> TokenStream {
             [#attribute_stream] fn #name(#arg) #result,
         });
 
-        if modifiers.feedable.is_some() {
-            assert!(modifiers.anon.is_none(), "Query {name} cannot be both `feedable` and `anon`.");
+        if let Some(feedable) = &modifiers.feedable {
+            assert!(
+                modifiers.anon.is_none(),
+                feedable.span(),
+                "Query {name} cannot be both `feedable` and `anon`."
+            );
             assert!(
                 modifiers.eval_always.is_none(),
+                feedable.span(),
                 "Query {name} cannot be both `feedable` and `eval_always`."
             );
             feedable_queries.extend(quote! {
@@ -407,5 +423,6 @@ pub fn rustc_queries(input: TokenStream) -> TokenStream {
             use super::*;
             #query_cached_stream
         }
+        #errors
     })
 }

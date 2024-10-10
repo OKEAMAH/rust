@@ -10,18 +10,18 @@ use rustc_middle::ty::TyCtxt;
 use rustc_span::Span;
 
 use crate::build::Builder;
-use crate::errors::MCDCExceedsConditionNumLimit;
+use crate::errors::MCDCExceedsConditionLimit;
 
-/// The MCDC bitmap scales exponentially (2^n) based on the number of conditions seen,
-/// So llvm sets a maximum value prevents the bitmap footprint from growing too large without the user's knowledge.
-/// This limit may be relaxed if the [upstream change](https://github.com/llvm/llvm-project/pull/82448) is merged.
-const MAX_CONDITIONS_NUM_IN_DECISION: usize = 6;
+/// LLVM uses `i16` to represent condition id. Hence `i16::MAX` is the hard limit for number of
+/// conditions in a decision.
+const MAX_CONDITIONS_IN_DECISION: usize = i16::MAX as usize;
 
 #[derive(Default)]
 struct MCDCDecisionCtx {
     /// To construct condition evaluation tree.
     decision_stack: VecDeque<ConditionInfo>,
     processing_decision: Option<MCDCDecisionSpan>,
+    conditions: Vec<MCDCBranchSpan>,
 }
 
 struct MCDCState {
@@ -100,28 +100,33 @@ impl MCDCState {
             }
             None => decision_ctx.processing_decision.insert(MCDCDecisionSpan {
                 span,
-                conditions_num: 0,
+                num_conditions: 0,
                 end_markers: vec![],
                 decision_depth,
             }),
         };
 
-        let parent_condition = decision_ctx.decision_stack.pop_back().unwrap_or_default();
-        let lhs_id = if parent_condition.condition_id == ConditionId::NONE {
-            decision.conditions_num += 1;
-            ConditionId::from(decision.conditions_num)
-        } else {
-            parent_condition.condition_id
-        };
+        let parent_condition = decision_ctx.decision_stack.pop_back().unwrap_or_else(|| {
+            assert_eq!(
+                decision.num_conditions, 0,
+                "decision stack must be empty only for empty decision"
+            );
+            decision.num_conditions += 1;
+            ConditionInfo {
+                condition_id: ConditionId::START,
+                true_next_id: None,
+                false_next_id: None,
+            }
+        });
+        let lhs_id = parent_condition.condition_id;
 
-        decision.conditions_num += 1;
-        let rhs_condition_id = ConditionId::from(decision.conditions_num);
-
+        let rhs_condition_id = ConditionId::from(decision.num_conditions);
+        decision.num_conditions += 1;
         let (lhs, rhs) = match op {
             LogicalOp::And => {
                 let lhs = ConditionInfo {
                     condition_id: lhs_id,
-                    true_next_id: rhs_condition_id,
+                    true_next_id: Some(rhs_condition_id),
                     false_next_id: parent_condition.false_next_id,
                 };
                 let rhs = ConditionInfo {
@@ -135,7 +140,7 @@ impl MCDCState {
                 let lhs = ConditionInfo {
                     condition_id: lhs_id,
                     true_next_id: parent_condition.true_next_id,
-                    false_next_id: rhs_condition_id,
+                    false_next_id: Some(rhs_condition_id),
                 };
                 let rhs = ConditionInfo {
                     condition_id: rhs_condition_id,
@@ -150,47 +155,67 @@ impl MCDCState {
         decision_ctx.decision_stack.push_back(lhs);
     }
 
-    fn take_condition(
+    fn try_finish_decision(
         &mut self,
+        span: Span,
         true_marker: BlockMarkerId,
         false_marker: BlockMarkerId,
-    ) -> (Option<ConditionInfo>, Option<MCDCDecisionSpan>) {
+        degraded_branches: &mut Vec<MCDCBranchSpan>,
+    ) -> Option<(MCDCDecisionSpan, Vec<MCDCBranchSpan>)> {
         let Some(decision_ctx) = self.decision_ctx_stack.last_mut() else {
             bug!("Unexpected empty decision_ctx_stack")
         };
         let Some(condition_info) = decision_ctx.decision_stack.pop_back() else {
-            return (None, None);
+            let branch = MCDCBranchSpan {
+                span,
+                condition_info: ConditionInfo {
+                    condition_id: ConditionId::START,
+                    true_next_id: None,
+                    false_next_id: None,
+                },
+                true_marker,
+                false_marker,
+            };
+            degraded_branches.push(branch);
+            return None;
         };
         let Some(decision) = decision_ctx.processing_decision.as_mut() else {
             bug!("Processing decision should have been created before any conditions are taken");
         };
-        if condition_info.true_next_id == ConditionId::NONE {
+        if condition_info.true_next_id.is_none() {
             decision.end_markers.push(true_marker);
         }
-        if condition_info.false_next_id == ConditionId::NONE {
+        if condition_info.false_next_id.is_none() {
             decision.end_markers.push(false_marker);
         }
+        decision_ctx.conditions.push(MCDCBranchSpan {
+            span,
+            condition_info,
+            true_marker,
+            false_marker,
+        });
 
         if decision_ctx.decision_stack.is_empty() {
-            (Some(condition_info), decision_ctx.processing_decision.take())
+            let conditions = std::mem::take(&mut decision_ctx.conditions);
+            decision_ctx.processing_decision.take().map(|decision| (decision, conditions))
         } else {
-            (Some(condition_info), None)
+            None
         }
     }
 }
 
-pub struct MCDCInfoBuilder {
-    branch_spans: Vec<MCDCBranchSpan>,
-    decision_spans: Vec<MCDCDecisionSpan>,
+pub(crate) struct MCDCInfoBuilder {
+    degraded_spans: Vec<MCDCBranchSpan>,
+    mcdc_spans: Vec<(MCDCDecisionSpan, Vec<MCDCBranchSpan>)>,
     state: MCDCState,
 }
 
 impl MCDCInfoBuilder {
-    pub fn new() -> Self {
-        Self { branch_spans: vec![], decision_spans: vec![], state: MCDCState::new() }
+    pub(crate) fn new() -> Self {
+        Self { degraded_spans: vec![], mcdc_spans: vec![], state: MCDCState::new() }
     }
 
-    pub fn visit_evaluated_condition(
+    pub(crate) fn visit_evaluated_condition(
         &mut self,
         tcx: TyCtxt<'_>,
         source_info: SourceInfo,
@@ -201,76 +226,70 @@ impl MCDCInfoBuilder {
         let true_marker = inject_block_marker(source_info, true_block);
         let false_marker = inject_block_marker(source_info, false_block);
 
-        let decision_depth = self.state.decision_depth();
-        let (mut condition_info, decision_result) =
-            self.state.take_condition(true_marker, false_marker);
         // take_condition() returns Some for decision_result when the decision stack
         // is empty, i.e. when all the conditions of the decision were instrumented,
         // and the decision is "complete".
-        if let Some(decision) = decision_result {
-            match decision.conditions_num {
+        if let Some((decision, conditions)) = self.state.try_finish_decision(
+            source_info.span,
+            true_marker,
+            false_marker,
+            &mut self.degraded_spans,
+        ) {
+            let num_conditions = conditions.len();
+            assert_eq!(
+                num_conditions, decision.num_conditions,
+                "final number of conditions is not correct"
+            );
+            match num_conditions {
                 0 => {
                     unreachable!("Decision with no condition is not expected");
                 }
-                1..=MAX_CONDITIONS_NUM_IN_DECISION => {
-                    self.decision_spans.push(decision);
+                1..=MAX_CONDITIONS_IN_DECISION => {
+                    self.mcdc_spans.push((decision, conditions));
                 }
                 _ => {
-                    // Do not generate mcdc mappings and statements for decisions with too many conditions.
-                    let rebase_idx = self.branch_spans.len() - decision.conditions_num + 1;
-                    for branch in &mut self.branch_spans[rebase_idx..] {
-                        branch.condition_info = None;
-                    }
+                    self.degraded_spans.extend(conditions);
 
-                    // ConditionInfo of this branch shall also be reset.
-                    condition_info = None;
-
-                    tcx.dcx().emit_warn(MCDCExceedsConditionNumLimit {
+                    tcx.dcx().emit_warn(MCDCExceedsConditionLimit {
                         span: decision.span,
-                        conditions_num: decision.conditions_num,
-                        max_conditions_num: MAX_CONDITIONS_NUM_IN_DECISION,
+                        num_conditions,
+                        max_conditions: MAX_CONDITIONS_IN_DECISION,
                     });
                 }
             }
         }
-        self.branch_spans.push(MCDCBranchSpan {
-            span: source_info.span,
-            condition_info,
-            true_marker,
-            false_marker,
-            decision_depth,
-        });
     }
 
-    pub fn into_done(self) -> (Vec<MCDCDecisionSpan>, Vec<MCDCBranchSpan>) {
-        (self.decision_spans, self.branch_spans)
+    pub(crate) fn into_done(
+        self,
+    ) -> (Vec<(MCDCDecisionSpan, Vec<MCDCBranchSpan>)>, Vec<MCDCBranchSpan>) {
+        (self.mcdc_spans, self.degraded_spans)
     }
 }
 
 impl Builder<'_, '_> {
     pub(crate) fn visit_coverage_branch_operation(&mut self, logical_op: LogicalOp, span: Span) {
-        if let Some(branch_info) = self.coverage_branch_info.as_mut()
-            && let Some(mcdc_info) = branch_info.mcdc_info.as_mut()
+        if let Some(coverage_info) = self.coverage_info.as_mut()
+            && let Some(mcdc_info) = coverage_info.mcdc_info.as_mut()
         {
             mcdc_info.state.record_conditions(logical_op, span);
         }
     }
 
     pub(crate) fn mcdc_increment_depth_if_enabled(&mut self) {
-        if let Some(branch_info) = self.coverage_branch_info.as_mut()
-            && let Some(mcdc_info) = branch_info.mcdc_info.as_mut()
+        if let Some(coverage_info) = self.coverage_info.as_mut()
+            && let Some(mcdc_info) = coverage_info.mcdc_info.as_mut()
         {
             mcdc_info.state.decision_ctx_stack.push(MCDCDecisionCtx::default());
         };
     }
 
     pub(crate) fn mcdc_decrement_depth_if_enabled(&mut self) {
-        if let Some(branch_info) = self.coverage_branch_info.as_mut()
-            && let Some(mcdc_info) = branch_info.mcdc_info.as_mut()
+        if let Some(coverage_info) = self.coverage_info.as_mut()
+            && let Some(mcdc_info) = coverage_info.mcdc_info.as_mut()
+            && mcdc_info.state.decision_ctx_stack.pop().is_none()
         {
-            if mcdc_info.state.decision_ctx_stack.pop().is_none() {
-                bug!("Unexpected empty decision stack");
-            }
+            bug!("Unexpected empty decision stack");
         };
     }
 }

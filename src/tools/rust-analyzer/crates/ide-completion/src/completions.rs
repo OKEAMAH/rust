@@ -24,9 +24,9 @@ pub(crate) mod vis;
 
 use std::iter;
 
-use hir::{known, HasAttrs, ScopeDef, Variant};
+use hir::{sym, HasAttrs, Name, ScopeDef, Variant};
 use ide_db::{imports::import_assets::LocatedImport, RootDatabase, SymbolKind};
-use syntax::{ast, SmolStr};
+use syntax::{ast, SmolStr, ToSmolStr};
 
 use crate::{
     context::{
@@ -85,6 +85,7 @@ impl Completions {
             CompletionItemKind::Keyword,
             ctx.source_range(),
             SmolStr::new_static(keyword),
+            ctx.edition,
         );
         item.add_to(self, ctx.db);
     }
@@ -124,7 +125,8 @@ impl Completions {
         kw: &str,
         snippet: &str,
     ) {
-        let mut item = CompletionItem::new(CompletionItemKind::Keyword, ctx.source_range(), kw);
+        let mut item =
+            CompletionItem::new(CompletionItemKind::Keyword, ctx.source_range(), kw, ctx.edition);
 
         match ctx.config.snippet_cap {
             Some(cap) => {
@@ -149,7 +151,8 @@ impl Completions {
         kw: &str,
         snippet: &str,
     ) {
-        let mut item = CompletionItem::new(CompletionItemKind::Keyword, ctx.source_range(), kw);
+        let mut item =
+            CompletionItem::new(CompletionItemKind::Keyword, ctx.source_range(), kw, ctx.edition);
 
         match ctx.config.snippet_cap {
             Some(cap) => item.insert_snippet(cap, snippet),
@@ -541,13 +544,23 @@ impl Completions {
     }
 
     pub(crate) fn add_lifetime(&mut self, ctx: &CompletionContext<'_>, name: hir::Name) {
-        CompletionItem::new(SymbolKind::LifetimeParam, ctx.source_range(), name.to_smol_str())
-            .add_to(self, ctx.db)
+        CompletionItem::new(
+            SymbolKind::LifetimeParam,
+            ctx.source_range(),
+            name.display_no_db(ctx.edition).to_smolstr(),
+            ctx.edition,
+        )
+        .add_to(self, ctx.db)
     }
 
     pub(crate) fn add_label(&mut self, ctx: &CompletionContext<'_>, name: hir::Name) {
-        CompletionItem::new(SymbolKind::Label, ctx.source_range(), name.to_smol_str())
-            .add_to(self, ctx.db)
+        CompletionItem::new(
+            SymbolKind::Label,
+            ctx.source_range(),
+            name.display_no_db(ctx.edition).to_smolstr(),
+            ctx.edition,
+        )
+        .add_to(self, ctx.db)
     }
 
     pub(crate) fn add_variant_pat(
@@ -604,6 +617,16 @@ impl Completions {
         }
         self.add_opt(render_struct_pat(RenderContext::new(ctx), pattern_ctx, strukt, local_name));
     }
+
+    pub(crate) fn suggest_name(&mut self, ctx: &CompletionContext<'_>, name: &str) {
+        let item = CompletionItem::new(
+            CompletionItemKind::Binding,
+            ctx.source_range(),
+            SmolStr::from(name),
+            ctx.edition,
+        );
+        item.add_to(self, ctx.db);
+    }
 }
 
 /// Calls the callback for each variant of the provided enum with the path to the variant.
@@ -618,7 +641,8 @@ fn enum_variants_with_paths(
     let mut process_variant = |variant: Variant| {
         let self_path = hir::ModPath::from_segments(
             hir::PathKind::Plain,
-            iter::once(known::SELF_TYPE).chain(iter::once(variant.name(ctx.db))),
+            iter::once(Name::new_symbol_root(sym::Self_.clone()))
+                .chain(iter::once(variant.name(ctx.db))),
         );
 
         cb(acc, ctx, variant, self_path);
@@ -633,11 +657,10 @@ fn enum_variants_with_paths(
     }
 
     for variant in variants {
-        if let Some(path) = ctx.module.find_use_path(
+        if let Some(path) = ctx.module.find_path(
             ctx.db,
             hir::ModuleDef::from(variant),
-            ctx.config.prefer_no_std,
-            ctx.config.prefer_prelude,
+            ctx.config.import_path_config(),
         ) {
             // Variants with trivial paths are already added by the existing completion logic,
             // so we should avoid adding these twice

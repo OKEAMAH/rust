@@ -1,17 +1,21 @@
-#![cfg_attr(doc, allow(internal_features))]
-#![cfg_attr(doc, feature(rustdoc_internals))]
-#![cfg_attr(doc, doc(rust_logo))]
-#![feature(rustc_private)]
-// Note: please avoid adding other feature gates where possible
+// tidy-alphabetical-start
 #![allow(rustc::diagnostic_outside_of_impl)]
 #![allow(rustc::untranslatable_diagnostic)]
+#![cfg_attr(doc, allow(internal_features))]
+#![cfg_attr(doc, doc(rust_logo))]
+#![cfg_attr(doc, feature(rustdoc_internals))]
+// Note: please avoid adding other feature gates where possible
+#![feature(rustc_private)]
+// Note: please avoid adding other feature gates where possible
 #![warn(rust_2018_idioms)]
-#![warn(unused_lifetimes)]
 #![warn(unreachable_pub)]
+#![warn(unused_lifetimes)]
+// tidy-alphabetical-end
 
 extern crate jobserver;
 #[macro_use]
 extern crate rustc_middle;
+extern crate rustc_abi;
 extern crate rustc_ast;
 extern crate rustc_codegen_ssa;
 extern crate rustc_data_structures;
@@ -21,7 +25,6 @@ extern crate rustc_hir;
 extern crate rustc_incremental;
 extern crate rustc_index;
 extern crate rustc_metadata;
-extern crate rustc_monomorphize;
 extern crate rustc_session;
 extern crate rustc_span;
 extern crate rustc_target;
@@ -36,15 +39,15 @@ use std::sync::Arc;
 
 use cranelift_codegen::isa::TargetIsa;
 use cranelift_codegen::settings::{self, Configurable};
-use rustc_codegen_ssa::traits::CodegenBackend;
 use rustc_codegen_ssa::CodegenResults;
+use rustc_codegen_ssa::traits::CodegenBackend;
 use rustc_data_structures::profiling::SelfProfilerRef;
 use rustc_errors::ErrorGuaranteed;
 use rustc_metadata::EncodedMetadata;
 use rustc_middle::dep_graph::{WorkProduct, WorkProductId};
-use rustc_session::config::OutputFilenames;
 use rustc_session::Session;
-use rustc_span::{sym, Symbol};
+use rustc_session::config::OutputFilenames;
+use rustc_span::{Symbol, sym};
 
 pub use crate::config::*;
 use crate::prelude::*;
@@ -76,18 +79,18 @@ mod pretty_clif;
 mod toolchain;
 mod trap;
 mod unsize;
+mod unwind_module;
 mod value_and_place;
 mod vtable;
 
 mod prelude {
+    pub(crate) use cranelift_codegen::Context;
     pub(crate) use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
     pub(crate) use cranelift_codegen::ir::function::Function;
-    pub(crate) use cranelift_codegen::ir::types;
     pub(crate) use cranelift_codegen::ir::{
         AbiParam, Block, FuncRef, Inst, InstBuilder, MemFlags, Signature, SourceLoc, StackSlot,
-        StackSlotData, StackSlotKind, TrapCode, Type, Value,
+        StackSlotData, StackSlotKind, TrapCode, Type, Value, types,
     };
-    pub(crate) use cranelift_codegen::Context;
     pub(crate) use cranelift_module::{self, DataDescription, FuncId, Linkage, Module};
     pub(crate) use rustc_data_structures::fx::{FxHashMap, FxIndexMap};
     pub(crate) use rustc_hir::def_id::{DefId, LOCAL_CRATE};
@@ -95,10 +98,10 @@ mod prelude {
     pub(crate) use rustc_middle::mir::{self, *};
     pub(crate) use rustc_middle::ty::layout::{LayoutOf, TyAndLayout};
     pub(crate) use rustc_middle::ty::{
-        self, FloatTy, Instance, InstanceDef, IntTy, ParamEnv, Ty, TyCtxt, UintTy,
+        self, FloatTy, Instance, InstanceKind, IntTy, ParamEnv, Ty, TyCtxt, UintTy,
     };
     pub(crate) use rustc_span::Span;
-    pub(crate) use rustc_target::abi::{Abi, FieldIdx, Scalar, Size, VariantIdx, FIRST_VARIANT};
+    pub(crate) use rustc_target::abi::{Abi, FIRST_VARIANT, FieldIdx, Scalar, Size, VariantIdx};
 
     pub(crate) use crate::abi::*;
     pub(crate) use crate::base::{codegen_operand, codegen_place};
@@ -127,22 +130,13 @@ struct CodegenCx {
     global_asm: String,
     inline_asm_index: Cell<usize>,
     debug_context: Option<DebugContext>,
-    unwind_context: UnwindContext,
     cgu_name: Symbol,
 }
 
 impl CodegenCx {
-    fn new(
-        tcx: TyCtxt<'_>,
-        backend_config: BackendConfig,
-        isa: &dyn TargetIsa,
-        debug_info: bool,
-        cgu_name: Symbol,
-    ) -> Self {
+    fn new(tcx: TyCtxt<'_>, isa: &dyn TargetIsa, debug_info: bool, cgu_name: Symbol) -> Self {
         assert_eq!(pointer_ty(tcx), isa.pointer_type());
 
-        let unwind_context =
-            UnwindContext::new(isa, matches!(backend_config.codegen_mode, CodegenMode::Aot));
         let debug_context = if debug_info && !tcx.sess.target.options.is_like_windows {
             Some(DebugContext::new(tcx, isa, cgu_name.as_str()))
         } else {
@@ -155,7 +149,6 @@ impl CodegenCx {
             global_asm: String::new(),
             inline_asm_index: Cell::new(0),
             debug_context,
-            unwind_context,
             cgu_name,
         }
     }
@@ -172,12 +165,17 @@ impl CodegenBackend for CraneliftCodegenBackend {
     }
 
     fn init(&self, sess: &Session) {
-        use rustc_session::config::Lto;
+        use rustc_session::config::{InstrumentCoverage, Lto};
         match sess.lto() {
             Lto::No | Lto::ThinLocal => {}
             Lto::Thin | Lto::Fat => {
                 sess.dcx().warn("LTO is not supported. You may get a linker error.")
             }
+        }
+
+        if sess.opts.cg.instrument_coverage() != InstrumentCoverage::No {
+            sess.dcx()
+                .fatal("`-Cinstrument-coverage` is LLVM specific and not supported by Cranelift");
         }
 
         let mut config = self.config.borrow_mut();
@@ -193,9 +191,20 @@ impl CodegenBackend for CraneliftCodegenBackend {
         if sess.target.arch == "x86_64" && sess.target.os != "none" {
             // x86_64 mandates SSE2 support
             vec![Symbol::intern("fxsr"), sym::sse, Symbol::intern("sse2")]
-        } else if sess.target.arch == "aarch64" && sess.target.os != "none" {
-            // AArch64 mandates Neon support
-            vec![sym::neon]
+        } else if sess.target.arch == "aarch64" {
+            match &*sess.target.os {
+                "none" => vec![],
+                // On macOS the aes, sha2 and sha3 features are enabled by default and ring
+                // fails to compile on macOS when they are not present.
+                "macos" => vec![
+                    sym::neon,
+                    Symbol::intern("aes"),
+                    Symbol::intern("sha2"),
+                    Symbol::intern("sha3"),
+                ],
+                // AArch64 mandates Neon support
+                _ => vec![sym::neon],
+            }
         } else {
             vec![]
         }
@@ -268,9 +277,9 @@ fn build_isa(sess: &Session, backend_config: &BackendConfig) -> Arc<dyn TargetIs
     flags_builder.set("enable_verifier", enable_verifier).unwrap();
     flags_builder.set("regalloc_checker", enable_verifier).unwrap();
 
-    let preserve_frame_pointer = sess.target.options.frame_pointer
-        != rustc_target::spec::FramePointer::MayOmit
-        || matches!(sess.opts.cg.force_frame_pointers, Some(true));
+    let mut frame_ptr = sess.target.options.frame_pointer.clone();
+    frame_ptr.ratchet(sess.opts.cg.force_frame_pointers);
+    let preserve_frame_pointer = frame_ptr != rustc_target::spec::FramePointer::MayOmit;
     flags_builder
         .set("preserve_frame_pointers", if preserve_frame_pointer { "true" } else { "false" })
         .unwrap();

@@ -14,7 +14,7 @@ _x.py() {
     fi
 
     local context curcontext="$curcontext" state line
-    _arguments "${_arguments_options[@]}" \
+    _arguments "${_arguments_options[@]}" : \
 '--config=[TOML configuration file for build]:FILE:_files' \
 '--build-dir=[Build directory, overrides \`build.build-dir\` in \`config.toml\`]:DIR:_files -/' \
 '--build=[build target of the stage0 compiler]:BUILD:( )' \
@@ -33,7 +33,6 @@ _x.py() {
 '--warnings=[if value is deny, will deny warnings if value is warn, will emit warnings otherwise, use the default configured behaviour]:deny|warn:(deny warn default)' \
 '--error-format=[rustc error format]:FORMAT:( )' \
 '--color=[whether to use color in cargo and rustc output]:STYLE:(always never auto)' \
-'--llvm-skip-rebuild=[whether rebuilding llvm should be skipped, overriding \`skip-rebuld\` in config.toml]:VALUE:(true false)' \
 '--rust-profile-generate=[generate PGO profile with rustc build]:PROFILE:_files' \
 '--rust-profile-use=[use PGO profile for rustc build]:PROFILE:_files' \
 '--llvm-profile-use=[use PGO profile for LLVM build]:PROFILE:_files' \
@@ -65,7 +64,7 @@ _x.py() {
         curcontext="${curcontext%:*:*}:x.py-command-$line[3]:"
         case $line[3] in
             (build)
-_arguments "${_arguments_options[@]}" \
+_arguments "${_arguments_options[@]}" : \
 '--config=[TOML configuration file for build]:FILE:_files' \
 '--build-dir=[Build directory, overrides \`build.build-dir\` in \`config.toml\`]:DIR:_files -/' \
 '--build=[build target of the stage0 compiler]:BUILD:( )' \
@@ -84,7 +83,6 @@ _arguments "${_arguments_options[@]}" \
 '--warnings=[if value is deny, will deny warnings if value is warn, will emit warnings otherwise, use the default configured behaviour]:deny|warn:(deny warn default)' \
 '--error-format=[rustc error format]:FORMAT:( )' \
 '--color=[whether to use color in cargo and rustc output]:STYLE:(always never auto)' \
-'--llvm-skip-rebuild=[whether rebuilding llvm should be skipped, overriding \`skip-rebuld\` in config.toml]:VALUE:(true false)' \
 '--rust-profile-generate=[generate PGO profile with rustc build]:PROFILE:_files' \
 '--rust-profile-use=[use PGO profile for rustc build]:PROFILE:_files' \
 '--llvm-profile-use=[use PGO profile for LLVM build]:PROFILE:_files' \
@@ -108,7 +106,7 @@ _arguments "${_arguments_options[@]}" \
 && ret=0
 ;;
 (check)
-_arguments "${_arguments_options[@]}" \
+_arguments "${_arguments_options[@]}" : \
 '--config=[TOML configuration file for build]:FILE:_files' \
 '--build-dir=[Build directory, overrides \`build.build-dir\` in \`config.toml\`]:DIR:_files -/' \
 '--build=[build target of the stage0 compiler]:BUILD:( )' \
@@ -127,7 +125,6 @@ _arguments "${_arguments_options[@]}" \
 '--warnings=[if value is deny, will deny warnings if value is warn, will emit warnings otherwise, use the default configured behaviour]:deny|warn:(deny warn default)' \
 '--error-format=[rustc error format]:FORMAT:( )' \
 '--color=[whether to use color in cargo and rustc output]:STYLE:(always never auto)' \
-'--llvm-skip-rebuild=[whether rebuilding llvm should be skipped, overriding \`skip-rebuld\` in config.toml]:VALUE:(true false)' \
 '--rust-profile-generate=[generate PGO profile with rustc build]:PROFILE:_files' \
 '--rust-profile-use=[use PGO profile for rustc build]:PROFILE:_files' \
 '--llvm-profile-use=[use PGO profile for LLVM build]:PROFILE:_files' \
@@ -152,7 +149,7 @@ _arguments "${_arguments_options[@]}" \
 && ret=0
 ;;
 (clippy)
-_arguments "${_arguments_options[@]}" \
+_arguments "${_arguments_options[@]}" : \
 '*-A+[clippy lints to allow]:LINT: ' \
 '*-D+[clippy lints to deny]:LINT: ' \
 '*-W+[clippy lints to warn on]:LINT: ' \
@@ -175,7 +172,6 @@ _arguments "${_arguments_options[@]}" \
 '--warnings=[if value is deny, will deny warnings if value is warn, will emit warnings otherwise, use the default configured behaviour]:deny|warn:(deny warn default)' \
 '--error-format=[rustc error format]:FORMAT:( )' \
 '--color=[whether to use color in cargo and rustc output]:STYLE:(always never auto)' \
-'--llvm-skip-rebuild=[whether rebuilding llvm should be skipped, overriding \`skip-rebuld\` in config.toml]:VALUE:(true false)' \
 '--rust-profile-generate=[generate PGO profile with rustc build]:PROFILE:_files' \
 '--rust-profile-use=[use PGO profile for rustc build]:PROFILE:_files' \
 '--llvm-profile-use=[use PGO profile for LLVM build]:PROFILE:_files' \
@@ -202,7 +198,7 @@ _arguments "${_arguments_options[@]}" \
 && ret=0
 ;;
 (fix)
-_arguments "${_arguments_options[@]}" \
+_arguments "${_arguments_options[@]}" : \
 '--config=[TOML configuration file for build]:FILE:_files' \
 '--build-dir=[Build directory, overrides \`build.build-dir\` in \`config.toml\`]:DIR:_files -/' \
 '--build=[build target of the stage0 compiler]:BUILD:( )' \
@@ -221,7 +217,6 @@ _arguments "${_arguments_options[@]}" \
 '--warnings=[if value is deny, will deny warnings if value is warn, will emit warnings otherwise, use the default configured behaviour]:deny|warn:(deny warn default)' \
 '--error-format=[rustc error format]:FORMAT:( )' \
 '--color=[whether to use color in cargo and rustc output]:STYLE:(always never auto)' \
-'--llvm-skip-rebuild=[whether rebuilding llvm should be skipped, overriding \`skip-rebuld\` in config.toml]:VALUE:(true false)' \
 '--rust-profile-generate=[generate PGO profile with rustc build]:PROFILE:_files' \
 '--rust-profile-use=[use PGO profile for rustc build]:PROFILE:_files' \
 '--llvm-profile-use=[use PGO profile for LLVM build]:PROFILE:_files' \
@@ -245,7 +240,7 @@ _arguments "${_arguments_options[@]}" \
 && ret=0
 ;;
 (fmt)
-_arguments "${_arguments_options[@]}" \
+_arguments "${_arguments_options[@]}" : \
 '--config=[TOML configuration file for build]:FILE:_files' \
 '--build-dir=[Build directory, overrides \`build.build-dir\` in \`config.toml\`]:DIR:_files -/' \
 '--build=[build target of the stage0 compiler]:BUILD:( )' \
@@ -264,13 +259,13 @@ _arguments "${_arguments_options[@]}" \
 '--warnings=[if value is deny, will deny warnings if value is warn, will emit warnings otherwise, use the default configured behaviour]:deny|warn:(deny warn default)' \
 '--error-format=[rustc error format]:FORMAT:( )' \
 '--color=[whether to use color in cargo and rustc output]:STYLE:(always never auto)' \
-'--llvm-skip-rebuild=[whether rebuilding llvm should be skipped, overriding \`skip-rebuld\` in config.toml]:VALUE:(true false)' \
 '--rust-profile-generate=[generate PGO profile with rustc build]:PROFILE:_files' \
 '--rust-profile-use=[use PGO profile for rustc build]:PROFILE:_files' \
 '--llvm-profile-use=[use PGO profile for LLVM build]:PROFILE:_files' \
 '*--reproducible-artifact=[Additional reproducible artifacts that should be added to the reproducible artifacts archive]:REPRODUCIBLE_ARTIFACT: ' \
 '*--set=[override options in config.toml]:section.option=value:( )' \
 '--check[check formatting instead of applying]' \
+'--all[apply to all appropriate files, not just those that have been modified]' \
 '*-v[use verbose output (-vv for very verbose)]' \
 '*--verbose[use verbose output (-vv for very verbose)]' \
 '-i[use incremental compilation]' \
@@ -289,7 +284,7 @@ _arguments "${_arguments_options[@]}" \
 && ret=0
 ;;
 (doc)
-_arguments "${_arguments_options[@]}" \
+_arguments "${_arguments_options[@]}" : \
 '--config=[TOML configuration file for build]:FILE:_files' \
 '--build-dir=[Build directory, overrides \`build.build-dir\` in \`config.toml\`]:DIR:_files -/' \
 '--build=[build target of the stage0 compiler]:BUILD:( )' \
@@ -308,7 +303,6 @@ _arguments "${_arguments_options[@]}" \
 '--warnings=[if value is deny, will deny warnings if value is warn, will emit warnings otherwise, use the default configured behaviour]:deny|warn:(deny warn default)' \
 '--error-format=[rustc error format]:FORMAT:( )' \
 '--color=[whether to use color in cargo and rustc output]:STYLE:(always never auto)' \
-'--llvm-skip-rebuild=[whether rebuilding llvm should be skipped, overriding \`skip-rebuld\` in config.toml]:VALUE:(true false)' \
 '--rust-profile-generate=[generate PGO profile with rustc build]:PROFILE:_files' \
 '--rust-profile-use=[use PGO profile for rustc build]:PROFILE:_files' \
 '--llvm-profile-use=[use PGO profile for LLVM build]:PROFILE:_files' \
@@ -334,9 +328,9 @@ _arguments "${_arguments_options[@]}" \
 && ret=0
 ;;
 (test)
-_arguments "${_arguments_options[@]}" \
+_arguments "${_arguments_options[@]}" : \
 '*--test-args=[extra arguments to be passed for the test tool being used (e.g. libtest, compiletest or rustdoc)]:ARGS: ' \
-'*--rustc-args=[extra options to pass the compiler when running tests]:ARGS: ' \
+'*--compiletest-rustc-args=[extra options to pass the compiler when running compiletest tests]:ARGS: ' \
 '--extra-checks=[comma-separated list of other files types to check (accepts py, py\:lint, py\:fmt, shell)]:EXTRA_CHECKS: ' \
 '--compare-mode=[mode describing what file the actual ui output will be compared to]:COMPARE MODE: ' \
 '--pass=[force {check,build,run}-pass tests to this mode]:check | build | run: ' \
@@ -359,7 +353,6 @@ _arguments "${_arguments_options[@]}" \
 '--warnings=[if value is deny, will deny warnings if value is warn, will emit warnings otherwise, use the default configured behaviour]:deny|warn:(deny warn default)' \
 '--error-format=[rustc error format]:FORMAT:( )' \
 '--color=[whether to use color in cargo and rustc output]:STYLE:(always never auto)' \
-'--llvm-skip-rebuild=[whether rebuilding llvm should be skipped, overriding \`skip-rebuld\` in config.toml]:VALUE:(true false)' \
 '--rust-profile-generate=[generate PGO profile with rustc build]:PROFILE:_files' \
 '--rust-profile-use=[use PGO profile for rustc build]:PROFILE:_files' \
 '--llvm-profile-use=[use PGO profile for LLVM build]:PROFILE:_files' \
@@ -390,9 +383,8 @@ _arguments "${_arguments_options[@]}" \
 && ret=0
 ;;
 (miri)
-_arguments "${_arguments_options[@]}" \
+_arguments "${_arguments_options[@]}" : \
 '*--test-args=[extra arguments to be passed for the test tool being used (e.g. libtest, compiletest or rustdoc)]:ARGS: ' \
-'*--rustc-args=[extra options to pass the compiler when running tests]:ARGS: ' \
 '--config=[TOML configuration file for build]:FILE:_files' \
 '--build-dir=[Build directory, overrides \`build.build-dir\` in \`config.toml\`]:DIR:_files -/' \
 '--build=[build target of the stage0 compiler]:BUILD:( )' \
@@ -411,7 +403,6 @@ _arguments "${_arguments_options[@]}" \
 '--warnings=[if value is deny, will deny warnings if value is warn, will emit warnings otherwise, use the default configured behaviour]:deny|warn:(deny warn default)' \
 '--error-format=[rustc error format]:FORMAT:( )' \
 '--color=[whether to use color in cargo and rustc output]:STYLE:(always never auto)' \
-'--llvm-skip-rebuild=[whether rebuilding llvm should be skipped, overriding \`skip-rebuld\` in config.toml]:VALUE:(true false)' \
 '--rust-profile-generate=[generate PGO profile with rustc build]:PROFILE:_files' \
 '--rust-profile-use=[use PGO profile for rustc build]:PROFILE:_files' \
 '--llvm-profile-use=[use PGO profile for LLVM build]:PROFILE:_files' \
@@ -438,7 +429,7 @@ _arguments "${_arguments_options[@]}" \
 && ret=0
 ;;
 (bench)
-_arguments "${_arguments_options[@]}" \
+_arguments "${_arguments_options[@]}" : \
 '*--test-args=[]:TEST_ARGS: ' \
 '--config=[TOML configuration file for build]:FILE:_files' \
 '--build-dir=[Build directory, overrides \`build.build-dir\` in \`config.toml\`]:DIR:_files -/' \
@@ -458,7 +449,6 @@ _arguments "${_arguments_options[@]}" \
 '--warnings=[if value is deny, will deny warnings if value is warn, will emit warnings otherwise, use the default configured behaviour]:deny|warn:(deny warn default)' \
 '--error-format=[rustc error format]:FORMAT:( )' \
 '--color=[whether to use color in cargo and rustc output]:STYLE:(always never auto)' \
-'--llvm-skip-rebuild=[whether rebuilding llvm should be skipped, overriding \`skip-rebuld\` in config.toml]:VALUE:(true false)' \
 '--rust-profile-generate=[generate PGO profile with rustc build]:PROFILE:_files' \
 '--rust-profile-use=[use PGO profile for rustc build]:PROFILE:_files' \
 '--llvm-profile-use=[use PGO profile for LLVM build]:PROFILE:_files' \
@@ -482,7 +472,7 @@ _arguments "${_arguments_options[@]}" \
 && ret=0
 ;;
 (clean)
-_arguments "${_arguments_options[@]}" \
+_arguments "${_arguments_options[@]}" : \
 '--stage=[Clean a specific stage without touching other artifacts. By default, every stage is cleaned if this option is not used]:N: ' \
 '--config=[TOML configuration file for build]:FILE:_files' \
 '--build-dir=[Build directory, overrides \`build.build-dir\` in \`config.toml\`]:DIR:_files -/' \
@@ -501,7 +491,6 @@ _arguments "${_arguments_options[@]}" \
 '--warnings=[if value is deny, will deny warnings if value is warn, will emit warnings otherwise, use the default configured behaviour]:deny|warn:(deny warn default)' \
 '--error-format=[rustc error format]:FORMAT:( )' \
 '--color=[whether to use color in cargo and rustc output]:STYLE:(always never auto)' \
-'--llvm-skip-rebuild=[whether rebuilding llvm should be skipped, overriding \`skip-rebuld\` in config.toml]:VALUE:(true false)' \
 '--rust-profile-generate=[generate PGO profile with rustc build]:PROFILE:_files' \
 '--rust-profile-use=[use PGO profile for rustc build]:PROFILE:_files' \
 '--llvm-profile-use=[use PGO profile for LLVM build]:PROFILE:_files' \
@@ -526,7 +515,7 @@ _arguments "${_arguments_options[@]}" \
 && ret=0
 ;;
 (dist)
-_arguments "${_arguments_options[@]}" \
+_arguments "${_arguments_options[@]}" : \
 '--config=[TOML configuration file for build]:FILE:_files' \
 '--build-dir=[Build directory, overrides \`build.build-dir\` in \`config.toml\`]:DIR:_files -/' \
 '--build=[build target of the stage0 compiler]:BUILD:( )' \
@@ -545,7 +534,6 @@ _arguments "${_arguments_options[@]}" \
 '--warnings=[if value is deny, will deny warnings if value is warn, will emit warnings otherwise, use the default configured behaviour]:deny|warn:(deny warn default)' \
 '--error-format=[rustc error format]:FORMAT:( )' \
 '--color=[whether to use color in cargo and rustc output]:STYLE:(always never auto)' \
-'--llvm-skip-rebuild=[whether rebuilding llvm should be skipped, overriding \`skip-rebuld\` in config.toml]:VALUE:(true false)' \
 '--rust-profile-generate=[generate PGO profile with rustc build]:PROFILE:_files' \
 '--rust-profile-use=[use PGO profile for rustc build]:PROFILE:_files' \
 '--llvm-profile-use=[use PGO profile for LLVM build]:PROFILE:_files' \
@@ -569,7 +557,7 @@ _arguments "${_arguments_options[@]}" \
 && ret=0
 ;;
 (install)
-_arguments "${_arguments_options[@]}" \
+_arguments "${_arguments_options[@]}" : \
 '--config=[TOML configuration file for build]:FILE:_files' \
 '--build-dir=[Build directory, overrides \`build.build-dir\` in \`config.toml\`]:DIR:_files -/' \
 '--build=[build target of the stage0 compiler]:BUILD:( )' \
@@ -588,7 +576,6 @@ _arguments "${_arguments_options[@]}" \
 '--warnings=[if value is deny, will deny warnings if value is warn, will emit warnings otherwise, use the default configured behaviour]:deny|warn:(deny warn default)' \
 '--error-format=[rustc error format]:FORMAT:( )' \
 '--color=[whether to use color in cargo and rustc output]:STYLE:(always never auto)' \
-'--llvm-skip-rebuild=[whether rebuilding llvm should be skipped, overriding \`skip-rebuld\` in config.toml]:VALUE:(true false)' \
 '--rust-profile-generate=[generate PGO profile with rustc build]:PROFILE:_files' \
 '--rust-profile-use=[use PGO profile for rustc build]:PROFILE:_files' \
 '--llvm-profile-use=[use PGO profile for LLVM build]:PROFILE:_files' \
@@ -612,7 +599,7 @@ _arguments "${_arguments_options[@]}" \
 && ret=0
 ;;
 (run)
-_arguments "${_arguments_options[@]}" \
+_arguments "${_arguments_options[@]}" : \
 '*--args=[arguments for the tool]:ARGS: ' \
 '--config=[TOML configuration file for build]:FILE:_files' \
 '--build-dir=[Build directory, overrides \`build.build-dir\` in \`config.toml\`]:DIR:_files -/' \
@@ -632,7 +619,6 @@ _arguments "${_arguments_options[@]}" \
 '--warnings=[if value is deny, will deny warnings if value is warn, will emit warnings otherwise, use the default configured behaviour]:deny|warn:(deny warn default)' \
 '--error-format=[rustc error format]:FORMAT:( )' \
 '--color=[whether to use color in cargo and rustc output]:STYLE:(always never auto)' \
-'--llvm-skip-rebuild=[whether rebuilding llvm should be skipped, overriding \`skip-rebuld\` in config.toml]:VALUE:(true false)' \
 '--rust-profile-generate=[generate PGO profile with rustc build]:PROFILE:_files' \
 '--rust-profile-use=[use PGO profile for rustc build]:PROFILE:_files' \
 '--llvm-profile-use=[use PGO profile for LLVM build]:PROFILE:_files' \
@@ -656,7 +642,7 @@ _arguments "${_arguments_options[@]}" \
 && ret=0
 ;;
 (setup)
-_arguments "${_arguments_options[@]}" \
+_arguments "${_arguments_options[@]}" : \
 '--config=[TOML configuration file for build]:FILE:_files' \
 '--build-dir=[Build directory, overrides \`build.build-dir\` in \`config.toml\`]:DIR:_files -/' \
 '--build=[build target of the stage0 compiler]:BUILD:( )' \
@@ -675,7 +661,6 @@ _arguments "${_arguments_options[@]}" \
 '--warnings=[if value is deny, will deny warnings if value is warn, will emit warnings otherwise, use the default configured behaviour]:deny|warn:(deny warn default)' \
 '--error-format=[rustc error format]:FORMAT:( )' \
 '--color=[whether to use color in cargo and rustc output]:STYLE:(always never auto)' \
-'--llvm-skip-rebuild=[whether rebuilding llvm should be skipped, overriding \`skip-rebuld\` in config.toml]:VALUE:(true false)' \
 '--rust-profile-generate=[generate PGO profile with rustc build]:PROFILE:_files' \
 '--rust-profile-use=[use PGO profile for rustc build]:PROFILE:_files' \
 '--llvm-profile-use=[use PGO profile for LLVM build]:PROFILE:_files' \
@@ -700,7 +685,7 @@ _arguments "${_arguments_options[@]}" \
 && ret=0
 ;;
 (suggest)
-_arguments "${_arguments_options[@]}" \
+_arguments "${_arguments_options[@]}" : \
 '--config=[TOML configuration file for build]:FILE:_files' \
 '--build-dir=[Build directory, overrides \`build.build-dir\` in \`config.toml\`]:DIR:_files -/' \
 '--build=[build target of the stage0 compiler]:BUILD:( )' \
@@ -719,7 +704,6 @@ _arguments "${_arguments_options[@]}" \
 '--warnings=[if value is deny, will deny warnings if value is warn, will emit warnings otherwise, use the default configured behaviour]:deny|warn:(deny warn default)' \
 '--error-format=[rustc error format]:FORMAT:( )' \
 '--color=[whether to use color in cargo and rustc output]:STYLE:(always never auto)' \
-'--llvm-skip-rebuild=[whether rebuilding llvm should be skipped, overriding \`skip-rebuld\` in config.toml]:VALUE:(true false)' \
 '--rust-profile-generate=[generate PGO profile with rustc build]:PROFILE:_files' \
 '--rust-profile-use=[use PGO profile for rustc build]:PROFILE:_files' \
 '--llvm-profile-use=[use PGO profile for LLVM build]:PROFILE:_files' \
@@ -744,7 +728,7 @@ _arguments "${_arguments_options[@]}" \
 && ret=0
 ;;
 (vendor)
-_arguments "${_arguments_options[@]}" \
+_arguments "${_arguments_options[@]}" : \
 '*--sync=[Additional \`Cargo.toml\` to sync and vendor]:SYNC:_files' \
 '--config=[TOML configuration file for build]:FILE:_files' \
 '--build-dir=[Build directory, overrides \`build.build-dir\` in \`config.toml\`]:DIR:_files -/' \
@@ -764,13 +748,54 @@ _arguments "${_arguments_options[@]}" \
 '--warnings=[if value is deny, will deny warnings if value is warn, will emit warnings otherwise, use the default configured behaviour]:deny|warn:(deny warn default)' \
 '--error-format=[rustc error format]:FORMAT:( )' \
 '--color=[whether to use color in cargo and rustc output]:STYLE:(always never auto)' \
-'--llvm-skip-rebuild=[whether rebuilding llvm should be skipped, overriding \`skip-rebuld\` in config.toml]:VALUE:(true false)' \
 '--rust-profile-generate=[generate PGO profile with rustc build]:PROFILE:_files' \
 '--rust-profile-use=[use PGO profile for rustc build]:PROFILE:_files' \
 '--llvm-profile-use=[use PGO profile for LLVM build]:PROFILE:_files' \
 '*--reproducible-artifact=[Additional reproducible artifacts that should be added to the reproducible artifacts archive]:REPRODUCIBLE_ARTIFACT: ' \
 '*--set=[override options in config.toml]:section.option=value:( )' \
 '--versioned-dirs[Always include version in subdir name]' \
+'*-v[use verbose output (-vv for very verbose)]' \
+'*--verbose[use verbose output (-vv for very verbose)]' \
+'-i[use incremental compilation]' \
+'--incremental[use incremental compilation]' \
+'--include-default-paths[include default paths in addition to the provided ones]' \
+'--dry-run[dry run; don'\''t build anything]' \
+'--dump-bootstrap-shims[Indicates whether to dump the work done from bootstrap shims]' \
+'--json-output[use message-format=json]' \
+'--bypass-bootstrap-lock[Bootstrap uses this value to decide whether it should bypass locking the build process. This is rarely needed (e.g., compiling the std library for different targets in parallel)]' \
+'--llvm-profile-generate[generate PGO profile with llvm built for rustc]' \
+'--enable-bolt-settings[Enable BOLT link flags]' \
+'--skip-stage0-validation[Skip stage0 compiler validation]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+'*::paths -- paths for the subcommand:_files' \
+&& ret=0
+;;
+(perf)
+_arguments "${_arguments_options[@]}" : \
+'--config=[TOML configuration file for build]:FILE:_files' \
+'--build-dir=[Build directory, overrides \`build.build-dir\` in \`config.toml\`]:DIR:_files -/' \
+'--build=[build target of the stage0 compiler]:BUILD:( )' \
+'--host=[host targets to build]:HOST:( )' \
+'--target=[target targets to build]:TARGET:( )' \
+'*--exclude=[build paths to exclude]:PATH:_files' \
+'*--skip=[build paths to skip]:PATH:_files' \
+'--rustc-error-format=[]:RUSTC_ERROR_FORMAT:( )' \
+'--on-fail=[command to run on failure]:CMD:_cmdstring' \
+'--stage=[stage to build (indicates compiler to use/test, e.g., stage 0 uses the bootstrap compiler, stage 1 the stage 0 rustc artifacts, etc.)]:N:( )' \
+'*--keep-stage=[stage(s) to keep without recompiling (pass multiple times to keep e.g., both stages 0 and 1)]:N:( )' \
+'*--keep-stage-std=[stage(s) of the standard library to keep without recompiling (pass multiple times to keep e.g., both stages 0 and 1)]:N:( )' \
+'--src=[path to the root of the rust checkout]:DIR:_files -/' \
+'-j+[number of jobs to run in parallel]:JOBS:( )' \
+'--jobs=[number of jobs to run in parallel]:JOBS:( )' \
+'--warnings=[if value is deny, will deny warnings if value is warn, will emit warnings otherwise, use the default configured behaviour]:deny|warn:(deny warn default)' \
+'--error-format=[rustc error format]:FORMAT:( )' \
+'--color=[whether to use color in cargo and rustc output]:STYLE:(always never auto)' \
+'--rust-profile-generate=[generate PGO profile with rustc build]:PROFILE:_files' \
+'--rust-profile-use=[use PGO profile for rustc build]:PROFILE:_files' \
+'--llvm-profile-use=[use PGO profile for LLVM build]:PROFILE:_files' \
+'*--reproducible-artifact=[Additional reproducible artifacts that should be added to the reproducible artifacts archive]:REPRODUCIBLE_ARTIFACT: ' \
+'*--set=[override options in config.toml]:section.option=value:( )' \
 '*-v[use verbose output (-vv for very verbose)]' \
 '*--verbose[use verbose output (-vv for very verbose)]' \
 '-i[use incremental compilation]' \
@@ -812,6 +837,7 @@ _x.py_commands() {
 'setup:Set up the environment for development' \
 'suggest:Suggest a subset of tests to run, based on modified files' \
 'vendor:Vendor dependencies' \
+'perf:Perform profiling and benchmarking of the compiler using the \`rustc-perf-wrapper\` tool' \
     )
     _describe -t commands 'x.py commands' commands "$@"
 }
@@ -869,6 +895,11 @@ _x.py__install_commands() {
 _x.py__miri_commands() {
     local commands; commands=()
     _describe -t commands 'x.py miri commands' commands "$@"
+}
+(( $+functions[_x.py__perf_commands] )) ||
+_x.py__perf_commands() {
+    local commands; commands=()
+    _describe -t commands 'x.py perf commands' commands "$@"
 }
 (( $+functions[_x.py__run_commands] )) ||
 _x.py__run_commands() {

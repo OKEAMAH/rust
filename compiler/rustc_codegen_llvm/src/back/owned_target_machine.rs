@@ -1,13 +1,12 @@
-use std::{
-    ffi::{c_char, CStr},
-    marker::PhantomData,
-    ops::Deref,
-    ptr::NonNull,
-};
+use std::ffi::{CStr, c_char};
+use std::marker::PhantomData;
+use std::ops::Deref;
+use std::ptr::NonNull;
 
 use rustc_data_structures::small_c_str::SmallCStr;
 
-use crate::{errors::LlvmError, llvm};
+use crate::errors::LlvmError;
+use crate::llvm;
 
 /// Responsible for safely creating and disposing llvm::TargetMachine via ffi functions.
 /// Not cloneable as there is no clone function for llvm::TargetMachine.
@@ -31,8 +30,8 @@ impl OwnedTargetMachine {
         data_sections: bool,
         unique_section_names: bool,
         trap_unreachable: bool,
-        singletree: bool,
-        asm_comments: bool,
+        singlethread: bool,
+        verbose_asm: bool,
         emit_stack_size_section: bool,
         relax_elf_relocations: bool,
         use_init_array: bool,
@@ -63,8 +62,8 @@ impl OwnedTargetMachine {
                 data_sections,
                 unique_section_names,
                 trap_unreachable,
-                singletree,
-                asm_comments,
+                singlethread,
+                verbose_asm,
                 emit_stack_size_section,
                 relax_elf_relocations,
                 use_init_array,
@@ -87,15 +86,17 @@ impl Deref for OwnedTargetMachine {
     type Target = llvm::TargetMachine;
 
     fn deref(&self) -> &Self::Target {
-        // SAFETY: constructing ensures we have a valid pointer created by llvm::LLVMRustCreateTargetMachine
+        // SAFETY: constructing ensures we have a valid pointer created by
+        // llvm::LLVMRustCreateTargetMachine.
         unsafe { self.tm_unique.as_ref() }
     }
 }
 
 impl Drop for OwnedTargetMachine {
     fn drop(&mut self) {
-        // SAFETY: constructing ensures we have a valid pointer created by llvm::LLVMRustCreateTargetMachine
-        // OwnedTargetMachine is not copyable so there is no double free or use after free
+        // SAFETY: constructing ensures we have a valid pointer created by
+        // llvm::LLVMRustCreateTargetMachine OwnedTargetMachine is not copyable so there is no
+        // double free or use after free.
         unsafe {
             llvm::LLVMRustDisposeTargetMachine(self.tm_unique.as_mut());
         }

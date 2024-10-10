@@ -1,5 +1,5 @@
 use clippy_utils::diagnostics::{span_lint, span_lint_and_sugg};
-use clippy_utils::macros::{find_format_arg_expr, is_format_macro, root_macro_call_first_node, FormatArgsStorage};
+use clippy_utils::macros::{FormatArgsStorage, find_format_arg_expr, is_format_macro, root_macro_call_first_node};
 use clippy_utils::{get_parent_as_impl, is_diag_trait_item, path_to_local, peel_ref_operators};
 use rustc_ast::{FormatArgsPiece, FormatTrait};
 use rustc_errors::Applicability;
@@ -7,7 +7,7 @@ use rustc_hir::{Expr, ExprKind, Impl, ImplItem, ImplItemKind, QPath};
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_session::impl_lint_pass;
 use rustc_span::symbol::kw;
-use rustc_span::{sym, Symbol};
+use rustc_span::{Symbol, sym};
 
 declare_clippy_lint! {
     /// ### What it does
@@ -97,7 +97,6 @@ struct FormatTraitNames {
     formatter_name: Option<Symbol>,
 }
 
-#[derive(Default)]
 pub struct FormatImpl {
     format_args: FormatArgsStorage,
     // Whether we are inside Display or Debug trait impl - None for neither
@@ -149,7 +148,7 @@ struct FormatImplExpr<'a, 'tcx> {
     format_trait_impl: FormatTraitNames,
 }
 
-impl<'a, 'tcx> FormatImplExpr<'a, 'tcx> {
+impl FormatImplExpr<'_, '_> {
     fn check_to_string_in_display(&self) {
         if self.format_trait_impl.name == sym::Display
             && let ExprKind::MethodCall(path, self_arg, ..) = self.expr.kind
@@ -197,7 +196,7 @@ impl<'a, 'tcx> FormatImplExpr<'a, 'tcx> {
                     && trait_name == self.format_trait_impl.name
                     && let Ok(index) = placeholder.argument.index
                     && let Some(arg) = format_args.arguments.all_args().get(index)
-                    && let Ok(arg_expr) = find_format_arg_expr(self.expr, arg)
+                    && let Some(arg_expr) = find_format_arg_expr(self.expr, arg)
                 {
                     self.check_format_arg_self(arg_expr);
                 }

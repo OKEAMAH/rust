@@ -1,13 +1,12 @@
+use std::borrow::Cow;
+
 use rustc_index::bit_set::BitSet;
 use rustc_middle::mir::visit::{NonMutatingUseContext, PlaceContext, Visitor};
 use rustc_middle::mir::*;
 
-use std::borrow::Cow;
-
 use super::MaybeBorrowedLocals;
 use crate::{GenKill, ResultsCursor};
 
-#[derive(Clone)]
 pub struct MaybeStorageLive<'a> {
     always_live_locals: Cow<'a, BitSet<Local>>,
 }
@@ -18,7 +17,7 @@ impl<'a> MaybeStorageLive<'a> {
     }
 }
 
-impl<'tcx, 'a> crate::AnalysisDomain<'tcx> for MaybeStorageLive<'a> {
+impl<'a, 'tcx> crate::AnalysisDomain<'tcx> for MaybeStorageLive<'a> {
     type Domain = BitSet<Local>;
 
     const NAME: &'static str = "maybe_storage_live";
@@ -40,7 +39,7 @@ impl<'tcx, 'a> crate::AnalysisDomain<'tcx> for MaybeStorageLive<'a> {
     }
 }
 
-impl<'tcx, 'a> crate::GenKillAnalysis<'tcx> for MaybeStorageLive<'a> {
+impl<'a, 'tcx> crate::GenKillAnalysis<'tcx> for MaybeStorageLive<'a> {
     type Idx = Local;
 
     fn domain_size(&self, body: &Body<'tcx>) -> usize {
@@ -54,7 +53,7 @@ impl<'tcx, 'a> crate::GenKillAnalysis<'tcx> for MaybeStorageLive<'a> {
         _: Location,
     ) {
         match stmt.kind {
-            StatementKind::StorageLive(l) => trans.gen(l),
+            StatementKind::StorageLive(l) => trans.gen_(l),
             StatementKind::StorageDead(l) => trans.kill(l),
             _ => (),
         }
@@ -80,7 +79,6 @@ impl<'tcx, 'a> crate::GenKillAnalysis<'tcx> for MaybeStorageLive<'a> {
     }
 }
 
-#[derive(Clone)]
 pub struct MaybeStorageDead<'a> {
     always_live_locals: Cow<'a, BitSet<Local>>,
 }
@@ -91,7 +89,7 @@ impl<'a> MaybeStorageDead<'a> {
     }
 }
 
-impl<'tcx, 'a> crate::AnalysisDomain<'tcx> for MaybeStorageDead<'a> {
+impl<'a, 'tcx> crate::AnalysisDomain<'tcx> for MaybeStorageDead<'a> {
     type Domain = BitSet<Local>;
 
     const NAME: &'static str = "maybe_storage_dead";
@@ -112,7 +110,7 @@ impl<'tcx, 'a> crate::AnalysisDomain<'tcx> for MaybeStorageDead<'a> {
     }
 }
 
-impl<'tcx, 'a> crate::GenKillAnalysis<'tcx> for MaybeStorageDead<'a> {
+impl<'a, 'tcx> crate::GenKillAnalysis<'tcx> for MaybeStorageDead<'a> {
     type Idx = Local;
 
     fn domain_size(&self, body: &Body<'tcx>) -> usize {
@@ -127,7 +125,7 @@ impl<'tcx, 'a> crate::GenKillAnalysis<'tcx> for MaybeStorageDead<'a> {
     ) {
         match stmt.kind {
             StatementKind::StorageLive(l) => trans.kill(l),
-            StatementKind::StorageDead(l) => trans.gen(l),
+            StatementKind::StorageDead(l) => trans.gen_(l),
             _ => (),
         }
     }
@@ -208,7 +206,7 @@ impl<'tcx> crate::GenKillAnalysis<'tcx> for MaybeRequiresStorage<'_, 'tcx> {
             StatementKind::Assign(box (place, _))
             | StatementKind::SetDiscriminant { box place, .. }
             | StatementKind::Deinit(box place) => {
-                trans.gen(place.local);
+                trans.gen_(place.local);
             }
 
             // Nothing to do for these. Match exhaustively so this fails to compile when new
@@ -250,7 +248,7 @@ impl<'tcx> crate::GenKillAnalysis<'tcx> for MaybeRequiresStorage<'_, 'tcx> {
 
         match &terminator.kind {
             TerminatorKind::Call { destination, .. } => {
-                trans.gen(destination.local);
+                trans.gen_(destination.local);
             }
 
             // Note that we do *not* gen the `resume_arg` of `Yield` terminators. The reason for
@@ -265,7 +263,7 @@ impl<'tcx> crate::GenKillAnalysis<'tcx> for MaybeRequiresStorage<'_, 'tcx> {
                         InlineAsmOperand::Out { place, .. }
                         | InlineAsmOperand::InOut { out_place: place, .. } => {
                             if let Some(place) = place {
-                                trans.gen(place.local);
+                                trans.gen_(place.local);
                             }
                         }
                         InlineAsmOperand::In { .. }
@@ -288,6 +286,7 @@ impl<'tcx> crate::GenKillAnalysis<'tcx> for MaybeRequiresStorage<'_, 'tcx> {
             | TerminatorKind::Goto { .. }
             | TerminatorKind::UnwindResume
             | TerminatorKind::Return
+            | TerminatorKind::TailCall { .. }
             | TerminatorKind::SwitchInt { .. }
             | TerminatorKind::Unreachable => {}
         }
@@ -325,6 +324,7 @@ impl<'tcx> crate::GenKillAnalysis<'tcx> for MaybeRequiresStorage<'_, 'tcx> {
             | TerminatorKind::Goto { .. }
             | TerminatorKind::UnwindResume
             | TerminatorKind::Return
+            | TerminatorKind::TailCall { .. }
             | TerminatorKind::SwitchInt { .. }
             | TerminatorKind::Unreachable => {}
         }
@@ -339,7 +339,7 @@ impl<'tcx> crate::GenKillAnalysis<'tcx> for MaybeRequiresStorage<'_, 'tcx> {
         _block: BasicBlock,
         return_places: CallReturnPlaces<'_, 'tcx>,
     ) {
-        return_places.for_each(|place| trans.gen(place.local));
+        return_places.for_each(|place| trans.gen_(place.local));
     }
 }
 

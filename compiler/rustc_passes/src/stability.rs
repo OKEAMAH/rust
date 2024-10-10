@@ -1,7 +1,9 @@
 //! A pass that annotates every item and method with its stability level,
 //! propagating default levels lexically from parent to children ast nodes.
 
-use crate::errors;
+use std::mem::replace;
+use std::num::NonZero;
+
 use rustc_attr::{
     self as attr, ConstStability, DeprecatedSince, Stability, StabilityLevel, StableSince,
     Unstable, UnstableReason, VERSION_PLACEHOLDER,
@@ -10,7 +12,7 @@ use rustc_data_structures::fx::FxIndexMap;
 use rustc_data_structures::unord::{ExtendUnord, UnordMap, UnordSet};
 use rustc_hir as hir;
 use rustc_hir::def::{DefKind, Res};
-use rustc_hir::def_id::{LocalDefId, LocalModDefId, CRATE_DEF_ID, LOCAL_CRATE};
+use rustc_hir::def_id::{CRATE_DEF_ID, LOCAL_CRATE, LocalDefId, LocalModDefId};
 use rustc_hir::hir_id::CRATE_HIR_ID;
 use rustc_hir::intravisit::{self, Visitor};
 use rustc_hir::{FieldDef, Item, ItemKind, TraitRef, Ty, TyKind, Variant};
@@ -22,12 +24,12 @@ use rustc_middle::query::Providers;
 use rustc_middle::ty::TyCtxt;
 use rustc_session::lint;
 use rustc_session::lint::builtin::{INEFFECTIVE_UNSTABLE_TRAIT_IMPL, USELESS_DEPRECATED};
-use rustc_span::symbol::{sym, Symbol};
 use rustc_span::Span;
+use rustc_span::symbol::{Symbol, sym};
 use rustc_target::spec::abi::Abi;
+use tracing::{debug, info};
 
-use std::mem::replace;
-use std::num::NonZero;
+use crate::errors;
 
 #[derive(PartialEq)]
 enum AnnotationKind {
@@ -172,16 +174,14 @@ impl<'a, 'tcx> Annotator<'a, 'tcx> {
 
         // If the current node is a function, has const stability attributes and if it doesn not have an intrinsic ABI,
         // check if the function/method is const or the parent impl block is const
-        if let (Some(const_span), Some(fn_sig)) = (const_span, fn_sig) {
-            if fn_sig.header.abi != Abi::RustIntrinsic && !fn_sig.header.is_const() {
-                if !self.in_trait_impl
-                    || (self.in_trait_impl && !self.tcx.is_const_fn_raw(def_id.to_def_id()))
-                {
-                    self.tcx
-                        .dcx()
-                        .emit_err(errors::MissingConstErr { fn_sig_span: fn_sig.span, const_span });
-                }
-            }
+        if let (Some(const_span), Some(fn_sig)) = (const_span, fn_sig)
+            && fn_sig.header.abi != Abi::RustIntrinsic
+            && !fn_sig.header.is_const()
+            && (!self.in_trait_impl || !self.tcx.is_const_fn_raw(def_id.to_def_id()))
+        {
+            self.tcx
+                .dcx()
+                .emit_err(errors::MissingConstErr { fn_sig_span: fn_sig.span, const_span });
         }
 
         // `impl const Trait for Type` items forward their const stability to their
@@ -542,9 +542,8 @@ impl<'tcx> MissingStabilityAnnotations<'tcx> {
         let is_stable =
             self.tcx.lookup_stability(def_id).is_some_and(|stability| stability.level.is_stable());
         let missing_const_stability_attribute = self.tcx.lookup_const_stability(def_id).is_none();
-        let is_reachable = self.effective_visibilities.is_reachable(def_id);
 
-        if is_const && is_stable && missing_const_stability_attribute && is_reachable {
+        if is_const && is_stable && missing_const_stability_attribute {
             let descr = self.tcx.def_descr(def_id.to_def_id());
             self.tcx.dcx().emit_err(errors::MissingConstStabAttr { span, descr });
         }
@@ -936,12 +935,6 @@ pub fn check_unused_or_stable_features(tcx: TyCtxt<'_>) {
     let declared_lib_features = &tcx.features().declared_lib_features;
     let mut remaining_lib_features = FxIndexMap::default();
     for (feature, span) in declared_lib_features {
-        if !tcx.sess.opts.unstable_features.is_nightly_build() {
-            tcx.dcx().emit_err(errors::FeatureOnlyOnNightly {
-                span: *span,
-                release_channel: env!("CFG_RELEASE_CHANNEL"),
-            });
-        }
         if remaining_lib_features.contains_key(&feature) {
             // Warn if the user enables a lib feature multiple times.
             tcx.dcx().emit_err(errors::DuplicateFeatureErr { span: *span, feature: *feature });
@@ -1020,7 +1013,7 @@ pub fn check_unused_or_stable_features(tcx: TyCtxt<'_>) {
         // stabilization diagnostic, but it can be avoided when there are no
         // `remaining_lib_features`.
         let mut all_implications = remaining_implications.clone();
-        for &cnum in tcx.used_crates(()) {
+        for &cnum in tcx.crates(()) {
             all_implications
                 .extend_unord(tcx.stability_implications(cnum).items().map(|(k, v)| (*k, *v)));
         }
@@ -1033,7 +1026,7 @@ pub fn check_unused_or_stable_features(tcx: TyCtxt<'_>) {
             &all_implications,
         );
 
-        for &cnum in tcx.used_crates(()) {
+        for &cnum in tcx.crates(()) {
             if remaining_lib_features.is_empty() && remaining_implications.is_empty() {
                 break;
             }

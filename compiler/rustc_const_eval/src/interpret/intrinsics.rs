@@ -2,26 +2,24 @@
 //! looking at their MIR. Intrinsics/functions supported here are shared by CTFE
 //! and miri.
 
+use std::assert_matches::assert_matches;
+
 use rustc_hir::def_id::DefId;
-use rustc_middle::ty;
-use rustc_middle::ty::layout::{LayoutOf as _, ValidityRequirement};
-use rustc_middle::ty::GenericArgsRef;
-use rustc_middle::ty::{Ty, TyCtxt};
-use rustc_middle::{
-    bug,
-    mir::{self, BinOp, ConstValue, NonDivergingIntrinsic},
-    ty::layout::TyAndLayout,
-};
-use rustc_span::symbol::{sym, Symbol};
+use rustc_middle::mir::{self, BinOp, ConstValue, NonDivergingIntrinsic};
+use rustc_middle::ty::layout::{LayoutOf as _, TyAndLayout, ValidityRequirement};
+use rustc_middle::ty::{GenericArgsRef, Ty, TyCtxt};
+use rustc_middle::{bug, ty};
+use rustc_span::symbol::{Symbol, sym};
 use rustc_target::abi::Size;
+use tracing::trace;
 
+use super::memory::MemoryKind;
+use super::util::ensure_monomorphic_enough;
 use super::{
-    err_inval, err_ub_custom, err_unsup_format, memory::MemoryKind, throw_inval, throw_ub_custom,
-    throw_ub_format, util::ensure_monomorphic_enough, Allocation, CheckInAllocMsg, ConstAllocation,
-    GlobalId, ImmTy, InterpCx, InterpResult, MPlaceTy, Machine, OpTy, Pointer, PointerArithmetic,
-    Scalar,
+    Allocation, CheckInAllocMsg, ConstAllocation, GlobalId, ImmTy, InterpCx, InterpResult,
+    MPlaceTy, Machine, OpTy, Pointer, PointerArithmetic, Provenance, Scalar, err_inval,
+    err_ub_custom, err_unsup_format, interp_ok, throw_inval, throw_ub_custom, throw_ub_format,
 };
-
 use crate::fluent_generated as fluent;
 
 /// Directly returns an `Allocation` containing an absolute path representation of the given type.
@@ -41,7 +39,7 @@ pub(crate) fn eval_nullary_intrinsic<'tcx>(
 ) -> InterpResult<'tcx, ConstValue<'tcx>> {
     let tp_ty = args.type_at(0);
     let name = tcx.item_name(def_id);
-    Ok(match name {
+    interp_ok(match name {
         sym::type_name => {
             ensure_monomorphic_enough(tcx, tp_ty)?;
             let alloc = alloc_type_name(tcx, tp_ty);
@@ -83,7 +81,7 @@ pub(crate) fn eval_nullary_intrinsic<'tcx>(
             | ty::RawPtr(_, _)
             | ty::Ref(_, _, _)
             | ty::FnDef(_, _)
-            | ty::FnPtr(_)
+            | ty::FnPtr(..)
             | ty::Dynamic(_, _, _)
             | ty::Closure(_, _)
             | ty::CoroutineClosure(_, _)
@@ -97,11 +95,11 @@ pub(crate) fn eval_nullary_intrinsic<'tcx>(
     })
 }
 
-impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
+impl<'tcx, M: Machine<'tcx>> InterpCx<'tcx, M> {
     /// Returns `true` if emulation happened.
     /// Here we implement the intrinsics that are common to all Miri instances; individual machines can add their own
     /// intrinsic handling.
-    pub fn emulate_intrinsic(
+    pub fn eval_intrinsic(
         &mut self,
         instance: ty::Instance<'tcx>,
         args: &[OpTy<'tcx, M::Provenance>],
@@ -196,7 +194,7 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
                 // rotate_right: (X << ((BW - S) % BW)) | (X >> (S % BW))
                 let layout_val = self.layout_of(instance_args.type_at(0))?;
                 let val = self.read_scalar(&args[0])?;
-                let val_bits = val.to_bits(layout_val.size)?;
+                let val_bits = val.to_bits(layout_val.size)?; // sign is ignored here
 
                 let layout_raw_shift = self.layout_of(self.tcx.types.u32)?;
                 let raw_shift = self.read_scalar(&args[1])?;
@@ -210,7 +208,7 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
                 } else {
                     (val_bits >> shift_bits) | (val_bits << inv_shift_bits)
                 };
-                let truncated_bits = self.truncate(result_bits, layout_val);
+                let truncated_bits = layout_val.size.truncate(result_bits);
                 let result = Scalar::from_uint(truncated_bits, layout_val.size);
                 self.write_scalar(result, dest)?;
             }
@@ -218,7 +216,7 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
                 self.copy_intrinsic(&args[0], &args[1], &args[2], /*nonoverlapping*/ false)?;
             }
             sym::write_bytes => {
-                self.write_bytes_intrinsic(&args[0], &args[1], &args[2])?;
+                self.write_bytes_intrinsic(&args[0], &args[1], &args[2], "write_bytes")?;
             }
             sym::compare_bytes => {
                 let result = self.compare_bytes_intrinsic(&args[0], &args[1], &args[2])?;
@@ -242,44 +240,34 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
                 let isize_layout = self.layout_of(self.tcx.types.isize)?;
 
                 // Get offsets for both that are at least relative to the same base.
-                let (a_offset, b_offset) =
-                    match (self.ptr_try_get_alloc_id(a), self.ptr_try_get_alloc_id(b)) {
+                // With `OFFSET_IS_ADDR` this is trivial; without it we need either
+                // two integers or two pointers into the same allocation.
+                let (a_offset, b_offset, is_addr) = if M::Provenance::OFFSET_IS_ADDR {
+                    (a.addr().bytes(), b.addr().bytes(), /*is_addr*/ true)
+                } else {
+                    match (self.ptr_try_get_alloc_id(a, 0), self.ptr_try_get_alloc_id(b, 0)) {
                         (Err(a), Err(b)) => {
-                            // Neither pointer points to an allocation.
-                            // This is okay only if they are the same.
-                            if a != b {
-                                // We'd catch this below in the "dereferenceable" check, but
-                                // show a nicer error for this particular case.
-                                throw_ub_custom!(
-                                    fluent::const_eval_offset_from_different_integers,
-                                    name = intrinsic_name,
-                                );
-                            }
-                            // This will always return 0.
-                            (a, b)
+                            // Neither pointer points to an allocation, so they are both absolute.
+                            (a, b, /*is_addr*/ true)
                         }
-                        (Err(_), _) | (_, Err(_)) => {
-                            // We managed to find a valid allocation for one pointer, but not the other.
-                            // That means they are definitely not pointing to the same allocation.
+                        (Ok((a_alloc_id, a_offset, _)), Ok((b_alloc_id, b_offset, _)))
+                            if a_alloc_id == b_alloc_id =>
+                        {
+                            // Found allocation for both, and it's the same.
+                            // Use these offsets for distance calculation.
+                            (a_offset.bytes(), b_offset.bytes(), /*is_addr*/ false)
+                        }
+                        _ => {
+                            // Not into the same allocation -- this is UB.
                             throw_ub_custom!(
                                 fluent::const_eval_offset_from_different_allocations,
                                 name = intrinsic_name,
                             );
                         }
-                        (Ok((a_alloc_id, a_offset, _)), Ok((b_alloc_id, b_offset, _))) => {
-                            // Found allocation for both. They must be into the same allocation.
-                            if a_alloc_id != b_alloc_id {
-                                throw_ub_custom!(
-                                    fluent::const_eval_offset_from_different_allocations,
-                                    name = intrinsic_name,
-                                );
-                            }
-                            // Use these offsets for distance calculation.
-                            (a_offset.bytes(), b_offset.bytes())
-                        }
-                    };
+                    }
+                };
 
-                // Compute distance.
+                // Compute distance: a - b.
                 let dist = {
                     // Addresses are unsigned, so this is a `usize` computation. We have to do the
                     // overflow check separately anyway.
@@ -296,13 +284,14 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
                                 fluent::const_eval_offset_from_unsigned_overflow,
                                 a_offset = a_offset,
                                 b_offset = b_offset,
+                                is_addr = is_addr,
                             );
                         }
                         // The signed form of the intrinsic allows this. If we interpret the
                         // difference as isize, we'll get the proper signed difference. If that
-                        // seems *positive*, they were more than isize::MAX apart.
+                        // seems *positive* or equal to isize::MIN, they were more than isize::MAX apart.
                         let dist = val.to_target_isize(self)?;
-                        if dist >= 0 {
+                        if dist >= 0 || i128::from(dist) == self.pointer_size().signed_int_min() {
                             throw_ub_custom!(
                                 fluent::const_eval_offset_from_underflow,
                                 name = intrinsic_name,
@@ -324,14 +313,24 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
                     }
                 };
 
-                // Check that the range between them is dereferenceable ("in-bounds or one past the
-                // end of the same allocation"). This is like the check in ptr_offset_inbounds.
-                let min_ptr = if dist >= 0 { b } else { a };
-                self.check_ptr_access(
-                    min_ptr,
-                    Size::from_bytes(dist.unsigned_abs()),
+                // Check that the memory between them is dereferenceable at all, starting from the
+                // origin pointer: `dist` is `a - b`, so it is based on `b`.
+                self.check_ptr_access_signed(b, dist, CheckInAllocMsg::OffsetFromTest)?;
+                // Then check that this is also dereferenceable from `a`. This ensures that they are
+                // derived from the same allocation.
+                self.check_ptr_access_signed(
+                    a,
+                    dist.checked_neg().unwrap(), // i64::MIN is impossible as no allocation can be that large
                     CheckInAllocMsg::OffsetFromTest,
-                )?;
+                )
+                .map_err(|_| {
+                    // Make the error more specific.
+                    err_ub_custom!(
+                        fluent::const_eval_offset_from_different_allocations,
+                        name = intrinsic_name,
+                    )
+                    .into()
+                })?;
 
                 // Perform division by size to compute return value.
                 let ret_layout = if intrinsic_name == sym::ptr_offset_from_unsigned {
@@ -380,14 +379,14 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
 
                     M::panic_nounwind(self, &msg)?;
                     // Skip the `return_to_block` at the end (we panicked, we do not return).
-                    return Ok(true);
+                    return interp_ok(true);
                 }
             }
             sym::simd_insert => {
                 let index = u64::from(self.read_scalar(&args[1])?.to_u32()?);
                 let elem = &args[2];
-                let (input, input_len) = self.operand_to_simd(&args[0])?;
-                let (dest, dest_len) = self.mplace_to_simd(dest)?;
+                let (input, input_len) = self.project_to_simd(&args[0])?;
+                let (dest, dest_len) = self.project_to_simd(dest)?;
                 assert_eq!(input_len, dest_len, "Return vector length must match input length");
                 // Bounds are not checked by typeck so we have to do it ourselves.
                 if index >= input_len {
@@ -398,17 +397,14 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
 
                 for i in 0..dest_len {
                     let place = self.project_index(&dest, i)?;
-                    let value = if i == index {
-                        elem.clone()
-                    } else {
-                        self.project_index(&input, i)?.into()
-                    };
+                    let value =
+                        if i == index { elem.clone() } else { self.project_index(&input, i)? };
                     self.copy_op(&value, &place)?;
                 }
             }
             sym::simd_extract => {
                 let index = u64::from(self.read_scalar(&args[1])?.to_u32()?);
-                let (input, input_len) = self.operand_to_simd(&args[0])?;
+                let (input, input_len) = self.project_to_simd(&args[0])?;
                 // Bounds are not checked by typeck so we have to do it ourselves.
                 if index >= input_len {
                     throw_ub_format!(
@@ -431,25 +427,27 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
 
             sym::vtable_size => {
                 let ptr = self.read_pointer(&args[0])?;
-                let (size, _align) = self.get_vtable_size_and_align(ptr)?;
+                // `None` because we don't know which trait to expect here; any vtable is okay.
+                let (size, _align) = self.get_vtable_size_and_align(ptr, None)?;
                 self.write_scalar(Scalar::from_target_usize(size.bytes(), self), dest)?;
             }
             sym::vtable_align => {
                 let ptr = self.read_pointer(&args[0])?;
-                let (_size, align) = self.get_vtable_size_and_align(ptr)?;
+                // `None` because we don't know which trait to expect here; any vtable is okay.
+                let (_size, align) = self.get_vtable_size_and_align(ptr, None)?;
                 self.write_scalar(Scalar::from_target_usize(align.bytes(), self), dest)?;
             }
 
             // Unsupported intrinsic: skip the return_to_block below.
-            _ => return Ok(false),
+            _ => return interp_ok(false),
         }
 
         trace!("{:?}", self.dump_place(&dest.clone().into()));
         self.return_to_block(ret)?;
-        Ok(true)
+        interp_ok(true)
     }
 
-    pub(super) fn emulate_nondiverging_intrinsic(
+    pub(super) fn eval_nondiverging_intrinsic(
         &mut self,
         intrinsic: &NonDivergingIntrinsic<'tcx>,
     ) -> InterpResult<'tcx> {
@@ -460,7 +458,7 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
                 if !cond {
                     throw_ub_custom!(fluent::const_eval_assume_false);
                 }
-                Ok(())
+                interp_ok(())
             }
             NonDivergingIntrinsic::CopyNonOverlapping(mir::CopyNonOverlapping {
                 count,
@@ -483,7 +481,7 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
         ret_layout: TyAndLayout<'tcx>,
     ) -> InterpResult<'tcx, Scalar<M::Provenance>> {
         assert!(layout.ty.is_integral(), "invalid type for numeric intrinsic: {}", layout.ty);
-        let bits = val.to_bits(layout.size)?;
+        let bits = val.to_bits(layout.size)?; // these operations all ignore the sign
         let extra = 128 - u128::from(layout.size.bits());
         let bits_out = match name {
             sym::ctpop => u128::from(bits.count_ones()),
@@ -502,7 +500,7 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
             }
             _ => bug!("not a numeric intrinsic: {}", name),
         };
-        Ok(Scalar::from_uint(bits_out, ret_layout.size))
+        interp_ok(Scalar::from_uint(bits_out, ret_layout.size))
     }
 
     pub fn exact_div(
@@ -512,13 +510,14 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
         dest: &MPlaceTy<'tcx, M::Provenance>,
     ) -> InterpResult<'tcx> {
         assert_eq!(a.layout.ty, b.layout.ty);
-        assert!(matches!(a.layout.ty.kind(), ty::Int(..) | ty::Uint(..)));
+        assert_matches!(a.layout.ty.kind(), ty::Int(..) | ty::Uint(..));
 
         // Performs an exact division, resulting in undefined behavior where
         // `x % y != 0` or `y == 0` or `x == T::MIN && y == -1`.
         // First, check x % y != 0 (or if that computation overflows).
         let rem = self.binary_op(BinOp::Rem, a, b)?;
-        if rem.to_scalar().assert_bits(a.layout.size) != 0 {
+        // sign does not matter for 0 test, so `to_bits` is fine
+        if rem.to_scalar().to_bits(a.layout.size)? != 0 {
             throw_ub_custom!(
                 fluent::const_eval_exact_div_has_remainder,
                 a = format!("{a}"),
@@ -537,29 +536,26 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
         r: &ImmTy<'tcx, M::Provenance>,
     ) -> InterpResult<'tcx, Scalar<M::Provenance>> {
         assert_eq!(l.layout.ty, r.layout.ty);
-        assert!(matches!(l.layout.ty.kind(), ty::Int(..) | ty::Uint(..)));
-        assert!(matches!(mir_op, BinOp::Add | BinOp::Sub));
+        assert_matches!(l.layout.ty.kind(), ty::Int(..) | ty::Uint(..));
+        assert_matches!(mir_op, BinOp::Add | BinOp::Sub);
 
         let (val, overflowed) =
             self.binary_op(mir_op.wrapping_to_overflowing().unwrap(), l, r)?.to_scalar_pair();
-        Ok(if overflowed.to_bool()? {
+        interp_ok(if overflowed.to_bool()? {
             let size = l.layout.size;
-            let num_bits = size.bits();
             if l.layout.abi.is_signed() {
                 // For signed ints the saturated value depends on the sign of the first
                 // term since the sign of the second term can be inferred from this and
                 // the fact that the operation has overflowed (if either is 0 no
                 // overflow can occur)
-                let first_term: u128 = l.to_scalar().to_bits(l.layout.size)?;
-                let first_term_positive = first_term & (1 << (num_bits - 1)) == 0;
-                if first_term_positive {
+                let first_term: i128 = l.to_scalar().to_int(l.layout.size)?;
+                if first_term >= 0 {
                     // Negative overflow not possible since the positive first term
                     // can only increase an (in range) negative term for addition
-                    // or corresponding negated positive term for subtraction
+                    // or corresponding negated positive term for subtraction.
                     Scalar::from_int(size.signed_int_max(), size)
                 } else {
-                    // Positive overflow not possible for similar reason
-                    // max negative
+                    // Positive overflow not possible for similar reason.
                     Scalar::from_int(size.signed_int_min(), size)
                 }
             } else {
@@ -578,43 +574,31 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
     }
 
     /// Offsets a pointer by some multiple of its type, returning an error if the pointer leaves its
-    /// allocation. For integer pointers, we consider each of them their own tiny allocation of size
-    /// 0, so offset-by-0 (and only 0) is okay -- except that null cannot be offset by _any_ value.
+    /// allocation.
     pub fn ptr_offset_inbounds(
         &self,
         ptr: Pointer<Option<M::Provenance>>,
         offset_bytes: i64,
     ) -> InterpResult<'tcx, Pointer<Option<M::Provenance>>> {
-        // The offset being in bounds cannot rely on "wrapping around" the address space.
-        // So, first rule out overflows in the pointer arithmetic.
-        let offset_ptr = ptr.signed_offset(offset_bytes, self)?;
-        // ptr and offset_ptr must be in bounds of the same allocated object. This means all of the
-        // memory between these pointers must be accessible. Note that we do not require the
-        // pointers to be properly aligned (unlike a read/write operation).
-        let min_ptr = if offset_bytes >= 0 { ptr } else { offset_ptr };
-        // This call handles checking for integer/null pointers.
-        self.check_ptr_access(
-            min_ptr,
-            Size::from_bytes(offset_bytes.unsigned_abs()),
-            CheckInAllocMsg::PointerArithmeticTest,
-        )?;
-        Ok(offset_ptr)
+        // The offset must be in bounds starting from `ptr`.
+        self.check_ptr_access_signed(ptr, offset_bytes, CheckInAllocMsg::PointerArithmeticTest)?;
+        // This also implies that there is no overflow, so we are done.
+        interp_ok(ptr.wrapping_signed_offset(offset_bytes, self))
     }
 
     /// Copy `count*size_of::<T>()` many bytes from `*src` to `*dst`.
     pub(crate) fn copy_intrinsic(
         &mut self,
-        src: &OpTy<'tcx, <M as Machine<'mir, 'tcx>>::Provenance>,
-        dst: &OpTy<'tcx, <M as Machine<'mir, 'tcx>>::Provenance>,
-        count: &OpTy<'tcx, <M as Machine<'mir, 'tcx>>::Provenance>,
+        src: &OpTy<'tcx, <M as Machine<'tcx>>::Provenance>,
+        dst: &OpTy<'tcx, <M as Machine<'tcx>>::Provenance>,
+        count: &OpTy<'tcx, <M as Machine<'tcx>>::Provenance>,
         nonoverlapping: bool,
     ) -> InterpResult<'tcx> {
         let count = self.read_target_usize(count)?;
         let layout = self.layout_of(src.layout.ty.builtin_deref(true).unwrap())?;
         let (size, align) = (layout.size, layout.align.abi);
-        // `checked_mul` enforces a too small bound (the correct one would probably be target_isize_max),
-        // but no actual allocation can be big enough for the difference to be noticeable.
-        let size = size.checked_mul(count, self).ok_or_else(|| {
+
+        let size = self.compute_size_in_bytes(size, count).ok_or_else(|| {
             err_ub_custom!(
                 fluent::const_eval_size_overflow,
                 name = if nonoverlapping { "copy_nonoverlapping" } else { "copy" }
@@ -633,8 +617,8 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
     /// Does a *typed* swap of `*left` and `*right`.
     fn typed_swap_intrinsic(
         &mut self,
-        left: &OpTy<'tcx, <M as Machine<'mir, 'tcx>>::Provenance>,
-        right: &OpTy<'tcx, <M as Machine<'mir, 'tcx>>::Provenance>,
+        left: &OpTy<'tcx, <M as Machine<'tcx>>::Provenance>,
+        right: &OpTy<'tcx, <M as Machine<'tcx>>::Provenance>,
     ) -> InterpResult<'tcx> {
         let left = self.deref_pointer(left)?;
         let right = self.deref_pointer(right)?;
@@ -645,14 +629,15 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
         self.copy_op(&right, &left)?;
         self.copy_op(&temp, &right)?;
         self.deallocate_ptr(temp.ptr(), None, kind)?;
-        Ok(())
+        interp_ok(())
     }
 
-    pub(crate) fn write_bytes_intrinsic(
+    pub fn write_bytes_intrinsic(
         &mut self,
-        dst: &OpTy<'tcx, <M as Machine<'mir, 'tcx>>::Provenance>,
-        byte: &OpTy<'tcx, <M as Machine<'mir, 'tcx>>::Provenance>,
-        count: &OpTy<'tcx, <M as Machine<'mir, 'tcx>>::Provenance>,
+        dst: &OpTy<'tcx, <M as Machine<'tcx>>::Provenance>,
+        byte: &OpTy<'tcx, <M as Machine<'tcx>>::Provenance>,
+        count: &OpTy<'tcx, <M as Machine<'tcx>>::Provenance>,
+        name: &'static str,
     ) -> InterpResult<'tcx> {
         let layout = self.layout_of(dst.layout.ty.builtin_deref(true).unwrap())?;
 
@@ -662,9 +647,9 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
 
         // `checked_mul` enforces a too small bound (the correct one would probably be target_isize_max),
         // but no actual allocation can be big enough for the difference to be noticeable.
-        let len = layout.size.checked_mul(count, self).ok_or_else(|| {
-            err_ub_custom!(fluent::const_eval_size_overflow, name = "write_bytes")
-        })?;
+        let len = self
+            .compute_size_in_bytes(layout.size, count)
+            .ok_or_else(|| err_ub_custom!(fluent::const_eval_size_overflow, name = name))?;
 
         let bytes = std::iter::repeat(byte).take(len.bytes_usize());
         self.write_bytes_ptr(dst, bytes)
@@ -672,9 +657,9 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
 
     pub(crate) fn compare_bytes_intrinsic(
         &mut self,
-        left: &OpTy<'tcx, <M as Machine<'mir, 'tcx>>::Provenance>,
-        right: &OpTy<'tcx, <M as Machine<'mir, 'tcx>>::Provenance>,
-        byte_count: &OpTy<'tcx, <M as Machine<'mir, 'tcx>>::Provenance>,
+        left: &OpTy<'tcx, <M as Machine<'tcx>>::Provenance>,
+        right: &OpTy<'tcx, <M as Machine<'tcx>>::Provenance>,
+        byte_count: &OpTy<'tcx, <M as Machine<'tcx>>::Provenance>,
     ) -> InterpResult<'tcx, Scalar<M::Provenance>> {
         let left = self.read_pointer(left)?;
         let right = self.read_pointer(right)?;
@@ -685,34 +670,31 @@ impl<'mir, 'tcx: 'mir, M: Machine<'mir, 'tcx>> InterpCx<'mir, 'tcx, M> {
 
         // `Ordering`'s discriminants are -1/0/+1, so casting does the right thing.
         let result = Ord::cmp(left_bytes, right_bytes) as i32;
-        Ok(Scalar::from_i32(result))
+        interp_ok(Scalar::from_i32(result))
     }
 
     pub(crate) fn raw_eq_intrinsic(
         &mut self,
-        lhs: &OpTy<'tcx, <M as Machine<'mir, 'tcx>>::Provenance>,
-        rhs: &OpTy<'tcx, <M as Machine<'mir, 'tcx>>::Provenance>,
+        lhs: &OpTy<'tcx, <M as Machine<'tcx>>::Provenance>,
+        rhs: &OpTy<'tcx, <M as Machine<'tcx>>::Provenance>,
     ) -> InterpResult<'tcx, Scalar<M::Provenance>> {
         let layout = self.layout_of(lhs.layout.ty.builtin_deref(true).unwrap())?;
         assert!(layout.is_sized());
 
-        let get_bytes = |this: &InterpCx<'mir, 'tcx, M>,
-                         op: &OpTy<'tcx, <M as Machine<'mir, 'tcx>>::Provenance>,
-                         size|
+        let get_bytes = |this: &InterpCx<'tcx, M>,
+                         op: &OpTy<'tcx, <M as Machine<'tcx>>::Provenance>|
          -> InterpResult<'tcx, &[u8]> {
             let ptr = this.read_pointer(op)?;
-            let Some(alloc_ref) = self.get_ptr_alloc(ptr, size)? else {
+            this.check_ptr_align(ptr, layout.align.abi)?;
+            let Some(alloc_ref) = self.get_ptr_alloc(ptr, layout.size)? else {
                 // zero-sized access
-                return Ok(&[]);
+                return interp_ok(&[]);
             };
-            if alloc_ref.has_provenance() {
-                throw_ub_custom!(fluent::const_eval_raw_eq_with_provenance);
-            }
             alloc_ref.get_bytes_strip_provenance()
         };
 
-        let lhs_bytes = get_bytes(self, lhs, layout.size)?;
-        let rhs_bytes = get_bytes(self, rhs, layout.size)?;
-        Ok(Scalar::from_bool(lhs_bytes == rhs_bytes))
+        let lhs_bytes = get_bytes(self, lhs)?;
+        let rhs_bytes = get_bytes(self, rhs)?;
+        interp_ok(Scalar::from_bool(lhs_bytes == rhs_bytes))
     }
 }

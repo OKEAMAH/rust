@@ -2,12 +2,12 @@ use rustc_ast::attr;
 use rustc_ast::entry::EntryPointType;
 use rustc_errors::codes::*;
 use rustc_hir::def::DefKind;
-use rustc_hir::def_id::{DefId, LocalDefId, CRATE_DEF_ID, LOCAL_CRATE};
-use rustc_hir::{ItemId, Node, CRATE_HIR_ID};
+use rustc_hir::def_id::{CRATE_DEF_ID, DefId, LOCAL_CRATE, LocalDefId};
+use rustc_hir::{CRATE_HIR_ID, ItemId, Node};
 use rustc_middle::query::Providers;
 use rustc_middle::ty::TyCtxt;
-use rustc_session::config::{sigpipe, CrateType, EntryFnType};
-use rustc_session::{config::RemapPathScopeComponents, RemapFileNameExt};
+use rustc_session::RemapFileNameExt;
+use rustc_session::config::{CrateType, EntryFnType, RemapPathScopeComponents, sigpipe};
 use rustc_span::symbol::sym;
 use rustc_span::{Span, Symbol};
 
@@ -106,7 +106,6 @@ fn check_and_search_item(id: ItemId, ctxt: &mut EntryContext<'_>) {
     }
 }
 
-#[allow(rustc::untranslatable_diagnostic)] // FIXME: make this translatable
 fn configure_main(tcx: TyCtxt<'_>, visitor: &EntryContext<'_>) -> Option<(DefId, EntryFnType)> {
     if let Some((def_id, _)) = visitor.start_fn {
         Some((def_id.to_def_id(), EntryFnType::Start))

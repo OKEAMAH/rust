@@ -2,10 +2,9 @@
 
 use std::fmt;
 
-use serde::{Serialize, Serializer};
-
 use rustc_hir::def::{CtorOf, DefKind};
 use rustc_span::hygiene::MacroKind;
+use serde::{Serialize, Serializer};
 
 use crate::clean;
 
@@ -52,7 +51,7 @@ pub(crate) enum ItemType {
     AssocConst = 19,
     Union = 20,
     ForeignType = 21,
-    OpaqueTy = 22,
+    // OpaqueTy used to be here, but it was removed in #127276
     ProcAttribute = 23,
     ProcDerive = 24,
     TraitAlias = 25,
@@ -71,7 +70,7 @@ impl Serialize for ItemType {
 
 impl<'a> From<&'a clean::Item> for ItemType {
     fn from(item: &'a clean::Item) -> ItemType {
-        let kind = match *item.kind {
+        let kind = match item.kind {
             clean::StrippedItem(box ref item) => item,
             ref kind => kind,
         };
@@ -85,7 +84,6 @@ impl<'a> From<&'a clean::Item> for ItemType {
             clean::EnumItem(..) => ItemType::Enum,
             clean::FunctionItem(..) => ItemType::Function,
             clean::TypeAliasItem(..) => ItemType::TypeAlias,
-            clean::OpaqueTyItem(..) => ItemType::OpaqueTy,
             clean::StaticItem(..) => ItemType::Static,
             clean::ConstantItem(..) => ItemType::Constant,
             clean::TraitItem(..) => ItemType::Trait,
@@ -164,7 +162,8 @@ impl ItemType {
             | DefKind::LifetimeParam
             | DefKind::GlobalAsm
             | DefKind::Impl { .. }
-            | DefKind::Closure => Self::ForeignType,
+            | DefKind::Closure
+            | DefKind::SyntheticCoroutineBody => Self::ForeignType,
         }
     }
 
@@ -192,7 +191,6 @@ impl ItemType {
             ItemType::AssocConst => "associatedconstant",
             ItemType::ForeignType => "foreigntype",
             ItemType::Keyword => "keyword",
-            ItemType::OpaqueTy => "opaque",
             ItemType::ProcAttribute => "attr",
             ItemType::ProcDerive => "derive",
             ItemType::TraitAlias => "traitalias",

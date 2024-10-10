@@ -1,11 +1,14 @@
-use crate::base::ExtCtxt;
 use rustc_ast::ptr::P;
-use rustc_ast::{self as ast, AttrVec, BlockCheckMode, Expr, LocalKind, MatchKind, PatKind, UnOp};
-use rustc_ast::{attr, token, util::literal};
+use rustc_ast::util::literal;
+use rustc_ast::{
+    self as ast, AttrVec, BlockCheckMode, Expr, LocalKind, MatchKind, PatKind, UnOp, attr, token,
+};
 use rustc_span::source_map::Spanned;
-use rustc_span::symbol::{kw, sym, Ident, Symbol};
-use rustc_span::{Span, DUMMY_SP};
-use thin_vec::{thin_vec, ThinVec};
+use rustc_span::symbol::{Ident, Symbol, kw, sym};
+use rustc_span::{DUMMY_SP, Span};
+use thin_vec::{ThinVec, thin_vec};
+
+use crate::base::ExtCtxt;
 
 impl<'a> ExtCtxt<'a> {
     pub fn path(&self, span: Span, strs: Vec<Ident>) -> ast::Path {
@@ -149,18 +152,15 @@ impl<'a> ExtCtxt<'a> {
     }
 
     pub fn trait_bound(&self, path: ast::Path, is_const: bool) -> ast::GenericBound {
-        ast::GenericBound::Trait(
-            self.poly_trait_ref(path.span, path),
-            ast::TraitBoundModifiers {
-                polarity: ast::BoundPolarity::Positive,
-                constness: if is_const {
-                    ast::BoundConstness::Maybe(DUMMY_SP)
-                } else {
-                    ast::BoundConstness::Never
-                },
-                asyncness: ast::BoundAsyncness::Normal,
+        ast::GenericBound::Trait(self.poly_trait_ref(path.span, path), ast::TraitBoundModifiers {
+            polarity: ast::BoundPolarity::Positive,
+            constness: if is_const {
+                ast::BoundConstness::Maybe(DUMMY_SP)
+            } else {
+                ast::BoundConstness::Never
             },
-        )
+            asyncness: ast::BoundAsyncness::Normal,
+        })
     }
 
     pub fn lifetime(&self, span: Span, ident: Ident) -> ast::Lifetime {
@@ -229,14 +229,11 @@ impl<'a> ExtCtxt<'a> {
     }
 
     pub fn block_expr(&self, expr: P<ast::Expr>) -> P<ast::Block> {
-        self.block(
-            expr.span,
-            thin_vec![ast::Stmt {
-                id: ast::DUMMY_NODE_ID,
-                span: expr.span,
-                kind: ast::StmtKind::Expr(expr),
-            }],
-        )
+        self.block(expr.span, thin_vec![ast::Stmt {
+            id: ast::DUMMY_NODE_ID,
+            span: expr.span,
+            kind: ast::StmtKind::Expr(expr),
+        }])
     }
     pub fn block(&self, span: Span, stmts: ThinVec<ast::Stmt>) -> P<ast::Block> {
         P(ast::Block {
@@ -631,7 +628,10 @@ impl<'a> ExtCtxt<'a> {
             span,
             name,
             AttrVec::new(),
-            ast::ItemKind::Static(ast::StaticItem { ty, mutability, expr: Some(expr) }.into()),
+            ast::ItemKind::Static(
+                ast::StaticItem { ty, safety: ast::Safety::Default, mutability, expr: Some(expr) }
+                    .into(),
+            ),
         )
     }
 
@@ -663,7 +663,7 @@ impl<'a> ExtCtxt<'a> {
     // Builds `#[name]`.
     pub fn attr_word(&self, name: Symbol, span: Span) -> ast::Attribute {
         let g = &self.sess.psess.attr_id_generator;
-        attr::mk_attr_word(g, ast::AttrStyle::Outer, name, span)
+        attr::mk_attr_word(g, ast::AttrStyle::Outer, ast::Safety::Default, name, span)
     }
 
     // Builds `#[name = val]`.
@@ -671,12 +671,26 @@ impl<'a> ExtCtxt<'a> {
     // Note: `span` is used for both the identifier and the value.
     pub fn attr_name_value_str(&self, name: Symbol, val: Symbol, span: Span) -> ast::Attribute {
         let g = &self.sess.psess.attr_id_generator;
-        attr::mk_attr_name_value_str(g, ast::AttrStyle::Outer, name, val, span)
+        attr::mk_attr_name_value_str(
+            g,
+            ast::AttrStyle::Outer,
+            ast::Safety::Default,
+            name,
+            val,
+            span,
+        )
     }
 
     // Builds `#[outer(inner)]`.
     pub fn attr_nested_word(&self, outer: Symbol, inner: Symbol, span: Span) -> ast::Attribute {
         let g = &self.sess.psess.attr_id_generator;
-        attr::mk_attr_nested_word(g, ast::AttrStyle::Outer, outer, inner, span)
+        attr::mk_attr_nested_word(
+            g,
+            ast::AttrStyle::Outer,
+            ast::Safety::Default,
+            outer,
+            inner,
+            span,
+        )
     }
 }

@@ -1,16 +1,13 @@
-use crate::cmp;
 use crate::ffi::CStr;
-use crate::io;
-use crate::mem;
+use crate::mem::{self, ManuallyDrop};
 use crate::num::NonZero;
-use crate::ptr;
-use crate::sys::{os, stack_overflow};
-use crate::time::Duration;
-
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 use crate::sys::weak::dlsym;
-#[cfg(any(target_os = "solaris", target_os = "illumos", target_os = "nto"))]
+#[cfg(any(target_os = "solaris", target_os = "illumos", target_os = "nto",))]
 use crate::sys::weak::weak;
+use crate::sys::{os, stack_overflow};
+use crate::time::Duration;
+use crate::{cmp, io, ptr};
 #[cfg(not(any(target_os = "l4re", target_os = "vxworks", target_os = "espidf")))]
 pub const DEFAULT_MIN_STACK_SIZE: usize = 2 * 1024 * 1024;
 #[cfg(target_os = "l4re")]
@@ -120,13 +117,15 @@ impl Thread {
     pub fn set_name(name: &CStr) {
         const PR_SET_NAME: libc::c_int = 15;
         unsafe {
-            libc::prctl(
+            let res = libc::prctl(
                 PR_SET_NAME,
                 name.as_ptr(),
                 0 as libc::c_ulong,
                 0 as libc::c_ulong,
                 0 as libc::c_ulong,
             );
+            // We have no good way of propagating errors here, but in debug-builds let's check that this actually worked.
+            debug_assert_eq!(res, 0);
         }
     }
 
@@ -143,7 +142,12 @@ impl Thread {
         }
     }
 
-    #[cfg(any(target_os = "freebsd", target_os = "dragonfly", target_os = "openbsd"))]
+    #[cfg(any(
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "openbsd",
+        target_os = "nuttx"
+    ))]
     pub fn set_name(name: &CStr) {
         unsafe {
             libc::pthread_set_name_np(libc::pthread_self(), name.as_ptr());
@@ -215,17 +219,31 @@ impl Thread {
         }
     }
 
+    #[cfg(target_os = "vxworks")]
+    pub fn set_name(name: &CStr) {
+        // FIXME(libc): adding real STATUS, ERROR type eventually.
+        extern "C" {
+            fn taskNameSet(task_id: libc::TASK_ID, task_name: *mut libc::c_char) -> libc::c_int;
+        }
+
+        //  VX_TASK_NAME_LEN is 31 in VxWorks 7.
+        const VX_TASK_NAME_LEN: usize = 31;
+
+        let mut name = truncate_cstr::<{ VX_TASK_NAME_LEN }>(name);
+        let res = unsafe { taskNameSet(libc::taskIdSelf(), name.as_mut_ptr()) };
+        debug_assert_eq!(res, libc::OK);
+    }
+
     #[cfg(any(
         target_env = "newlib",
         target_os = "l4re",
         target_os = "emscripten",
         target_os = "redox",
-        target_os = "vxworks",
         target_os = "hurd",
         target_os = "aix",
     ))]
     pub fn set_name(_name: &CStr) {
-        // Newlib, Emscripten, and VxWorks have no way to set a thread name.
+        // Newlib and Emscripten have no way to set a thread name.
     }
 
     #[cfg(not(target_os = "espidf"))]
@@ -242,7 +260,7 @@ impl Thread {
                     tv_nsec: nsecs,
                 };
                 secs -= ts.tv_sec as u64;
-                let ts_ptr = core::ptr::addr_of_mut!(ts);
+                let ts_ptr = &raw mut ts;
                 if libc::nanosleep(ts_ptr, ts_ptr) == -1 {
                     assert_eq!(os::errno(), libc::EINTR);
                     secs += ts.tv_sec as u64;
@@ -256,23 +274,39 @@ impl Thread {
 
     #[cfg(target_os = "espidf")]
     pub fn sleep(dur: Duration) {
-        let mut micros = dur.as_micros();
-        unsafe {
-            while micros > 0 {
-                let st = if micros > u32::MAX as u128 { u32::MAX } else { micros as u32 };
-                libc::usleep(st);
+        // ESP-IDF does not have `nanosleep`, so we use `usleep` instead.
+        // As per the documentation of `usleep`, it is expected to support
+        // sleep times as big as at least up to 1 second.
+        //
+        // ESP-IDF does support almost up to `u32::MAX`, but due to a potential integer overflow in its
+        // `usleep` implementation
+        // (https://github.com/espressif/esp-idf/blob/d7ca8b94c852052e3bc33292287ef4dd62c9eeb1/components/newlib/time.c#L210),
+        // we limit the sleep time to the maximum one that would not cause the underlying `usleep` implementation to overflow
+        // (`portTICK_PERIOD_MS` can be anything between 1 to 1000, and is 10 by default).
+        const MAX_MICROS: u32 = u32::MAX - 1_000_000 - 1;
 
-                micros -= st as u128;
+        // Add any nanoseconds smaller than a microsecond as an extra microsecond
+        // so as to comply with the `std::thread::sleep` contract which mandates
+        // implementations to sleep for _at least_ the provided `dur`.
+        // We can't overflow `micros` as it is a `u128`, while `Duration` is a pair of
+        // (`u64` secs, `u32` nanos), where the nanos are strictly smaller than 1 second
+        // (i.e. < 1_000_000_000)
+        let mut micros = dur.as_micros() + if dur.subsec_nanos() % 1_000 > 0 { 1 } else { 0 };
+
+        while micros > 0 {
+            let st = if micros > MAX_MICROS as u128 { MAX_MICROS } else { micros as u32 };
+            unsafe {
+                libc::usleep(st);
             }
+
+            micros -= st as u128;
         }
     }
 
     pub fn join(self) {
-        unsafe {
-            let ret = libc::pthread_join(self.id, ptr::null_mut());
-            mem::forget(self);
-            assert!(ret == 0, "failed to join thread: {}", io::Error::from_raw_os_error(ret));
-        }
+        let id = self.into_id();
+        let ret = unsafe { libc::pthread_join(id, ptr::null_mut()) };
+        assert!(ret == 0, "failed to join thread: {}", io::Error::from_raw_os_error(ret));
     }
 
     pub fn id(&self) -> libc::pthread_t {
@@ -280,9 +314,7 @@ impl Thread {
     }
 
     pub fn into_id(self) -> libc::pthread_t {
-        let id = self.id;
-        mem::forget(self);
-        id
+        ManuallyDrop::new(self).id
     }
 }
 
@@ -298,6 +330,7 @@ impl Drop for Thread {
     target_os = "nto",
     target_os = "solaris",
     target_os = "illumos",
+    target_os = "vxworks",
     target_vendor = "apple",
 ))]
 fn truncate_cstr<const MAX_WITH_NUL: usize>(cstr: &CStr) -> [libc::c_char; MAX_WITH_NUL] {
@@ -416,8 +449,8 @@ pub fn available_parallelism() -> io::Result<NonZero<usize>> {
                     libc::sysctl(
                         mib.as_mut_ptr(),
                         2,
-                        core::ptr::addr_of_mut!(cpus) as *mut _,
-                        core::ptr::addr_of_mut!(cpus_size) as *mut _,
+                        (&raw mut cpus) as *mut _,
+                        (&raw mut cpus_size) as *mut _,
                         ptr::null_mut(),
                         0,
                     )
@@ -462,8 +495,20 @@ pub fn available_parallelism() -> io::Result<NonZero<usize>> {
 
                 Ok(NonZero::new_unchecked(sinfo.cpu_count as usize))
             }
+        } else if #[cfg(target_os = "vxworks")] {
+            // Note: there is also `vxCpuConfiguredGet`, closer to _SC_NPROCESSORS_CONF
+            // expectations than the actual cores availability.
+            extern "C" {
+                fn vxCpuEnabledGet() -> libc::cpuset_t;
+            }
+
+            // SAFETY: `vxCpuEnabledGet` always fetches a mask with at least one bit set
+            unsafe{
+                let set = vxCpuEnabledGet();
+                Ok(NonZero::new_unchecked(set.count_ones() as usize))
+            }
         } else {
-            // FIXME: implement on vxWorks, Redox, l4re
+            // FIXME: implement on Redox, l4re
             Err(io::const_io_error!(io::ErrorKind::Unsupported, "Getting the number of hardware threads is not supported on the target platform"))
         }
     }
@@ -475,14 +520,13 @@ mod cgroups {
     //! * cgroup v2 in non-standard mountpoints
     //! * paths containing control characters or spaces, since those would be escaped in procfs
     //!   output and we don't unescape
+
     use crate::borrow::Cow;
     use crate::ffi::OsString;
-    use crate::fs::{try_exists, File};
-    use crate::io::Read;
-    use crate::io::{BufRead, BufReader};
+    use crate::fs::{File, exists};
+    use crate::io::{BufRead, Read};
     use crate::os::unix::ffi::OsStringExt;
-    use crate::path::Path;
-    use crate::path::PathBuf;
+    use crate::path::{Path, PathBuf};
     use crate::str::from_utf8;
 
     #[derive(PartialEq)]
@@ -555,7 +599,7 @@ mod cgroups {
         path.push("cgroup.controllers");
 
         // skip if we're not looking at cgroup2
-        if matches!(try_exists(&path), Err(_) | Ok(false)) {
+        if matches!(exists(&path), Err(_) | Ok(false)) {
             return usize::MAX;
         };
 
@@ -612,7 +656,7 @@ mod cgroups {
             path.push(&group_path);
 
             // skip if we guessed the mount incorrectly
-            if matches!(try_exists(&path), Err(_) | Ok(false)) {
+            if matches!(exists(&path), Err(_) | Ok(false)) {
                 continue;
             }
 
@@ -653,7 +697,7 @@ mod cgroups {
     /// If the cgroupfs is a bind mount then `group_path` is adjusted to skip
     /// over the already-included prefix
     fn find_mountpoint(group_path: &Path) -> Option<(Cow<'static, str>, &Path)> {
-        let mut reader = BufReader::new(File::open("/proc/self/mountinfo").ok()?);
+        let mut reader = File::open_buffered("/proc/self/mountinfo").ok()?;
         let mut line = String::with_capacity(256);
         loop {
             line.clear();
@@ -710,12 +754,24 @@ unsafe fn min_stack_size(attr: *const libc::pthread_attr_t) -> usize {
 }
 
 // No point in looking up __pthread_get_minstack() on non-glibc platforms.
-#[cfg(all(not(all(target_os = "linux", target_env = "gnu")), not(target_os = "netbsd")))]
+#[cfg(all(
+    not(all(target_os = "linux", target_env = "gnu")),
+    not(any(target_os = "netbsd", target_os = "nuttx"))
+))]
 unsafe fn min_stack_size(_: *const libc::pthread_attr_t) -> usize {
     libc::PTHREAD_STACK_MIN
 }
 
-#[cfg(target_os = "netbsd")]
+#[cfg(any(target_os = "netbsd", target_os = "nuttx"))]
 unsafe fn min_stack_size(_: *const libc::pthread_attr_t) -> usize {
-    2048 // just a guess
+    static STACK: crate::sync::OnceLock<usize> = crate::sync::OnceLock::new();
+
+    *STACK.get_or_init(|| {
+        let mut stack = unsafe { libc::sysconf(libc::_SC_THREAD_STACK_MIN) };
+        if stack < 0 {
+            stack = 2048; // just a guess
+        }
+
+        stack as usize
+    })
 }

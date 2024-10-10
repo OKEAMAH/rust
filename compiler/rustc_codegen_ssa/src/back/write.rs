@@ -1,54 +1,52 @@
-use super::link::{self, ensure_removed};
-use super::lto::{self, SerializedModule};
-use super::symbol_export::symbol_name_for_instance_in_crate;
+use std::any::Any;
+use std::assert_matches::assert_matches;
+use std::marker::PhantomData;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::mpsc::{Receiver, Sender, channel};
+use std::{fs, io, mem, str, thread};
 
-use crate::errors;
-use crate::traits::*;
-use crate::{
-    CachedModuleCodegen, CodegenResults, CompiledModule, CrateInfo, ModuleCodegen, ModuleKind,
-};
 use jobserver::{Acquired, Client};
 use rustc_ast::attr;
 use rustc_data_structures::fx::{FxHashMap, FxIndexMap};
 use rustc_data_structures::memmap::Mmap;
 use rustc_data_structures::profiling::{SelfProfilerRef, VerboseTimingGuard};
-use rustc_data_structures::sync::Lrc;
 use rustc_errors::emitter::Emitter;
 use rustc_errors::translation::Translate;
 use rustc_errors::{
     Diag, DiagArgMap, DiagCtxt, DiagMessage, ErrCode, FatalError, FluentBundle, Level, MultiSpan,
-    Style,
+    Style, Suggestions,
 };
 use rustc_fs_util::link_or_copy;
 use rustc_hir::def_id::{CrateNum, LOCAL_CRATE};
 use rustc_incremental::{
     copy_cgu_workproduct_to_incr_comp_cache_dir, in_incr_comp_dir, in_incr_comp_dir_sess,
 };
-use rustc_metadata::fs::copy_to_stdout;
 use rustc_metadata::EncodedMetadata;
+use rustc_metadata::fs::copy_to_stdout;
 use rustc_middle::bug;
 use rustc_middle::dep_graph::{WorkProduct, WorkProductId};
 use rustc_middle::middle::exported_symbols::SymbolExportInfo;
 use rustc_middle::ty::TyCtxt;
-use rustc_session::config::{self, CrateType, Lto, OutFileName, OutputFilenames, OutputType};
-use rustc_session::config::{Passes, SwitchWithOptPath};
 use rustc_session::Session;
+use rustc_session::config::{
+    self, CrateType, Lto, OutFileName, OutputFilenames, OutputType, Passes, SwitchWithOptPath,
+};
 use rustc_span::source_map::SourceMap;
 use rustc_span::symbol::sym;
 use rustc_span::{BytePos, FileName, InnerSpan, Pos, Span};
 use rustc_target::spec::{MergeFunctions, SanitizerSet};
+use tracing::debug;
 
+use super::link::{self, ensure_removed};
+use super::lto::{self, SerializedModule};
+use super::symbol_export::symbol_name_for_instance_in_crate;
 use crate::errors::ErrorCreatingRemarkDir;
-use std::any::Any;
-use std::fs;
-use std::io;
-use std::marker::PhantomData;
-use std::mem;
-use std::path::{Path, PathBuf};
-use std::str;
-use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::Arc;
-use std::thread;
+use crate::traits::*;
+use crate::{
+    CachedModuleCodegen, CodegenResults, CompiledModule, CrateInfo, ModuleCodegen, ModuleKind,
+    errors,
+};
 
 const PRE_LTO_BC_EXT: &str = "pre-lto.bc";
 
@@ -107,18 +105,19 @@ pub struct ModuleConfig {
     pub emit_asm: bool,
     pub emit_obj: EmitObj,
     pub emit_thin_lto: bool,
+    pub emit_thin_lto_summary: bool,
     pub bc_cmdline: String,
 
     // Miscellaneous flags. These are mostly copied from command-line
     // options.
     pub verify_llvm_ir: bool,
+    pub lint_llvm_ir: bool,
     pub no_prepopulate_passes: bool,
     pub no_builtins: bool,
     pub time_module: bool,
     pub vectorize_loop: bool,
     pub vectorize_slp: bool,
     pub merge_functions: bool,
-    pub inline_threshold: Option<u32>,
     pub emit_lifetime_markers: bool,
     pub llvm_plugins: Vec<String>,
 }
@@ -231,9 +230,14 @@ impl ModuleConfig {
             ),
             emit_obj,
             emit_thin_lto: sess.opts.unstable_opts.emit_thin_lto,
+            emit_thin_lto_summary: if_regular!(
+                sess.opts.output_types.contains_key(&OutputType::ThinLinkBitcode),
+                false
+            ),
             bc_cmdline: sess.target.bitcode_llvm_cmdline.to_string(),
 
             verify_llvm_ir: sess.verify_llvm_ir(),
+            lint_llvm_ir: sess.opts.unstable_opts.lint_llvm_ir,
             no_prepopulate_passes: sess.opts.cg.no_prepopulate_passes,
             no_builtins: no_builtins || sess.target.no_builtins,
 
@@ -274,7 +278,6 @@ impl ModuleConfig {
                 }
             },
 
-            inline_threshold: sess.opts.cg.inline_threshold,
             emit_lifetime_markers: sess.emit_lifetime_markers(),
             llvm_plugins: if_regular!(sess.opts.unstable_opts.llvm_plugins.clone(), vec![]),
         }
@@ -282,6 +285,7 @@ impl ModuleConfig {
 
     pub fn bitcode_needed(&self) -> bool {
         self.emit_bc
+            || self.emit_thin_lto_summary
             || self.emit_obj == EmitObj::Bitcode
             || self.emit_obj == EmitObj::ObjectCode(BitcodeSection::Full)
     }
@@ -330,7 +334,7 @@ pub type TargetMachineFactoryFn<B> = Arc<
         + Sync,
 >;
 
-pub type ExportedSymbols = FxHashMap<CrateNum, Arc<Vec<(String, SymbolExportInfo)>>>;
+type ExportedSymbols = FxHashMap<CrateNum, Arc<Vec<(String, SymbolExportInfo)>>>;
 
 /// Additional resources used by optimize_and_codegen (not module specific)
 #[derive(Clone)]
@@ -432,9 +436,9 @@ fn generate_lto_work<B: ExtraBackendMethods>(
     }
 }
 
-pub struct CompiledModules {
-    pub modules: Vec<CompiledModule>,
-    pub allocator_module: Option<CompiledModule>,
+struct CompiledModules {
+    modules: Vec<CompiledModule>,
+    allocator_module: Option<CompiledModule>,
 }
 
 fn need_bitcode_in_object(tcx: TyCtxt<'_>) -> bool {
@@ -457,7 +461,7 @@ fn need_pre_lto_bitcode_for_incr_comp(sess: &Session) -> bool {
     }
 }
 
-pub fn start_async_codegen<B: ExtraBackendMethods>(
+pub(crate) fn start_async_codegen<B: ExtraBackendMethods>(
     backend: B,
     tcx: TyCtxt<'_>,
     target_cpu: String,
@@ -629,6 +633,9 @@ fn produce_final_output_artifacts(
                 // them for making an rlib.
                 copy_if_one_unit(OutputType::Bitcode, true);
             }
+            OutputType::ThinLinkBitcode => {
+                copy_if_one_unit(OutputType::ThinLinkBitcode, false);
+            }
             OutputType::LlvmAssembly => {
                 copy_if_one_unit(OutputType::LlvmAssembly, false);
             }
@@ -707,6 +714,29 @@ fn produce_final_output_artifacts(
         }
     }
 
+    if sess.opts.json_artifact_notifications {
+        if compiled_modules.modules.len() == 1 {
+            compiled_modules.modules[0].for_each_output(|_path, ty| {
+                if sess.opts.output_types.contains_key(&ty) {
+                    let descr = ty.shorthand();
+                    // for single cgu file is renamed to drop cgu specific suffix
+                    // so we regenerate it the same way
+                    let path = crate_output.path(ty);
+                    sess.dcx().emit_artifact_notification(path.as_path(), descr);
+                }
+            });
+        } else {
+            for module in &compiled_modules.modules {
+                module.for_each_output(|path, ty| {
+                    if sess.opts.output_types.contains_key(&ty) {
+                        let descr = ty.shorthand();
+                        sess.dcx().emit_artifact_notification(&path, descr);
+                    }
+                });
+            }
+        }
+    }
+
     // We leave the following files around by default:
     //  - #crate#.o
     //  - #crate#.crate.metadata.o
@@ -725,7 +755,7 @@ pub(crate) enum WorkItem<B: WriteBackendMethods> {
 }
 
 impl<B: WriteBackendMethods> WorkItem<B> {
-    pub fn module_kind(&self) -> ModuleKind {
+    fn module_kind(&self) -> ModuleKind {
         match *self {
             WorkItem::Optimize(ref m) => m.kind,
             WorkItem::CopyPostLtoArtifacts(_) | WorkItem::LTO(_) => ModuleKind::Regular,
@@ -805,13 +835,13 @@ pub enum FatLtoInput<B: WriteBackendMethods> {
 }
 
 /// Actual LTO type we end up choosing based on multiple factors.
-pub enum ComputedLtoType {
+pub(crate) enum ComputedLtoType {
     No,
     Thin,
     Fat,
 }
 
-pub fn compute_per_cgu_lto_type(
+pub(crate) fn compute_per_cgu_lto_type(
     sess_lto: &Lto,
     opts: &config::Options,
     sess_crate_types: &[CrateType],
@@ -858,9 +888,10 @@ fn execute_optimize_work_item<B: ExtraBackendMethods>(
     module_config: &ModuleConfig,
 ) -> Result<WorkItemResult<B>, FatalError> {
     let dcx = cgcx.create_dcx();
+    let dcx = dcx.handle();
 
     unsafe {
-        B::optimize(cgcx, &dcx, &module, module_config)?;
+        B::optimize(cgcx, dcx, &module, module_config)?;
     }
 
     // After we've done the initial round of optimizations we need to
@@ -882,7 +913,7 @@ fn execute_optimize_work_item<B: ExtraBackendMethods>(
     match lto_type {
         ComputedLtoType::No => finish_intra_module_work(cgcx, module, module_config),
         ComputedLtoType::Thin => {
-            let (name, thin_buffer) = B::prepare_thin(module);
+            let (name, thin_buffer) = B::prepare_thin(module, false);
             if let Some(path) = bitcode {
                 fs::write(&path, thin_buffer.data()).unwrap_or_else(|e| {
                     panic!("Error writing pre-lto-bitcode file `{}`: {}", path.display(), e);
@@ -921,7 +952,11 @@ fn execute_copy_from_cache_work_item<B: ExtraBackendMethods>(
         match link_or_copy(&source_file, &output_path) {
             Ok(_) => Some(output_path),
             Err(error) => {
-                cgcx.create_dcx().emit_err(errors::CopyPathBuf { source_file, output_path, error });
+                cgcx.create_dcx().handle().emit_err(errors::CopyPathBuf {
+                    source_file,
+                    output_path,
+                    error,
+                });
                 None
             }
         }
@@ -954,7 +989,7 @@ fn execute_copy_from_cache_work_item<B: ExtraBackendMethods>(
     let bytecode = load_from_incr_cache(module_config.emit_bc, OutputType::Bitcode);
     let object = load_from_incr_cache(should_emit_obj, OutputType::Object);
     if should_emit_obj && object.is_none() {
-        cgcx.create_dcx().emit_fatal(errors::NoSavedObjectFile { cgu_name: &module.name })
+        cgcx.create_dcx().handle().emit_fatal(errors::NoSavedObjectFile { cgu_name: &module.name })
     }
 
     WorkItemResult::Finished(CompiledModule {
@@ -983,12 +1018,13 @@ fn finish_intra_module_work<B: ExtraBackendMethods>(
     module_config: &ModuleConfig,
 ) -> Result<WorkItemResult<B>, FatalError> {
     let dcx = cgcx.create_dcx();
+    let dcx = dcx.handle();
 
     if !cgcx.opts.unstable_opts.combine_cgu
         || module.kind == ModuleKind::Metadata
         || module.kind == ModuleKind::Allocator
     {
-        let module = unsafe { B::codegen(cgcx, &dcx, module, module_config)? };
+        let module = unsafe { B::codegen(cgcx, dcx, module, module_config)? };
         Ok(WorkItemResult::Finished(module))
     } else {
         Ok(WorkItemResult::NeedsLink(module))
@@ -1050,7 +1086,7 @@ struct Diagnostic {
 // A cut-down version of `rustc_errors::Subdiag` that impls `Send`. It's
 // missing the following fields from `rustc_errors::Subdiag`.
 // - `span`: it doesn't impl `Send`.
-pub struct Subdiagnostic {
+pub(crate) struct Subdiagnostic {
     level: Level,
     messages: Vec<(DiagMessage, Style)>,
 }
@@ -1475,7 +1511,7 @@ fn start_executing_work<B: ExtraBackendMethods>(
                             // We reduce the `running` counter by one. The
                             // `tokens.truncate()` below will take care of
                             // giving the Token back.
-                            debug_assert!(running_with_own_token > 0);
+                            assert!(running_with_own_token > 0);
                             running_with_own_token -= 1;
                             main_thread_state = MainThreadState::Lending;
                         }
@@ -1659,9 +1695,10 @@ fn start_executing_work<B: ExtraBackendMethods>(
         if !needs_link.is_empty() {
             assert!(compiled_modules.is_empty());
             let dcx = cgcx.create_dcx();
-            let module = B::run_link(&cgcx, &dcx, needs_link).map_err(|_| ())?;
+            let dcx = dcx.handle();
+            let module = B::run_link(&cgcx, dcx, needs_link).map_err(|_| ())?;
             let module = unsafe {
-                B::codegen(&cgcx, &dcx, module, cgcx.config(ModuleKind::Regular)).map_err(|_| ())?
+                B::codegen(&cgcx, dcx, module, cgcx.config(ModuleKind::Regular)).map_err(|_| ())?
             };
             compiled_modules.push(module);
         }
@@ -1741,7 +1778,7 @@ fn start_executing_work<B: ExtraBackendMethods>(
 
 /// `FatalError` is explicitly not `Send`.
 #[must_use]
-pub struct WorkerFatalError;
+pub(crate) struct WorkerFatalError;
 
 fn spawn_work<'a, B: ExtraBackendMethods>(
     cgcx: &'a CodegenContext<B>,
@@ -1829,7 +1866,7 @@ pub struct SharedEmitterMain {
 }
 
 impl SharedEmitter {
-    pub fn new() -> (SharedEmitter, SharedEmitterMain) {
+    fn new() -> (SharedEmitter, SharedEmitterMain) {
         let (sender, receiver) = channel();
 
         (SharedEmitter { sender }, SharedEmitterMain { receiver })
@@ -1845,13 +1882,13 @@ impl SharedEmitter {
         drop(self.sender.send(SharedEmitterMessage::InlineAsmError(cookie, msg, level, source)));
     }
 
-    pub fn fatal(&self, msg: &str) {
+    fn fatal(&self, msg: &str) {
         drop(self.sender.send(SharedEmitterMessage::Fatal(msg.to_string())));
     }
 }
 
 impl Translate for SharedEmitter {
-    fn fluent_bundle(&self) -> Option<&Lrc<FluentBundle>> {
+    fn fluent_bundle(&self) -> Option<&FluentBundle> {
         None
     }
 
@@ -1865,7 +1902,7 @@ impl Emitter for SharedEmitter {
         // Check that we aren't missing anything interesting when converting to
         // the cut-down local `DiagInner`.
         assert_eq!(diag.span, MultiSpan::new());
-        assert_eq!(diag.suggestions, Ok(vec![]));
+        assert_eq!(diag.suggestions, Suggestions::Enabled(vec![]));
         assert_eq!(diag.sort_span, rustc_span::DUMMY_SP);
         assert_eq!(diag.is_lint, None);
         // No sensible check for `diag.emitted_at`.
@@ -1886,13 +1923,13 @@ impl Emitter for SharedEmitter {
         );
     }
 
-    fn source_map(&self) -> Option<&Lrc<SourceMap>> {
+    fn source_map(&self) -> Option<&SourceMap> {
         None
     }
 }
 
 impl SharedEmitterMain {
-    pub fn check(&self, sess: &Session, blocking: bool) {
+    fn check(&self, sess: &Session, blocking: bool) {
         loop {
             let message = if blocking {
                 match self.receiver.recv() {
@@ -1928,7 +1965,7 @@ impl SharedEmitterMain {
                     sess.dcx().abort_if_errors();
                 }
                 Ok(SharedEmitterMessage::InlineAsmError(cookie, msg, level, source)) => {
-                    assert!(matches!(level, Level::Error | Level::Warning | Level::Note));
+                    assert_matches!(level, Level::Error | Level::Warning | Level::Note);
                     let msg = msg.strip_prefix("error: ").unwrap_or(&msg).to_string();
                     let mut err = Diag::<()>::new(sess.dcx(), level, msg);
 
@@ -2049,17 +2086,17 @@ impl<B: ExtraBackendMethods> OngoingCodegen<B> {
         )
     }
 
-    pub fn codegen_finished(&self, tcx: TyCtxt<'_>) {
+    pub(crate) fn codegen_finished(&self, tcx: TyCtxt<'_>) {
         self.wait_for_signal_to_codegen_item();
         self.check_for_errors(tcx.sess);
         drop(self.coordinator.sender.send(Box::new(Message::CodegenComplete::<B>)));
     }
 
-    pub fn check_for_errors(&self, sess: &Session) {
+    pub(crate) fn check_for_errors(&self, sess: &Session) {
         self.shared_emitter_main.check(sess, false);
     }
 
-    pub fn wait_for_signal_to_codegen_item(&self) {
+    pub(crate) fn wait_for_signal_to_codegen_item(&self) {
         match self.codegen_worker_receive.recv() {
             Ok(CguMessage) => {
                 // Ok to proceed.
@@ -2072,7 +2109,7 @@ impl<B: ExtraBackendMethods> OngoingCodegen<B> {
     }
 }
 
-pub fn submit_codegened_module_to_llvm<B: ExtraBackendMethods>(
+pub(crate) fn submit_codegened_module_to_llvm<B: ExtraBackendMethods>(
     _backend: &B,
     tx_to_llvm_workers: &Sender<Box<dyn Any + Send>>,
     module: ModuleCodegen<B::Module>,
@@ -2082,7 +2119,7 @@ pub fn submit_codegened_module_to_llvm<B: ExtraBackendMethods>(
     drop(tx_to_llvm_workers.send(Box::new(Message::CodegenDone::<B> { llvm_work_item, cost })));
 }
 
-pub fn submit_post_lto_module_to_llvm<B: ExtraBackendMethods>(
+pub(crate) fn submit_post_lto_module_to_llvm<B: ExtraBackendMethods>(
     _backend: &B,
     tx_to_llvm_workers: &Sender<Box<dyn Any + Send>>,
     module: CachedModuleCodegen,
@@ -2091,7 +2128,7 @@ pub fn submit_post_lto_module_to_llvm<B: ExtraBackendMethods>(
     drop(tx_to_llvm_workers.send(Box::new(Message::CodegenDone::<B> { llvm_work_item, cost: 0 })));
 }
 
-pub fn submit_pre_lto_module_to_llvm<B: ExtraBackendMethods>(
+pub(crate) fn submit_pre_lto_module_to_llvm<B: ExtraBackendMethods>(
     _backend: &B,
     tcx: TyCtxt<'_>,
     tx_to_llvm_workers: &Sender<Box<dyn Any + Send>>,

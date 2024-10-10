@@ -7,79 +7,29 @@ pub mod select;
 pub mod solve;
 pub mod specialization_graph;
 mod structural_impls;
-pub mod util;
-
-use crate::mir::ConstraintCategory;
-use crate::ty::abstract_const::NotConstEvaluatable;
-use crate::ty::GenericArgsRef;
-use crate::ty::{self, AdtKind, Ty};
-
-use rustc_data_structures::sync::Lrc;
-use rustc_errors::{Applicability, Diag, EmissionGuarantee};
-use rustc_hir as hir;
-use rustc_hir::def_id::DefId;
-use rustc_hir::HirId;
-use rustc_macros::{
-    Decodable, Encodable, HashStable, TyDecodable, TyEncodable, TypeFoldable, TypeVisitable,
-};
-use rustc_span::def_id::{LocalDefId, CRATE_DEF_ID};
-use rustc_span::symbol::Symbol;
-use rustc_span::{Span, DUMMY_SP};
-use smallvec::{smallvec, SmallVec};
 
 use std::borrow::Cow;
 use std::hash::{Hash, Hasher};
 
-pub use self::select::{EvaluationCache, EvaluationResult, OverflowError, SelectionCache};
+use rustc_data_structures::sync::Lrc;
+use rustc_errors::{Applicability, Diag, EmissionGuarantee};
+use rustc_hir as hir;
+use rustc_hir::HirId;
+use rustc_hir::def_id::DefId;
+use rustc_macros::{
+    Decodable, Encodable, HashStable, TyDecodable, TyEncodable, TypeFoldable, TypeVisitable,
+};
+use rustc_span::def_id::{CRATE_DEF_ID, LocalDefId};
+use rustc_span::symbol::Symbol;
+use rustc_span::{DUMMY_SP, Span};
 // FIXME: Remove this import and import via `solve::`
-pub use rustc_next_trait_solver::solve::BuiltinImplSource;
+pub use rustc_type_ir::solve::{BuiltinImplSource, Reveal};
+use smallvec::{SmallVec, smallvec};
 
-/// Depending on the stage of compilation, we want projection to be
-/// more or less conservative.
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, HashStable, Encodable, Decodable)]
-pub enum Reveal {
-    /// At type-checking time, we refuse to project any associated
-    /// type that is marked `default`. Non-`default` ("final") types
-    /// are always projected. This is necessary in general for
-    /// soundness of specialization. However, we *could* allow
-    /// projections in fully-monomorphic cases. We choose not to,
-    /// because we prefer for `default type` to force the type
-    /// definition to be treated abstractly by any consumers of the
-    /// impl. Concretely, that means that the following example will
-    /// fail to compile:
-    ///
-    /// ```compile_fail,E0308
-    /// #![feature(specialization)]
-    /// trait Assoc {
-    ///     type Output;
-    /// }
-    ///
-    /// impl<T> Assoc for T {
-    ///     default type Output = bool;
-    /// }
-    ///
-    /// fn main() {
-    ///     let x: <() as Assoc>::Output = true;
-    /// }
-    /// ```
-    ///
-    /// We also do not reveal the hidden type of opaque types during
-    /// type-checking.
-    UserFacing,
-
-    /// At codegen time, all monomorphic projections will succeed.
-    /// Also, `impl Trait` is normalized to the concrete type,
-    /// which has to be already collected by type-checking.
-    ///
-    /// NOTE: as `impl Trait`'s concrete type should *never*
-    /// be observable directly by the user, `Reveal::All`
-    /// should not be used by checks which may expose
-    /// type equality or type contents to the user.
-    /// There are some exceptions, e.g., around auto traits and
-    /// transmute-checking, which expose some details, but
-    /// not the whole concrete type of the `impl Trait`.
-    All,
-}
+pub use self::select::{EvaluationCache, EvaluationResult, OverflowError, SelectionCache};
+use crate::mir::ConstraintCategory;
+use crate::ty::abstract_const::NotConstEvaluatable;
+use crate::ty::{self, AdtKind, GenericArgsRef, Ty};
 
 /// The reason why we incurred this obligation; used for error reporting.
 ///
@@ -403,7 +353,7 @@ pub enum ObligationCauseCode<'tcx> {
     ReturnValue(HirId),
 
     /// Opaque return type of this function
-    OpaqueReturnType(Option<(Ty<'tcx>, Span)>),
+    OpaqueReturnType(Option<(Ty<'tcx>, HirId)>),
 
     /// Block implicit return
     BlockTailExpression(HirId, hir::MatchSource),
@@ -606,8 +556,8 @@ pub enum SelectionError<'tcx> {
     /// (which for closures includes the "input" type params) and they
     /// didn't resolve. See `confirm_poly_trait_refs` for more.
     SignatureMismatch(Box<SignatureMismatchData<'tcx>>),
-    /// The trait pointed by `DefId` is not object safe.
-    TraitNotObjectSafe(DefId),
+    /// The trait pointed by `DefId` is dyn-incompatible.
+    TraitDynIncompatible(DefId),
     /// A given constant couldn't be evaluated.
     NotConstEvaluatable(NotConstEvaluatable),
     /// Exceeded the recursion depth during type projection.
@@ -616,6 +566,8 @@ pub enum SelectionError<'tcx> {
     /// We can thus not know whether the hidden type implements an auto trait, so
     /// we should not presume anything about it.
     OpaqueTypeAutoTraitLeakageUnknown(DefId),
+    /// Error for a `ConstArgHasType` goal
+    ConstArgHasWrongType { ct: ty::Const<'tcx>, ct_ty: Ty<'tcx>, expected_ty: Ty<'tcx> },
 }
 
 #[derive(Clone, Debug, TypeVisitable)]
@@ -738,7 +690,7 @@ pub struct ImplSourceUserDefinedData<'tcx, N> {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, HashStable, PartialOrd, Ord)]
-pub enum ObjectSafetyViolation {
+pub enum DynCompatibilityViolation {
     /// `Self: Sized` declared on the trait.
     SizedSelf(SmallVec<[Span; 1]>),
 
@@ -759,11 +711,11 @@ pub enum ObjectSafetyViolation {
     GAT(Symbol, Span),
 }
 
-impl ObjectSafetyViolation {
+impl DynCompatibilityViolation {
     pub fn error_msg(&self) -> Cow<'static, str> {
         match self {
-            ObjectSafetyViolation::SizedSelf(_) => "it requires `Self: Sized`".into(),
-            ObjectSafetyViolation::SupertraitSelf(ref spans) => {
+            DynCompatibilityViolation::SizedSelf(_) => "it requires `Self: Sized`".into(),
+            DynCompatibilityViolation::SupertraitSelf(ref spans) => {
                 if spans.iter().any(|sp| *sp != DUMMY_SP) {
                     "it uses `Self` as a type parameter".into()
                 } else {
@@ -771,81 +723,87 @@ impl ObjectSafetyViolation {
                         .into()
                 }
             }
-            ObjectSafetyViolation::SupertraitNonLifetimeBinder(_) => {
+            DynCompatibilityViolation::SupertraitNonLifetimeBinder(_) => {
                 "where clause cannot reference non-lifetime `for<...>` variables".into()
             }
-            ObjectSafetyViolation::Method(name, MethodViolationCode::StaticMethod(_), _) => {
+            DynCompatibilityViolation::Method(name, MethodViolationCode::StaticMethod(_), _) => {
                 format!("associated function `{name}` has no `self` parameter").into()
             }
-            ObjectSafetyViolation::Method(
+            DynCompatibilityViolation::Method(
                 name,
                 MethodViolationCode::ReferencesSelfInput(_),
                 DUMMY_SP,
             ) => format!("method `{name}` references the `Self` type in its parameters").into(),
-            ObjectSafetyViolation::Method(name, MethodViolationCode::ReferencesSelfInput(_), _) => {
-                format!("method `{name}` references the `Self` type in this parameter").into()
-            }
-            ObjectSafetyViolation::Method(name, MethodViolationCode::ReferencesSelfOutput, _) => {
-                format!("method `{name}` references the `Self` type in its return type").into()
-            }
-            ObjectSafetyViolation::Method(
+            DynCompatibilityViolation::Method(
+                name,
+                MethodViolationCode::ReferencesSelfInput(_),
+                _,
+            ) => format!("method `{name}` references the `Self` type in this parameter").into(),
+            DynCompatibilityViolation::Method(
+                name,
+                MethodViolationCode::ReferencesSelfOutput,
+                _,
+            ) => format!("method `{name}` references the `Self` type in its return type").into(),
+            DynCompatibilityViolation::Method(
                 name,
                 MethodViolationCode::ReferencesImplTraitInTrait(_),
                 _,
             ) => {
                 format!("method `{name}` references an `impl Trait` type in its return type").into()
             }
-            ObjectSafetyViolation::Method(name, MethodViolationCode::AsyncFn, _) => {
+            DynCompatibilityViolation::Method(name, MethodViolationCode::AsyncFn, _) => {
                 format!("method `{name}` is `async`").into()
             }
-            ObjectSafetyViolation::Method(
+            DynCompatibilityViolation::Method(
                 name,
                 MethodViolationCode::WhereClauseReferencesSelf,
                 _,
             ) => format!("method `{name}` references the `Self` type in its `where` clause").into(),
-            ObjectSafetyViolation::Method(name, MethodViolationCode::Generic, _) => {
+            DynCompatibilityViolation::Method(name, MethodViolationCode::Generic, _) => {
                 format!("method `{name}` has generic type parameters").into()
             }
-            ObjectSafetyViolation::Method(
+            DynCompatibilityViolation::Method(
                 name,
                 MethodViolationCode::UndispatchableReceiver(_),
                 _,
             ) => format!("method `{name}`'s `self` parameter cannot be dispatched on").into(),
-            ObjectSafetyViolation::AssocConst(name, DUMMY_SP) => {
+            DynCompatibilityViolation::AssocConst(name, DUMMY_SP) => {
                 format!("it contains associated `const` `{name}`").into()
             }
-            ObjectSafetyViolation::AssocConst(..) => "it contains this associated `const`".into(),
-            ObjectSafetyViolation::GAT(name, _) => {
+            DynCompatibilityViolation::AssocConst(..) => {
+                "it contains this associated `const`".into()
+            }
+            DynCompatibilityViolation::GAT(name, _) => {
                 format!("it contains the generic associated type `{name}`").into()
             }
         }
     }
 
-    pub fn solution(&self) -> ObjectSafetyViolationSolution {
+    pub fn solution(&self) -> DynCompatibilityViolationSolution {
         match self {
-            ObjectSafetyViolation::SizedSelf(_)
-            | ObjectSafetyViolation::SupertraitSelf(_)
-            | ObjectSafetyViolation::SupertraitNonLifetimeBinder(..) => {
-                ObjectSafetyViolationSolution::None
+            DynCompatibilityViolation::SizedSelf(_)
+            | DynCompatibilityViolation::SupertraitSelf(_)
+            | DynCompatibilityViolation::SupertraitNonLifetimeBinder(..) => {
+                DynCompatibilityViolationSolution::None
             }
-            ObjectSafetyViolation::Method(
+            DynCompatibilityViolation::Method(
                 name,
                 MethodViolationCode::StaticMethod(Some((add_self_sugg, make_sized_sugg))),
                 _,
-            ) => ObjectSafetyViolationSolution::AddSelfOrMakeSized {
+            ) => DynCompatibilityViolationSolution::AddSelfOrMakeSized {
                 name: *name,
                 add_self_sugg: add_self_sugg.clone(),
                 make_sized_sugg: make_sized_sugg.clone(),
             },
-            ObjectSafetyViolation::Method(
+            DynCompatibilityViolation::Method(
                 name,
                 MethodViolationCode::UndispatchableReceiver(Some(span)),
                 _,
-            ) => ObjectSafetyViolationSolution::ChangeToRefSelf(*name, *span),
-            ObjectSafetyViolation::AssocConst(name, _)
-            | ObjectSafetyViolation::GAT(name, _)
-            | ObjectSafetyViolation::Method(name, ..) => {
-                ObjectSafetyViolationSolution::MoveToAnotherTrait(*name)
+            ) => DynCompatibilityViolationSolution::ChangeToRefSelf(*name, *span),
+            DynCompatibilityViolation::AssocConst(name, _)
+            | DynCompatibilityViolation::GAT(name, _)
+            | DynCompatibilityViolation::Method(name, ..) => {
+                DynCompatibilityViolationSolution::MoveToAnotherTrait(*name)
             }
         }
     }
@@ -854,12 +812,12 @@ impl ObjectSafetyViolation {
         // When `span` comes from a separate crate, it'll be `DUMMY_SP`. Treat it as `None` so
         // diagnostics use a `note` instead of a `span_label`.
         match self {
-            ObjectSafetyViolation::SupertraitSelf(spans)
-            | ObjectSafetyViolation::SizedSelf(spans)
-            | ObjectSafetyViolation::SupertraitNonLifetimeBinder(spans) => spans.clone(),
-            ObjectSafetyViolation::AssocConst(_, span)
-            | ObjectSafetyViolation::GAT(_, span)
-            | ObjectSafetyViolation::Method(_, _, span)
+            DynCompatibilityViolation::SupertraitSelf(spans)
+            | DynCompatibilityViolation::SizedSelf(spans)
+            | DynCompatibilityViolation::SupertraitNonLifetimeBinder(spans) => spans.clone(),
+            DynCompatibilityViolation::AssocConst(_, span)
+            | DynCompatibilityViolation::GAT(_, span)
+            | DynCompatibilityViolation::Method(_, _, span)
                 if *span != DUMMY_SP =>
             {
                 smallvec![*span]
@@ -870,7 +828,7 @@ impl ObjectSafetyViolation {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum ObjectSafetyViolationSolution {
+pub enum DynCompatibilityViolationSolution {
     None,
     AddSelfOrMakeSized {
         name: Symbol,
@@ -881,11 +839,11 @@ pub enum ObjectSafetyViolationSolution {
     MoveToAnotherTrait(Symbol),
 }
 
-impl ObjectSafetyViolationSolution {
+impl DynCompatibilityViolationSolution {
     pub fn add_to<G: EmissionGuarantee>(self, err: &mut Diag<'_, G>) {
         match self {
-            ObjectSafetyViolationSolution::None => {}
-            ObjectSafetyViolationSolution::AddSelfOrMakeSized {
+            DynCompatibilityViolationSolution::None => {}
+            DynCompatibilityViolationSolution::AddSelfOrMakeSized {
                 name,
                 add_self_sugg,
                 make_sized_sugg,
@@ -908,7 +866,7 @@ impl ObjectSafetyViolationSolution {
                     Applicability::MaybeIncorrect,
                 );
             }
-            ObjectSafetyViolationSolution::ChangeToRefSelf(name, span) => {
+            DynCompatibilityViolationSolution::ChangeToRefSelf(name, span) => {
                 err.span_suggestion(
                     span,
                     format!("consider changing method `{name}`'s `self` parameter to be `&self`"),
@@ -916,14 +874,14 @@ impl ObjectSafetyViolationSolution {
                     Applicability::MachineApplicable,
                 );
             }
-            ObjectSafetyViolationSolution::MoveToAnotherTrait(name) => {
+            DynCompatibilityViolationSolution::MoveToAnotherTrait(name) => {
                 err.help(format!("consider moving `{name}` to another trait"));
             }
         }
     }
 }
 
-/// Reasons a method might not be object-safe.
+/// Reasons a method might not be dyn-compatible.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, HashStable, PartialOrd, Ord)]
 pub enum MethodViolationCode {
     /// e.g., `fn foo()`

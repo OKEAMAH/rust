@@ -96,9 +96,9 @@
 //! child processes must agree on how the commandline string is encoded.
 //!
 //! Most programs use the standard C run-time `argv`, which in practice results
-//! in consistent argument handling. However some programs have their own way of
+//! in consistent argument handling. However, some programs have their own way of
 //! parsing the commandline string. In these cases using [`arg`] or [`args`] may
-//! result in the child process seeing a different array of arguments then the
+//! result in the child process seeing a different array of arguments than the
 //! parent process intended.
 //!
 //! Two ways of mitigating this are:
@@ -148,24 +148,29 @@
 #![stable(feature = "process", since = "1.0.0")]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-#[cfg(all(test, not(any(target_os = "emscripten", target_env = "sgx", target_os = "xous"))))]
+#[cfg(all(
+    test,
+    not(any(
+        target_os = "emscripten",
+        target_os = "wasi",
+        target_env = "sgx",
+        target_os = "xous"
+    ))
+))]
 mod tests;
-
-use crate::io::prelude::*;
 
 use crate::convert::Infallible;
 use crate::ffi::OsStr;
-use crate::fmt;
-use crate::fs;
+use crate::io::prelude::*;
 use crate::io::{self, BorrowedCursor, IoSlice, IoSliceMut};
 use crate::num::NonZero;
 use crate::path::Path;
-use crate::str;
-use crate::sys::pipe::{read2, AnonPipe};
+use crate::sys::pipe::{AnonPipe, read2};
 use crate::sys::process as imp;
 #[stable(feature = "command_access", since = "1.57.0")]
 pub use crate::sys_common::process::CommandEnvs;
 use crate::sys_common::{AsInner, AsInnerMut, FromInner, IntoInner};
+use crate::{fmt, fs, str};
 
 /// Representation of a running or exited child process.
 ///
@@ -620,8 +625,6 @@ impl Command {
     ///
     /// # Examples
     ///
-    /// Basic usage:
-    ///
     /// ```no_run
     /// use std::process::Command;
     ///
@@ -629,6 +632,25 @@ impl Command {
     ///     .spawn()
     ///     .expect("sh command failed to start");
     /// ```
+    ///
+    /// # Caveats
+    ///
+    /// [`Command::new`] is only intended to accept the path of the program. If you pass a program
+    /// path along with arguments like `Command::new("ls -l").spawn()`, it will try to search for
+    /// `ls -l` literally. The arguments need to be passed separately, such as via [`arg`] or
+    /// [`args`].
+    ///
+    /// ```no_run
+    /// use std::process::Command;
+    ///
+    /// Command::new("ls")
+    ///     .arg("-l") // arg passed separately
+    ///     .spawn()
+    ///     .expect("ls command failed to start");
+    /// ```
+    ///
+    /// [`arg`]: Self::arg
+    /// [`args`]: Self::args
     #[stable(feature = "process", since = "1.0.0")]
     pub fn new<S: AsRef<OsStr>>(program: S) -> Command {
         Command { inner: imp::Command::new(program.as_ref()) }
@@ -683,8 +705,6 @@ impl Command {
     ///
     /// # Examples
     ///
-    /// Basic usage:
-    ///
     /// ```no_run
     /// use std::process::Command;
     ///
@@ -732,8 +752,6 @@ impl Command {
     ///
     /// # Examples
     ///
-    /// Basic usage:
-    ///
     /// ```no_run
     /// use std::process::Command;
     ///
@@ -770,8 +788,6 @@ impl Command {
     ///
     /// # Examples
     ///
-    /// Basic usage:
-    ///
     /// ```no_run
     /// use std::process::Command;
     ///
@@ -805,8 +821,6 @@ impl Command {
     /// and case-sensitive on all other platforms.
     ///
     /// # Examples
-    ///
-    /// Basic usage:
     ///
     /// ```no_run
     /// use std::process::{Command, Stdio};
@@ -854,8 +868,6 @@ impl Command {
     ///
     /// # Examples
     ///
-    /// Basic usage:
-    ///
     /// ```no_run
     /// use std::process::Command;
     ///
@@ -884,8 +896,6 @@ impl Command {
     ///
     /// # Examples
     ///
-    /// Basic usage:
-    ///
     /// ```no_run
     /// use std::process::Command;
     ///
@@ -911,8 +921,6 @@ impl Command {
     /// [`canonicalize`] to get an absolute program path instead.
     ///
     /// # Examples
-    ///
-    /// Basic usage:
     ///
     /// ```no_run
     /// use std::process::Command;
@@ -943,8 +951,6 @@ impl Command {
     ///
     /// # Examples
     ///
-    /// Basic usage:
-    ///
     /// ```no_run
     /// use std::process::{Command, Stdio};
     ///
@@ -971,8 +977,6 @@ impl Command {
     /// [`output`]: Self::output
     ///
     /// # Examples
-    ///
-    /// Basic usage:
     ///
     /// ```no_run
     /// use std::process::{Command, Stdio};
@@ -1001,8 +1005,6 @@ impl Command {
     ///
     /// # Examples
     ///
-    /// Basic usage:
-    ///
     /// ```no_run
     /// use std::process::{Command, Stdio};
     ///
@@ -1022,8 +1024,6 @@ impl Command {
     /// By default, stdin, stdout and stderr are inherited from the parent.
     ///
     /// # Examples
-    ///
-    /// Basic usage:
     ///
     /// ```no_run
     /// use std::process::Command;
@@ -1918,10 +1918,14 @@ impl crate::error::Error for ExitStatusError {}
 /// to its parent under normal termination.
 ///
 /// `ExitCode` is intended to be consumed only by the standard library (via
-/// [`Termination::report()`]), and intentionally does not provide accessors like
-/// `PartialEq`, `Eq`, or `Hash`. Instead the standard library provides the
-/// canonical `SUCCESS` and `FAILURE` exit codes as well as `From<u8> for
-/// ExitCode` for constructing other arbitrary exit codes.
+/// [`Termination::report()`]). For forwards compatibility with potentially
+/// unusual targets, this type currently does not provide `Eq`, `Hash`, or
+/// access to the raw value. This type does provide `PartialEq` for
+/// comparison, but note that there may potentially be multiple failure
+/// codes, some of which will _not_ compare equal to `ExitCode::FAILURE`.
+/// The standard library provides the canonical `SUCCESS` and `FAILURE`
+/// exit codes as well as `From<u8> for ExitCode` for constructing other
+/// arbitrary exit codes.
 ///
 /// # Portability
 ///
@@ -1960,7 +1964,7 @@ impl crate::error::Error for ExitStatusError {}
 ///     ExitCode::SUCCESS
 /// }
 /// ```
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 #[stable(feature = "process_exitcode", since = "1.61.0")]
 pub struct ExitCode(imp::ExitCode);
 
@@ -2037,7 +2041,7 @@ impl ExitCode {
     // representation of an ExitCode
     //
     // More info: https://internals.rust-lang.org/t/mini-pre-rfc-redesigning-process-exitstatus/5426
-    /// Convert an `ExitCode` into an i32
+    /// Converts an `ExitCode` into an i32
     #[unstable(
         feature = "process_exitcode_internals",
         reason = "exposed only for libstd",
@@ -2060,7 +2064,7 @@ impl Default for ExitCode {
 
 #[stable(feature = "process_exitcode", since = "1.61.0")]
 impl From<u8> for ExitCode {
-    /// Construct an `ExitCode` from an arbitrary u8 value.
+    /// Constructs an `ExitCode` from an arbitrary u8 value.
     fn from(code: u8) -> Self {
         ExitCode(imp::ExitCode::from(code))
     }
@@ -2089,8 +2093,6 @@ impl Child {
     ///
     /// # Examples
     ///
-    /// Basic usage:
-    ///
     /// ```no_run
     /// use std::process::Command;
     ///
@@ -2112,8 +2114,6 @@ impl Child {
     /// Returns the OS-assigned process identifier associated with this child.
     ///
     /// # Examples
-    ///
-    /// Basic usage:
     ///
     /// ```no_run
     /// use std::process::Command;
@@ -2141,8 +2141,6 @@ impl Child {
     /// the parent waits for the child to exit.
     ///
     /// # Examples
-    ///
-    /// Basic usage:
     ///
     /// ```no_run
     /// use std::process::Command;
@@ -2177,8 +2175,6 @@ impl Child {
     /// Note that unlike `wait`, this function will not attempt to drop stdin.
     ///
     /// # Examples
-    ///
-    /// Basic usage:
     ///
     /// ```no_run
     /// use std::process::Command;
@@ -2280,6 +2276,15 @@ impl Child {
 /// }
 /// ```
 ///
+/// In its current implementation, this function will execute exit handlers registered with `atexit`
+/// as well as other platform-specific exit handlers (e.g. `fini` sections of ELF shared objects).
+/// This means that Rust requires that all exit handlers are safe to execute at any time. In
+/// particular, if an exit handler cleans up some state that might be concurrently accessed by other
+/// threads, it is required that the exit handler performs suitable synchronization with those
+/// threads. (The alternative to this requirement would be to not run exit handlers at all, which is
+/// considered undesirable. Note that returning from `main` also calls `exit`, so making `exit` an
+/// unsafe operation is not an option.)
+///
 /// ## Platform-specific behavior
 ///
 /// **Unix**: On Unix-like platforms, it is unlikely that all 32 bits of `exit`
@@ -2373,15 +2378,11 @@ pub fn abort() -> ! {
 ///
 /// # Examples
 ///
-/// Basic usage:
-///
 /// ```no_run
 /// use std::process;
 ///
 /// println!("My pid is {}", process::id());
 /// ```
-///
-///
 #[must_use]
 #[stable(feature = "getpid", since = "1.26.0")]
 pub fn id() -> u32 {

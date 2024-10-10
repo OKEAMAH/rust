@@ -26,7 +26,7 @@ time ./miri install
 # We enable all features to make sure the Stacked Borrows consistency check runs.
 echo "Building debug version of Miri"
 export CARGO_EXTRA_FLAGS="$CARGO_EXTRA_FLAGS --all-features"
-time ./miri build --all-targets # the build that all the `./miri test` below will use
+time ./miri build # the build that all the `./miri test` below will use
 
 endgroup
 
@@ -41,9 +41,11 @@ function run_tests {
   if [ -n "${TEST_TARGET-}" ]; then
     begingroup "Testing foreign architecture $TEST_TARGET"
     TARGET_FLAG="--target $TEST_TARGET"
+    MULTI_TARGET_FLAG=""
   else
     begingroup "Testing host architecture"
     TARGET_FLAG=""
+    MULTI_TARGET_FLAG="--multi-target"
   fi
 
   ## ui test suite
@@ -64,7 +66,7 @@ function run_tests {
     time MIRIFLAGS="${MIRIFLAGS-} -O -Zmir-opt-level=4 -Cdebug-assertions=yes" MIRI_SKIP_UI_CHECKS=1 ./miri test $TARGET_FLAG tests/{pass,panic}
   fi
   if [ -n "${MANY_SEEDS-}" ]; then
-    # Also run some many-seeds tests.
+    # Also run some many-seeds tests. (Also tests `./miri run`.)
     time for FILE in tests/many-seeds/*.rs; do
       ./miri run "--many-seeds=0..$MANY_SEEDS" $TARGET_FLAG "$FILE"
     done
@@ -73,6 +75,8 @@ function run_tests {
     # Check that the benchmarks build and run, but only once.
     time HYPERFINE="hyperfine -w0 -r1" ./miri bench $TARGET_FLAG
   fi
+  # Smoke-test `./miri run --dep`.
+  ./miri run $TARGET_FLAG --dep tests/pass-dep/getrandom.rs
 
   ## test-cargo-miri
   # On Windows, there is always "python", not "python3" or "python2".
@@ -93,7 +97,7 @@ function run_tests {
     echo 'build.rustc-wrapper = "thisdoesnotexist"' > .cargo/config.toml
   fi
   # Run the actual test
-  time ${PYTHON} test-cargo-miri/run-test.py $TARGET_FLAG
+  time ${PYTHON} test-cargo-miri/run-test.py $TARGET_FLAG $MULTI_TARGET_FLAG
   # Clean up
   unset RUSTC MIRI
   rm -rf .cargo
@@ -135,7 +139,7 @@ case $HOST_TARGET in
     MANY_SEEDS=16 TEST_TARGET=x86_64-pc-windows-gnu run_tests
     ;;
   aarch64-apple-darwin)
-    # Host (tier 2)
+    # Host
     GC_STRESS=1 MIR_OPT=1 MANY_SEEDS=64 TEST_BENCH=1 CARGO_MIRI_ENV=1 run_tests
     # Extra tier 1
     MANY_SEEDS=64 TEST_TARGET=i686-pc-windows-gnu run_tests
@@ -144,18 +148,18 @@ case $HOST_TARGET in
     TEST_TARGET=arm-unknown-linux-gnueabi run_tests
     TEST_TARGET=s390x-unknown-linux-gnu run_tests # big-endian architecture of choice
     # Partially supported targets (tier 2)
-    BASIC="empty_main integer vec string btreemap hello hashmap heap_alloc align" # ensures we have the basics: stdout/stderr, system allocator, randomness (for HashMap initialization)
-    UNIX="panic/panic panic/unwind concurrency/simple atomic libc-mem libc-misc libc-random env num_cpus" # the things that are very similar across all Unixes, and hence easily supported there
-    TEST_TARGET=x86_64-unknown-freebsd run_tests_minimal $BASIC $UNIX threadname libc-time fs
-    TEST_TARGET=i686-unknown-freebsd   run_tests_minimal $BASIC $UNIX threadname libc-time fs
-    TEST_TARGET=x86_64-unknown-illumos run_tests_minimal $BASIC $UNIX pthread-sync
-    TEST_TARGET=x86_64-pc-solaris      run_tests_minimal $BASIC $UNIX pthread-sync
-    TEST_TARGET=aarch64-linux-android  run_tests_minimal $BASIC $UNIX
-    TEST_TARGET=wasm32-wasip2          run_tests_minimal empty_main wasm heap_alloc libc-mem
-    TEST_TARGET=wasm32-unknown-unknown run_tests_minimal empty_main wasm
+    BASIC="empty_main integer heap_alloc libc-mem vec string btreemap" # ensures we have the basics: pre-main code, system allocator
+    UNIX="hello panic/panic panic/unwind concurrency/simple atomic libc-mem libc-misc libc-random env num_cpus" # the things that are very similar across all Unixes, and hence easily supported there
+    TEST_TARGET=x86_64-unknown-freebsd run_tests_minimal $BASIC $UNIX time hashmap random threadname pthread fs
+    TEST_TARGET=i686-unknown-freebsd   run_tests_minimal $BASIC $UNIX time hashmap random threadname pthread fs
+    TEST_TARGET=x86_64-unknown-illumos run_tests_minimal $BASIC $UNIX time hashmap random thread sync available-parallelism tls
+    TEST_TARGET=x86_64-pc-solaris      run_tests_minimal $BASIC $UNIX time hashmap random thread sync available-parallelism tls
+    TEST_TARGET=aarch64-linux-android  run_tests_minimal $BASIC $UNIX time hashmap pthread --skip threadname
+    TEST_TARGET=wasm32-wasip2          run_tests_minimal $BASIC wasm
+    TEST_TARGET=wasm32-unknown-unknown run_tests_minimal no_std empty_main wasm # this target doesn't really have std
     TEST_TARGET=thumbv7em-none-eabihf  run_tests_minimal no_std
     # Custom target JSON file
-    TEST_TARGET=tests/avr.json MIRI_NO_STD=1 run_tests_minimal no_std
+    TEST_TARGET=tests/x86_64-unknown-kernel.json MIRI_NO_STD=1 run_tests_minimal no_std
     ;;
   i686-pc-windows-msvc)
     # Host

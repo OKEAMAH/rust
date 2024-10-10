@@ -4,7 +4,7 @@
 //! Expansion, and Definition Contexts,” *Journal of Functional Programming* 22, no. 2
 //! (March 1, 2012): 181–216, <https://doi.org/10.1017/S0956796812000093>.
 //!
-//! Also see https://rustc-dev-guide.rust-lang.org/macro-expansion.html#hygiene-and-hierarchies
+//! Also see <https://rustc-dev-guide.rust-lang.org/macro-expansion.html#hygiene-and-hierarchies>
 //!
 //! # The Expansion Order Hierarchy
 //!
@@ -79,6 +79,10 @@ impl SyntaxContextId {
 #[derive(Copy, Clone, Hash, PartialEq, Eq)]
 pub struct SyntaxContextData {
     /// Invariant: Only [`SyntaxContextId::ROOT`] has a [`None`] outer expansion.
+    // FIXME: The None case needs to encode the context crate id. We can encode that as the MSB of
+    // MacroCallId is reserved anyways so we can do bit tagging here just fine.
+    // The bigger issue is that this will cause interning to now create completely separate chains
+    // per crate. Though that is likely not a problem as `MacroCallId`s are already crate calling dependent.
     pub outer_expn: Option<MacroCallId>,
     pub outer_transparency: Transparency,
     pub parent: SyntaxContextId,
@@ -137,4 +141,13 @@ pub enum Transparency {
     /// Identifier produced by an opaque expansion is always resolved at definition-site.
     /// Def-site spans in procedural macros, identifiers from `macro` by default use this.
     Opaque,
+}
+
+impl Transparency {
+    /// Returns `true` if the transparency is [`Opaque`].
+    ///
+    /// [`Opaque`]: Transparency::Opaque
+    pub fn is_opaque(&self) -> bool {
+        matches!(self, Self::Opaque)
+    }
 }

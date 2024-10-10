@@ -2,29 +2,30 @@
 //! which folds deeply, invoking the underlying
 //! `normalize_canonicalized_projection_ty` query when it encounters projections.
 
-use crate::infer::at::At;
-use crate::infer::canonical::OriginalQueryValues;
-use crate::infer::{InferCtxt, InferOk};
-use crate::traits::error_reporting::OverflowCause;
-use crate::traits::error_reporting::TypeErrCtxtExt;
-use crate::traits::normalize::needs_normalization;
-use crate::traits::{BoundVarReplacer, PlaceholderReplacer};
-use crate::traits::{ObligationCause, PredicateObligation, Reveal};
 use rustc_data_structures::sso::SsoHashMap;
 use rustc_data_structures::stack::ensure_sufficient_stack;
-use rustc_infer::traits::Normalized;
 use rustc_macros::extension;
+pub use rustc_middle::traits::query::NormalizationResult;
 use rustc_middle::ty::fold::{FallibleTypeFolder, TypeFoldable, TypeSuperFoldable};
 use rustc_middle::ty::visit::{TypeSuperVisitable, TypeVisitable, TypeVisitableExt};
 use rustc_middle::ty::{self, Ty, TyCtxt, TypeVisitor};
 use rustc_span::DUMMY_SP;
+use tracing::{debug, info, instrument};
 
 use super::NoSolution;
-
-pub use rustc_middle::traits::query::NormalizationResult;
+use crate::error_reporting::InferCtxtErrorExt;
+use crate::error_reporting::traits::OverflowCause;
+use crate::infer::at::At;
+use crate::infer::canonical::OriginalQueryValues;
+use crate::infer::{InferCtxt, InferOk};
+use crate::traits::normalize::needs_normalization;
+use crate::traits::{
+    BoundVarReplacer, Normalized, ObligationCause, PlaceholderReplacer, PredicateObligation,
+    Reveal, ScrubbedTraitError,
+};
 
 #[extension(pub trait QueryNormalizeExt<'tcx>)]
-impl<'cx, 'tcx> At<'cx, 'tcx> {
+impl<'a, 'tcx> At<'a, 'tcx> {
     /// Normalize `value` in the context of the inference context,
     /// yielding a resulting type, or an error if `value` cannot be
     /// normalized. If you don't care about regions, you should prefer
@@ -76,7 +77,9 @@ impl<'cx, 'tcx> At<'cx, 'tcx> {
         };
 
         if self.infcx.next_trait_solver() {
-            match crate::solve::deeply_normalize_with_skipped_universes(self, value, universes) {
+            match crate::solve::deeply_normalize_with_skipped_universes::<_, ScrubbedTraitError<'tcx>>(
+                self, value, universes,
+            ) {
                 Ok(value) => return Ok(Normalized { value, obligations: vec![] }),
                 Err(_errors) => {
                     return Err(NoSolution);
@@ -157,9 +160,9 @@ impl<'tcx> TypeVisitor<TyCtxt<'tcx>> for MaxEscapingBoundVarVisitor {
     }
 }
 
-struct QueryNormalizer<'cx, 'tcx> {
-    infcx: &'cx InferCtxt<'tcx>,
-    cause: &'cx ObligationCause<'tcx>,
+struct QueryNormalizer<'a, 'tcx> {
+    infcx: &'a InferCtxt<'tcx>,
+    cause: &'a ObligationCause<'tcx>,
     param_env: ty::ParamEnv<'tcx>,
     obligations: Vec<PredicateObligation<'tcx>>,
     cache: SsoHashMap<Ty<'tcx>, Ty<'tcx>>,
@@ -167,10 +170,10 @@ struct QueryNormalizer<'cx, 'tcx> {
     universes: Vec<Option<ty::UniverseIndex>>,
 }
 
-impl<'cx, 'tcx> FallibleTypeFolder<TyCtxt<'tcx>> for QueryNormalizer<'cx, 'tcx> {
+impl<'a, 'tcx> FallibleTypeFolder<TyCtxt<'tcx>> for QueryNormalizer<'a, 'tcx> {
     type Error = NoSolution;
 
-    fn interner(&self) -> TyCtxt<'tcx> {
+    fn cx(&self) -> TyCtxt<'tcx> {
         self.infcx.tcx
     }
 
@@ -215,7 +218,7 @@ impl<'cx, 'tcx> FallibleTypeFolder<TyCtxt<'tcx>> for QueryNormalizer<'cx, 'tcx> 
 
                     Reveal::All => {
                         let args = data.args.try_fold_with(self)?;
-                        let recursion_limit = self.interner().recursion_limit();
+                        let recursion_limit = self.cx().recursion_limit();
 
                         if !recursion_limit.value_within_limit(self.anon_depth) {
                             let guar = self
@@ -227,15 +230,15 @@ impl<'cx, 'tcx> FallibleTypeFolder<TyCtxt<'tcx>> for QueryNormalizer<'cx, 'tcx> 
                                     true,
                                 )
                                 .delay_as_bug();
-                            return Ok(Ty::new_error(self.interner(), guar));
+                            return Ok(Ty::new_error(self.cx(), guar));
                         }
 
-                        let generic_ty = self.interner().type_of(data.def_id);
-                        let mut concrete_ty = generic_ty.instantiate(self.interner(), args);
+                        let generic_ty = self.cx().type_of(data.def_id);
+                        let mut concrete_ty = generic_ty.instantiate(self.cx(), args);
                         self.anon_depth += 1;
                         if concrete_ty == ty {
                             concrete_ty = Ty::new_error_with_message(
-                                self.interner(),
+                                self.cx(),
                                 DUMMY_SP,
                                 "recursive opaque type",
                             );
@@ -331,14 +334,14 @@ impl<'cx, 'tcx> FallibleTypeFolder<TyCtxt<'tcx>> for QueryNormalizer<'cx, 'tcx> 
             return Ok(constant);
         }
 
-        let constant = constant.try_super_fold_with(self)?;
-        debug!(?constant, ?self.param_env);
-        Ok(crate::traits::with_replaced_escaping_bound_vars(
+        let constant = crate::traits::with_replaced_escaping_bound_vars(
             self.infcx,
             &mut self.universes,
             constant,
             |constant| constant.normalize(self.infcx.tcx, self.param_env),
-        ))
+        );
+        debug!(?constant, ?self.param_env);
+        constant.try_super_fold_with(self)
     }
 
     #[inline]

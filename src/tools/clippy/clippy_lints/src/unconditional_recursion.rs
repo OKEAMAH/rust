@@ -5,7 +5,7 @@ use rustc_data_structures::fx::FxHashMap;
 use rustc_hir as hir;
 use rustc_hir::def::{DefKind, Res};
 use rustc_hir::def_id::{DefId, LocalDefId};
-use rustc_hir::intravisit::{walk_body, walk_expr, FnKind, Visitor};
+use rustc_hir::intravisit::{FnKind, Visitor, walk_body, walk_expr};
 use rustc_hir::{Body, Expr, ExprKind, FnDecl, HirId, Item, ItemKind, Node, QPath, TyKind};
 use rustc_hir_analysis::lower_ty;
 use rustc_lint::{LateContext, LateLintPass};
@@ -13,9 +13,10 @@ use rustc_middle::hir::map::Map;
 use rustc_middle::hir::nested_filter;
 use rustc_middle::ty::{self, AssocKind, Ty, TyCtxt};
 use rustc_session::impl_lint_pass;
-use rustc_span::symbol::{kw, Ident};
-use rustc_span::{sym, Span};
-use rustc_trait_selection::traits::error_reporting::suggestions::ReturnsVisitor;
+use rustc_span::symbol::{Ident, kw};
+use rustc_span::{Span, sym};
+use rustc_trait_selection::error_reporting::traits::suggestions::ReturnsVisitor;
+use std::ops::ControlFlow;
 
 declare_clippy_lint! {
     /// ### What it does
@@ -256,13 +257,10 @@ fn is_default_method_on_current_ty<'tcx>(tcx: TyCtxt<'tcx>, qpath: QPath<'tcx>, 
             }
             if matches!(
                 ty.kind,
-                TyKind::Path(QPath::Resolved(
-                    _,
-                    hir::Path {
-                        res: Res::SelfTyAlias { .. },
-                        ..
-                    },
-                ))
+                TyKind::Path(QPath::Resolved(_, hir::Path {
+                    res: Res::SelfTyAlias { .. },
+                    ..
+                },))
             ) {
                 return true;
             }
@@ -276,7 +274,6 @@ struct CheckCalls<'a, 'tcx> {
     cx: &'a LateContext<'tcx>,
     map: Map<'tcx>,
     implemented_ty_id: DefId,
-    found_default_call: bool,
     method_span: Span,
 }
 
@@ -285,16 +282,14 @@ where
     'tcx: 'a,
 {
     type NestedFilter = nested_filter::OnlyBodies;
+    type Result = ControlFlow<()>;
 
     fn nested_visit_map(&mut self) -> Self::Map {
         self.map
     }
 
-    fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
-        if self.found_default_call {
-            return;
-        }
-        walk_expr(self, expr);
+    fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) -> ControlFlow<()> {
+        walk_expr(self, expr)?;
 
         if let ExprKind::Call(f, _) = expr.kind
             && let ExprKind::Path(qpath) = f.kind
@@ -303,9 +298,10 @@ where
             && let Some(trait_def_id) = self.cx.tcx.trait_of_item(method_def_id)
             && self.cx.tcx.is_diagnostic_item(sym::Default, trait_def_id)
         {
-            self.found_default_call = true;
             span_error(self.cx, self.method_span, expr);
+            return ControlFlow::Break(());
         }
+        ControlFlow::Continue(())
     }
 }
 
@@ -336,7 +332,7 @@ impl UnconditionalRecursion {
                         // We need to use typeck here to infer the actual function being called.
                         && let body_def_id = cx.tcx.hir().enclosing_body_owner(call_expr.hir_id)
                         && let Some(body_owner) = cx.tcx.hir().maybe_body_owned_by(body_def_id)
-                        && let typeck = cx.tcx.typeck_body(body_owner)
+                        && let typeck = cx.tcx.typeck_body(body_owner.id())
                         && let Some(call_def_id) = typeck.type_dependent_def_id(call_expr.hir_id)
                     {
                         self.default_impl_for_type.insert(self_def_id, call_def_id);
@@ -383,7 +379,6 @@ impl UnconditionalRecursion {
                 cx,
                 map: cx.tcx.hir(),
                 implemented_ty_id,
-                found_default_call: false,
                 method_span,
             };
             walk_body(&mut c, body);

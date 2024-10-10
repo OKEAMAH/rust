@@ -1,4 +1,4 @@
-use crate::visitors::{for_each_expr, for_each_expr_with_closures, Descend, Visitable};
+use crate::visitors::{Descend, Visitable, for_each_expr, for_each_expr_without_closures};
 use crate::{self as utils, get_enclosing_loop_or_multi_call_closure};
 use core::ops::ControlFlow;
 use hir::def::Res;
@@ -46,8 +46,8 @@ struct MutVarsDelegate {
     skip: bool,
 }
 
-impl<'tcx> MutVarsDelegate {
-    fn update(&mut self, cat: &PlaceWithHirId<'tcx>) {
+impl MutVarsDelegate {
+    fn update(&mut self, cat: &PlaceWithHirId<'_>) {
         match cat.place.base {
             PlaceBase::Local(id) => {
                 self.used_mutably.insert(id);
@@ -122,7 +122,7 @@ impl<'a, 'tcx> BindingUsageFinder<'a, 'tcx> {
         finder.usage_found
     }
 }
-impl<'a, 'tcx> Visitor<'tcx> for BindingUsageFinder<'a, 'tcx> {
+impl<'tcx> Visitor<'tcx> for BindingUsageFinder<'_, 'tcx> {
     type NestedFilter = nested_filter::OnlyBodies;
 
     fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
@@ -145,7 +145,7 @@ impl<'a, 'tcx> Visitor<'tcx> for BindingUsageFinder<'a, 'tcx> {
 }
 
 pub fn contains_return_break_continue_macro(expression: &Expr<'_>) -> bool {
-    for_each_expr(expression, |e| {
+    for_each_expr_without_closures(expression, |e| {
         match e.kind {
             ExprKind::Ret(..) | ExprKind::Break(..) | ExprKind::Continue(..) => ControlFlow::Break(()),
             // Something special could be done here to handle while or for loop
@@ -159,7 +159,7 @@ pub fn contains_return_break_continue_macro(expression: &Expr<'_>) -> bool {
 }
 
 pub fn local_used_in<'tcx>(cx: &LateContext<'tcx>, local_id: HirId, v: impl Visitable<'tcx>) -> bool {
-    for_each_expr_with_closures(cx, v, |e| {
+    for_each_expr(cx, v, |e| {
         if utils::path_to_local_id(e, local_id) {
             ControlFlow::Break(())
         } else {
@@ -184,7 +184,7 @@ pub fn local_used_after_expr(cx: &LateContext<'_>, local_id: HirId, after: &Expr
     let loop_start = get_enclosing_loop_or_multi_call_closure(cx, after).map(|e| e.hir_id);
 
     let mut past_expr = false;
-    for_each_expr_with_closures(cx, block, |e| {
+    for_each_expr(cx, block, |e| {
         if past_expr {
             if utils::path_to_local_id(e, local_id) {
                 ControlFlow::Break(())

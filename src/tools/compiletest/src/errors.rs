@@ -1,15 +1,15 @@
-use self::WhichLine::*;
-
 use std::fmt;
 use std::fs::File;
-use std::io::prelude::*;
 use std::io::BufReader;
+use std::io::prelude::*;
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::OnceLock;
 
 use regex::Regex;
 use tracing::*;
+
+use self::WhichLine::*;
 
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum ErrorKind {
@@ -55,6 +55,18 @@ pub struct Error {
     /// `None` if not specified or unknown message kind.
     pub kind: Option<ErrorKind>,
     pub msg: String,
+}
+
+impl Error {
+    pub fn render_for_expected(&self) -> String {
+        use colored::Colorize;
+        format!(
+            "{: <10}line {: >3}: {}",
+            self.kind.map(|kind| kind.to_string()).unwrap_or_default().to_uppercase(),
+            self.line_num,
+            self.msg.cyan(),
+        )
+    }
 }
 
 #[derive(PartialEq, Debug)]

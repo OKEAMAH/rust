@@ -1,7 +1,8 @@
-use crate::lints::UnitBindingsDiag;
-use crate::{LateLintPass, LintContext};
 use rustc_hir as hir;
 use rustc_session::{declare_lint, declare_lint_pass};
+
+use crate::lints::UnitBindingsDiag;
+use crate::{LateLintPass, LintContext};
 
 declare_lint! {
     /// The `unit_bindings` lint detects cases where bindings are useless because they have
@@ -62,11 +63,9 @@ impl<'tcx> LateLintPass<'tcx> for UnitBindings {
             && !matches!(init.kind, hir::ExprKind::Tup([]))
             && !matches!(local.pat.kind, hir::PatKind::Tuple([], ..))
         {
-            cx.emit_span_lint(
-                UNIT_BINDINGS,
-                local.span,
-                UnitBindingsDiag { label: local.pat.span },
-            );
+            cx.emit_span_lint(UNIT_BINDINGS, local.span, UnitBindingsDiag {
+                label: local.pat.span,
+            });
         }
     }
 }

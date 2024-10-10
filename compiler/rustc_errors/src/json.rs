@@ -9,30 +9,33 @@
 
 // FIXME: spec the JSON output properly.
 
-use crate::emitter::{
-    should_show_source_code, ColorConfig, Destination, Emitter, HumanEmitter,
-    HumanReadableErrorType,
-};
-use crate::registry::Registry;
-use crate::translation::{to_fluent_args, Translate};
-use crate::{
-    diagnostic::IsLint, CodeSuggestion, FluentBundle, LazyFallbackBundle, MultiSpan, SpanLabel,
-    Subdiag, TerminalUrl,
-};
-use derive_setters::Setters;
-use rustc_data_structures::sync::{IntoDynSyncSend, Lrc};
-use rustc_error_messages::FluentArgs;
-use rustc_lint_defs::Applicability;
-use rustc_span::hygiene::ExpnData;
-use rustc_span::source_map::SourceMap;
-use rustc_span::Span;
-use serde::Serialize;
 use std::error::Report;
 use std::io::{self, Write};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::vec;
+
+use derive_setters::Setters;
+use rustc_data_structures::sync::{IntoDynSyncSend, Lrc};
+use rustc_error_messages::FluentArgs;
+use rustc_lint_defs::Applicability;
+use rustc_span::Span;
+use rustc_span::hygiene::ExpnData;
+use rustc_span::source_map::SourceMap;
+use serde::Serialize;
 use termcolor::{ColorSpec, WriteColor};
+
+use crate::diagnostic::IsLint;
+use crate::emitter::{
+    ColorConfig, Destination, Emitter, HumanEmitter, HumanReadableErrorType,
+    should_show_source_code,
+};
+use crate::registry::Registry;
+use crate::translation::{Translate, to_fluent_args};
+use crate::{
+    CodeSuggestion, FluentBundle, LazyFallbackBundle, MultiSpan, SpanLabel, Subdiag, Suggestions,
+    TerminalUrl,
+};
 
 #[cfg(test)]
 mod tests;
@@ -53,6 +56,7 @@ pub struct JsonEmitter {
     ignored_directories_in_source_blocks: Vec<String>,
     #[setters(skip)]
     json_rendered: HumanReadableErrorType,
+    color_config: ColorConfig,
     diagnostic_width: Option<usize>,
     macro_backtrace: bool,
     track_diagnostics: bool,
@@ -66,6 +70,7 @@ impl JsonEmitter {
         fallback_bundle: LazyFallbackBundle,
         pretty: bool,
         json_rendered: HumanReadableErrorType,
+        color_config: ColorConfig,
     ) -> JsonEmitter {
         JsonEmitter {
             dst: IntoDynSyncSend(dst),
@@ -77,6 +82,7 @@ impl JsonEmitter {
             ui_testing: false,
             ignored_directories_in_source_blocks: Vec::new(),
             json_rendered,
+            color_config,
             diagnostic_width: None,
             macro_backtrace: false,
             track_diagnostics: false,
@@ -105,8 +111,8 @@ enum EmitTyped<'a> {
 }
 
 impl Translate for JsonEmitter {
-    fn fluent_bundle(&self) -> Option<&Lrc<FluentBundle>> {
-        self.fluent_bundle.as_ref()
+    fn fluent_bundle(&self) -> Option<&FluentBundle> {
+        self.fluent_bundle.as_deref()
     }
 
     fn fallback_fluent_bundle(&self) -> &FluentBundle {
@@ -135,7 +141,12 @@ impl Emitter for JsonEmitter {
         let data: Vec<FutureBreakageItem<'_>> = diags
             .into_iter()
             .map(|mut diag| {
-                if diag.level == crate::Level::Allow {
+                // Allowed or expected lints don't normally (by definition) emit a lint
+                // but future incompat lints are special and are emitted anyway.
+                //
+                // So to avoid ICEs and confused users we "upgrade" the lint level for
+                // those `FutureBreakageItem` to warn.
+                if matches!(diag.level, crate::Level::Allow | crate::Level::Expect(..)) {
                     diag.level = crate::Level::Warning;
                 }
                 FutureBreakageItem {
@@ -161,12 +172,12 @@ impl Emitter for JsonEmitter {
         }
     }
 
-    fn source_map(&self) -> Option<&Lrc<SourceMap>> {
+    fn source_map(&self) -> Option<&SourceMap> {
         Some(&self.sm)
     }
 
     fn should_show_explain(&self) -> bool {
-        !matches!(self.json_rendered, HumanReadableErrorType::Short(_))
+        !self.json_rendered.short()
     }
 }
 
@@ -282,7 +293,7 @@ impl Diagnostic {
     /// Converts from `rustc_errors::DiagInner` to `Diagnostic`.
     fn from_errors_diagnostic(diag: crate::DiagInner, je: &JsonEmitter) -> Diagnostic {
         let args = to_fluent_args(diag.args.iter());
-        let sugg = diag.suggestions.iter().flatten().map(|sugg| {
+        let sugg_to_diag = |sugg: &CodeSuggestion| {
             let translated_message =
                 je.translate_message(&sugg.msg, &args).map_err(Report::new).unwrap();
             Diagnostic {
@@ -293,7 +304,12 @@ impl Diagnostic {
                 children: vec![],
                 rendered: None,
             }
-        });
+        };
+        let sugg = match &diag.suggestions {
+            Suggestions::Enabled(suggestions) => suggestions.iter().map(sugg_to_diag),
+            Suggestions::Sealed(suggestions) => suggestions.iter().map(sugg_to_diag),
+            Suggestions::Disabled => [].iter().map(sugg_to_diag),
+        };
 
         // generate regular command line output and store it in the json
 
@@ -346,8 +362,8 @@ impl Diagnostic {
 
         let buf = BufWriter::default();
         let mut dst: Destination = Box::new(buf.clone());
-        let (short, color_config) = je.json_rendered.unzip();
-        match color_config {
+        let short = je.json_rendered.short();
+        match je.color_config {
             ColorConfig::Always | ColorConfig::Auto => dst = Box::new(termcolor::Ansi::new(dst)),
             ColorConfig::Never => {}
         }

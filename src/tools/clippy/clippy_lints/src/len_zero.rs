@@ -1,7 +1,7 @@
 use clippy_utils::diagnostics::{span_lint, span_lint_and_sugg, span_lint_and_then};
-use clippy_utils::source::{snippet_opt, snippet_with_context};
-use clippy_utils::sugg::{has_enclosing_paren, Sugg};
-use clippy_utils::{get_item_name, get_parent_as_impl, is_lint_allowed, peel_ref_operators};
+use clippy_utils::source::{SpanRangeExt, snippet_with_context};
+use clippy_utils::sugg::{Sugg, has_enclosing_paren};
+use clippy_utils::{get_item_name, get_parent_as_impl, is_lint_allowed, is_trait_method, peel_ref_operators};
 use rustc_ast::ast::LitKind;
 use rustc_errors::Applicability;
 use rustc_hir::def::Res;
@@ -9,7 +9,7 @@ use rustc_hir::def_id::{DefId, DefIdSet};
 use rustc_hir::{
     AssocItemKind, BinOpKind, Expr, ExprKind, FnRetTy, GenericArg, GenericBound, ImplItem, ImplItemKind,
     ImplicitSelfKind, Item, ItemKind, Mutability, Node, OpaqueTyOrigin, PatKind, PathSegment, PrimTy, QPath,
-    TraitItemRef, TyKind, TypeBindingKind,
+    TraitItemRef, TyKind,
 };
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_middle::ty::{self, AssocKind, FnSig, Ty};
@@ -121,11 +121,9 @@ declare_lint_pass!(LenZero => [LEN_ZERO, LEN_WITHOUT_IS_EMPTY, COMPARISON_TO_EMP
 
 impl<'tcx> LateLintPass<'tcx> for LenZero {
     fn check_item(&mut self, cx: &LateContext<'tcx>, item: &'tcx Item<'_>) {
-        if item.span.from_expansion() {
-            return;
-        }
-
-        if let ItemKind::Trait(_, _, _, _, trait_items) = item.kind {
+        if let ItemKind::Trait(_, _, _, _, trait_items) = item.kind
+            && !item.span.from_expansion()
+        {
             check_trait_items(cx, item, trait_items);
         }
     }
@@ -162,17 +160,14 @@ impl<'tcx> LateLintPass<'tcx> for LenZero {
     }
 
     fn check_expr(&mut self, cx: &LateContext<'tcx>, expr: &'tcx Expr<'_>) {
-        if expr.span.from_expansion() {
-            return;
-        }
-
         if let ExprKind::Let(lt) = expr.kind
-            && has_is_empty(cx, lt.init)
             && match lt.pat.kind {
                 PatKind::Slice([], None, []) => true,
                 PatKind::Lit(lit) if is_empty_string(lit) => true,
                 _ => false,
             }
+            && !expr.span.from_expansion()
+            && has_is_empty(cx, lt.init)
         {
             let mut applicability = Applicability::MachineApplicable;
 
@@ -190,7 +185,22 @@ impl<'tcx> LateLintPass<'tcx> for LenZero {
             );
         }
 
-        if let ExprKind::Binary(Spanned { node: cmp, .. }, left, right) = expr.kind {
+        if let ExprKind::MethodCall(method, lhs_expr, [rhs_expr], _) = expr.kind
+            && is_trait_method(cx, expr, sym::PartialEq)
+            && !expr.span.from_expansion()
+        {
+            check_empty_expr(
+                cx,
+                expr.span,
+                lhs_expr,
+                peel_ref_operators(cx, rhs_expr),
+                (method.ident.name == sym::ne).then_some("!").unwrap_or_default(),
+            );
+        }
+
+        if let ExprKind::Binary(Spanned { node: cmp, .. }, left, right) = expr.kind
+            && !expr.span.from_expansion()
+        {
             // expr.span might contains parenthesis, see issue #10529
             let actual_span = span_without_enclosing_paren(cx, expr.span);
             match cmp {
@@ -219,7 +229,7 @@ impl<'tcx> LateLintPass<'tcx> for LenZero {
 }
 
 fn span_without_enclosing_paren(cx: &LateContext<'_>, span: Span) -> Span {
-    let Some(snippet) = snippet_opt(cx, span) else {
+    let Some(snippet) = span.get_source_text(cx) else {
         return span;
     };
     if has_enclosing_paren(snippet) {
@@ -253,7 +263,7 @@ fn check_trait_items(cx: &LateContext<'_>, visited_trait: &Item<'_>, trait_items
     // fill the set with current and super traits
     fn fill_trait_set(traitt: DefId, set: &mut DefIdSet, cx: &LateContext<'_>) {
         if set.insert(traitt) {
-            for supertrait in rustc_trait_selection::traits::supertrait_def_ids(cx.tcx, traitt) {
+            for supertrait in cx.tcx.supertrait_def_ids(traitt) {
                 fill_trait_set(supertrait, set, cx);
             }
         }
@@ -298,26 +308,17 @@ enum LenOutput {
 
 fn extract_future_output<'tcx>(cx: &LateContext<'tcx>, ty: Ty<'tcx>) -> Option<&'tcx PathSegment<'tcx>> {
     if let ty::Alias(_, alias_ty) = ty.kind()
-        && let Some(Node::Item(item)) = cx.tcx.hir().get_if_local(alias_ty.def_id)
-        && let Item {
-            kind: ItemKind::OpaqueTy(opaque),
-            ..
-        } = item
-        && let OpaqueTyOrigin::AsyncFn(_) = opaque.origin
+        && let Some(Node::OpaqueTy(opaque)) = cx.tcx.hir().get_if_local(alias_ty.def_id)
+        && let OpaqueTyOrigin::AsyncFn { .. } = opaque.origin
         && let [GenericBound::Trait(trait_ref, _)] = &opaque.bounds
         && let Some(segment) = trait_ref.trait_ref.path.segments.last()
         && let Some(generic_args) = segment.args
-        && generic_args.bindings.len() == 1
-        && let TypeBindingKind::Equality {
-            term:
-                rustc_hir::Term::Ty(rustc_hir::Ty {
-                    kind: TyKind::Path(QPath::Resolved(_, path)),
-                    ..
-                }),
-        } = &generic_args.bindings[0].kind
-        && path.segments.len() == 1
+        && let [constraint] = generic_args.constraints
+        && let Some(ty) = constraint.ty()
+        && let TyKind::Path(QPath::Resolved(_, path)) = ty.kind
+        && let [segment] = path.segments
     {
-        return Some(&path.segments[0]);
+        return Some(segment);
     }
 
     None
@@ -455,8 +456,7 @@ fn check_for_is_empty(
     let is_empty = cx
         .tcx
         .inherent_impls(impl_ty)
-        .into_iter()
-        .flatten()
+        .iter()
         .flat_map(|&id| cx.tcx.associated_items(id).filter_by_name_unhygienic(is_empty))
         .find(|item| item.kind == AssocKind::Fn);
 
@@ -624,7 +624,7 @@ fn has_is_empty(cx: &LateContext<'_>, expr: &Expr<'_>) -> bool {
     /// Checks the inherent impl's items for an `is_empty(self)` method.
     fn has_is_empty_impl(cx: &LateContext<'_>, id: DefId) -> bool {
         let is_empty = sym!(is_empty);
-        cx.tcx.inherent_impls(id).into_iter().flatten().any(|imp| {
+        cx.tcx.inherent_impls(id).iter().any(|imp| {
             cx.tcx
                 .associated_items(*imp)
                 .filter_by_name_unhygienic(is_empty)

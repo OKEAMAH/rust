@@ -1,21 +1,21 @@
-use crate::spec::{cvs, Cc, LinkerFlavor, Lld, RelocModel, Target, TargetOptions};
+use crate::spec::{Cc, LinkerFlavor, Lld, RelocModel, Target, TargetOptions, cvs};
 
 // The PSP has custom linker requirements.
 const LINKER_SCRIPT: &str = include_str!("./mipsel_sony_psp_linker_script.ld");
 
-pub fn target() -> Target {
-    let pre_link_args = TargetOptions::link_args(
-        LinkerFlavor::Gnu(Cc::No, Lld::No),
-        &["--emit-relocs", "--nmagic"],
-    );
+pub(crate) fn target() -> Target {
+    let pre_link_args = TargetOptions::link_args(LinkerFlavor::Gnu(Cc::No, Lld::No), &[
+        "--emit-relocs",
+        "--nmagic",
+    ]);
 
     Target {
         llvm_target: "mipsel-sony-psp".into(),
         metadata: crate::spec::TargetMetadata {
-            description: None,
-            tier: None,
-            host_tools: None,
-            std: None,
+            description: Some("MIPS (LE) Sony PlatStation Portable (PSP)".into()),
+            tier: Some(3),
+            host_tools: Some(false),
+            std: Some(false),
         },
         pointer_width: 32,
         data_layout: "e-m:m-p:32:32-i8:8:32-i16:16:32-i64:64-n32-S64".into(),

@@ -1,3 +1,4 @@
+use clippy_config::Conf;
 use clippy_utils::diagnostics::span_lint_and_then;
 use clippy_utils::ty::approx_ty_size;
 use rustc_errors::Applicability;
@@ -47,10 +48,10 @@ pub struct UnnecessaryBoxReturns {
 impl_lint_pass!(UnnecessaryBoxReturns => [UNNECESSARY_BOX_RETURNS]);
 
 impl UnnecessaryBoxReturns {
-    pub fn new(avoid_breaking_exported_api: bool, maximum_size: u64) -> Self {
+    pub fn new(conf: &'static Conf) -> Self {
         Self {
-            avoid_breaking_exported_api,
-            maximum_size,
+            avoid_breaking_exported_api: conf.avoid_breaking_exported_api,
+            maximum_size: conf.unnecessary_box_size,
         }
     }
 
@@ -74,11 +75,9 @@ impl UnnecessaryBoxReturns {
             .instantiate_bound_regions_with_erased(cx.tcx.fn_sig(def_id).skip_binder())
             .output();
 
-        if !return_ty.is_box() {
+        let Some(boxed_ty) = return_ty.boxed_ty() else {
             return;
-        }
-
-        let boxed_ty = return_ty.boxed_ty();
+        };
 
         // It's sometimes useful to return Box<T> if T is unsized, so don't lint those.
         // Also, don't lint if we know that T is very large, in which case returning

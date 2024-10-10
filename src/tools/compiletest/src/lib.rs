@@ -18,41 +18,41 @@ mod read2;
 pub mod runtest;
 pub mod util;
 
-use crate::common::{expected_output_path, output_base_dir, output_relative_path, UI_EXTENSIONS};
-use crate::common::{Config, Debugger, Mode, PassMode, TestPaths};
-use crate::util::logv;
-use build_helper::git::{get_git_modified_files, get_git_untracked_files};
 use core::panic;
-use getopts::Options;
 use std::collections::HashSet;
-use std::ffi::OsString;
-use std::fs;
+use std::ffi::{OsStr, OsString};
 use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, OnceLock};
 use std::time::SystemTime;
-use std::{env, vec};
+use std::{env, fs, vec};
+
+use build_helper::git::{get_git_modified_files, get_git_untracked_files};
+use getopts::Options;
 use test::ColorConfig;
 use tracing::*;
 use walkdir::WalkDir;
 
-use self::header::{make_test_description, EarlyProps};
+use self::header::{EarlyProps, make_test_description};
+use crate::common::{
+    Config, Debugger, Mode, PassMode, TestPaths, UI_EXTENSIONS, expected_output_path,
+    output_base_dir, output_relative_path,
+};
 use crate::header::HeadersCache;
+use crate::util::logv;
 
 pub fn parse_config(args: Vec<String>) -> Config {
     let mut opts = Options::new();
     opts.reqopt("", "compile-lib-path", "path to host shared libraries", "PATH")
         .reqopt("", "run-lib-path", "path to target shared libraries", "PATH")
         .reqopt("", "rustc-path", "path to rustc to use for compiling", "PATH")
+        .optopt("", "cargo-path", "path to cargo to use for compiling", "PATH")
         .optopt("", "rustdoc-path", "path to rustdoc to use for compiling", "PATH")
-        .optopt("", "rust-demangler-path", "path to rust-demangler to use in tests", "PATH")
         .optopt("", "coverage-dump-path", "path to coverage-dump to use in tests", "PATH")
         .reqopt("", "python", "path to python to use for doc tests", "PATH")
         .optopt("", "jsondocck-path", "path to jsondocck to use for doc tests", "PATH")
         .optopt("", "jsondoclint-path", "path to jsondoclint to use for doc tests", "PATH")
-        .optopt("", "valgrind-path", "path to Valgrind executable for Valgrind tests", "PROGRAM")
-        .optflag("", "force-valgrind", "fail if Valgrind tests cannot be run under Valgrind")
         .optopt("", "run-clang-based-tests-with", "path to Clang executable", "PATH")
         .optopt("", "llvm-filecheck", "path to LLVM's FileCheck binary", "DIR")
         .reqopt("", "src-base", "directory to scan for test files", "PATH")
@@ -63,7 +63,7 @@ pub fn parse_config(args: Vec<String>) -> Config {
             "",
             "mode",
             "which sort of compile tests to run",
-            "run-pass-valgrind | pretty | debug-info | codegen | rustdoc \
+            "pretty | debug-info | codegen | rustdoc \
             | rustdoc-json | codegen-units | incremental | run-make | ui \
             | js-doc-test | mir-opt | assembly | crashes",
         )
@@ -81,6 +81,7 @@ pub fn parse_config(args: Vec<String>) -> Config {
         )
         .optopt("", "run", "whether to execute run-* tests", "auto | always | never")
         .optflag("", "ignored", "run tests marked as ignored")
+        .optflag("", "has-enzyme", "run tests that require enzyme")
         .optflag("", "with-debug-assertions", "whether to run tests with `ignore-debug` header")
         .optmulti(
             "",
@@ -98,6 +99,11 @@ pub fn parse_config(args: Vec<String>) -> Config {
         )
         .optmulti("", "host-rustcflags", "flags to pass to rustc for host", "FLAGS")
         .optmulti("", "target-rustcflags", "flags to pass to rustc for target", "FLAGS")
+        .optflag(
+            "",
+            "rust-randomized-layout",
+            "set this when rustc/stdlib were compiled with randomized layouts",
+        )
         .optflag("", "optimize-tests", "run tests with optimizations enabled")
         .optflag("", "verbose", "run tests verbosely, showing all output")
         .optflag(
@@ -147,7 +153,7 @@ pub fn parse_config(args: Vec<String>) -> Config {
         .optflag("", "force-rerun", "rerun tests even if the inputs are unchanged")
         .optflag("", "only-modified", "only run tests that result been modified")
         .optflag("", "nocapture", "")
-        .optflag("", "profiler-support", "is the profiler runtime enabled for this target")
+        .optflag("", "profiler-runtime", "is the profiler runtime enabled for this target")
         .optflag("h", "help", "show this message")
         .reqopt("", "channel", "current Rust channel", "CHANNEL")
         .optflag(
@@ -157,7 +163,13 @@ pub fn parse_config(args: Vec<String>) -> Config {
         )
         .optopt("", "edition", "default Rust edition", "EDITION")
         .reqopt("", "git-repository", "name of the git repository", "ORG/REPO")
-        .reqopt("", "nightly-branch", "name of the git branch for nightly", "BRANCH");
+        .reqopt("", "nightly-branch", "name of the git branch for nightly", "BRANCH")
+        .reqopt(
+            "",
+            "git-merge-commit-email",
+            "email address used for finding merge commits",
+            "EMAIL",
+        );
 
     let (argv0, args_) = args.split_first().unwrap();
     if args.len() == 1 || args[1] == "-h" || args[1] == "--help" {
@@ -193,14 +205,8 @@ pub fn parse_config(args: Vec<String>) -> Config {
     let target = opt_str2(matches.opt_str("target"));
     let android_cross_path = opt_path(matches, "android-cross-path");
     let (cdb, cdb_version) = analyze_cdb(matches.opt_str("cdb"), &target);
-    let (gdb, gdb_version, gdb_native_rust) =
-        analyze_gdb(matches.opt_str("gdb"), &target, &android_cross_path);
-    let (lldb_version, lldb_native_rust) = matches
-        .opt_str("lldb-version")
-        .as_deref()
-        .and_then(extract_lldb_version)
-        .map(|(v, b)| (Some(v), b))
-        .unwrap_or((None, false));
+    let (gdb, gdb_version) = analyze_gdb(matches.opt_str("gdb"), &target, &android_cross_path);
+    let lldb_version = matches.opt_str("lldb-version").as_deref().and_then(extract_lldb_version);
     let color = match matches.opt_str("color").as_deref() {
         Some("auto") | None => ColorConfig::AutoColor,
         Some("always") => ColorConfig::AlwaysColor,
@@ -226,19 +232,41 @@ pub fn parse_config(args: Vec<String>) -> Config {
         // Avoid spawning an external command when we know tidy won't be used.
         false
     };
+    let has_enzyme = matches.opt_present("has-enzyme");
+    let filters = if mode == Mode::RunMake {
+        matches
+            .free
+            .iter()
+            .map(|f| {
+                let path = Path::new(f);
+                let mut iter = path.iter().skip(1);
+
+                // We skip the test folder and check if the user passed `rmake.rs` or `Makefile`.
+                if iter
+                    .next()
+                    .is_some_and(|s| s == OsStr::new("rmake.rs") || s == OsStr::new("Makefile"))
+                    && iter.next().is_none()
+                {
+                    path.parent().unwrap().to_str().unwrap().to_string()
+                } else {
+                    f.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+    } else {
+        matches.free.clone()
+    };
     Config {
         bless: matches.opt_present("bless"),
         compile_lib_path: make_absolute(opt_path(matches, "compile-lib-path")),
         run_lib_path: make_absolute(opt_path(matches, "run-lib-path")),
         rustc_path: opt_path(matches, "rustc-path"),
+        cargo_path: matches.opt_str("cargo-path").map(PathBuf::from),
         rustdoc_path: matches.opt_str("rustdoc-path").map(PathBuf::from),
-        rust_demangler_path: matches.opt_str("rust-demangler-path").map(PathBuf::from),
         coverage_dump_path: matches.opt_str("coverage-dump-path").map(PathBuf::from),
         python: matches.opt_str("python").unwrap(),
         jsondocck_path: matches.opt_str("jsondocck-path"),
         jsondoclint_path: matches.opt_str("jsondoclint-path"),
-        valgrind_path: matches.opt_str("valgrind-path"),
-        force_valgrind: matches.opt_present("force-valgrind"),
         run_clang_based_tests_with: matches.opt_str("run-clang-based-tests-with"),
         llvm_filecheck: matches.opt_str("llvm-filecheck").map(PathBuf::from),
         llvm_bin_dir: matches.opt_str("llvm-bin-dir").map(PathBuf::from),
@@ -251,7 +279,7 @@ pub fn parse_config(args: Vec<String>) -> Config {
         debugger: None,
         run_ignored,
         with_debug_assertions,
-        filters: matches.free.clone(),
+        filters,
         skip: matches.opt_strs("skip"),
         filter_exact: matches.opt_present("exact"),
         force_pass_mode: matches.opt_str("pass").map(|mode| {
@@ -269,15 +297,14 @@ pub fn parse_config(args: Vec<String>) -> Config {
         host_rustcflags: matches.opt_strs("host-rustcflags"),
         target_rustcflags: matches.opt_strs("target-rustcflags"),
         optimize_tests: matches.opt_present("optimize-tests"),
+        rust_randomized_layout: matches.opt_present("rust-randomized-layout"),
         target,
         host: opt_str2(matches.opt_str("host")),
         cdb,
         cdb_version,
         gdb,
         gdb_version,
-        gdb_native_rust,
         lldb_version,
-        lldb_native_rust,
         llvm_version,
         system_llvm: matches.opt_present("system-llvm"),
         android_cross_path,
@@ -302,6 +329,7 @@ pub fn parse_config(args: Vec<String>) -> Config {
             .map(|s| s.parse().expect("invalid --compare-mode provided")),
         rustfix_coverage: matches.opt_present("rustfix-coverage"),
         has_tidy,
+        has_enzyme,
         channel: matches.opt_str("channel").unwrap(),
         git_hash: matches.opt_present("git-hash"),
         edition: matches.opt_str("edition"),
@@ -325,8 +353,9 @@ pub fn parse_config(args: Vec<String>) -> Config {
 
         git_repository: matches.opt_str("git-repository").unwrap(),
         nightly_branch: matches.opt_str("nightly-branch").unwrap(),
+        git_merge_commit_email: matches.opt_str("git-merge-commit-email").unwrap(),
 
-        profiler_support: matches.opt_present("profiler-support"),
+        profiler_runtime: matches.opt_present("profiler-runtime"),
     }
 }
 
@@ -336,8 +365,8 @@ pub fn log_config(config: &Config) {
     logv(c, format!("compile_lib_path: {:?}", config.compile_lib_path));
     logv(c, format!("run_lib_path: {:?}", config.run_lib_path));
     logv(c, format!("rustc_path: {:?}", config.rustc_path.display()));
+    logv(c, format!("cargo_path: {:?}", config.cargo_path));
     logv(c, format!("rustdoc_path: {:?}", config.rustdoc_path));
-    logv(c, format!("rust_demangler_path: {:?}", config.rust_demangler_path));
     logv(c, format!("src_base: {:?}", config.src_base.display()));
     logv(c, format!("build_base: {:?}", config.build_base.display()));
     logv(c, format!("stage_id: {}", config.stage_id));
@@ -620,6 +649,12 @@ fn common_inputs_stamp(config: &Config) -> Stamp {
         stamp.add_path(&rust_src_dir.join("src/etc/htmldocck.py"));
     }
 
+    // Re-run coverage tests if the `coverage-dump` tool was modified,
+    // because its output format might have changed.
+    if let Some(coverage_dump_path) = &config.coverage_dump_path {
+        stamp.add_path(coverage_dump_path)
+    }
+
     stamp.add_dir(&rust_src_dir.join("src/tools/run-make-support"));
 
     // Compiletest itself.
@@ -788,8 +823,12 @@ fn make_test(
                 &config, cache, test_name, &test_path, src_file, revision, poisoned,
             );
             // Ignore tests that already run and are up to date with respect to inputs.
-            if !config.force_rerun {
-                desc.ignore |= is_up_to_date(&config, testpaths, &early_props, revision, inputs);
+            if !config.force_rerun
+                && is_up_to_date(&config, testpaths, &early_props, revision, inputs)
+            {
+                desc.ignore = true;
+                // Keep this in sync with the "up-to-date" message detected by bootstrap.
+                desc.ignore_message = Some("up-to-date");
             }
             test::TestDescAndFn {
                 desc,
@@ -1013,18 +1052,16 @@ fn extract_cdb_version(full_version_line: &str) -> Option<[u16; 4]> {
     Some([major, minor, patch, build])
 }
 
-/// Returns (Path to GDB, GDB Version, GDB has Rust Support)
+/// Returns (Path to GDB, GDB Version)
 fn analyze_gdb(
     gdb: Option<String>,
     target: &str,
     android_cross_path: &PathBuf,
-) -> (Option<String>, Option<u32>, bool) {
+) -> (Option<String>, Option<u32>) {
     #[cfg(not(windows))]
     const GDB_FALLBACK: &str = "gdb";
     #[cfg(windows)]
     const GDB_FALLBACK: &str = "gdb.exe";
-
-    const MIN_GDB_WITH_RUST: u32 = 7011010;
 
     let fallback_gdb = || {
         if is_android_gdb_target(target) {
@@ -1054,12 +1091,10 @@ fn analyze_gdb(
 
     let version = match version_line {
         Some(line) => extract_gdb_version(&line),
-        None => return (None, None, false),
+        None => return (None, None),
     };
 
-    let gdb_native_rust = version.map_or(false, |v| v >= MIN_GDB_WITH_RUST);
-
-    (Some(gdb), version, gdb_native_rust)
+    (Some(gdb), version)
 }
 
 fn extract_gdb_version(full_version_line: &str) -> Option<u32> {
@@ -1109,8 +1144,8 @@ fn extract_gdb_version(full_version_line: &str) -> Option<u32> {
     Some(((major * 1000) + minor) * 1000 + patch)
 }
 
-/// Returns (LLDB version, LLDB is rust-enabled)
-fn extract_lldb_version(full_version_line: &str) -> Option<(u32, bool)> {
+/// Returns LLDB version
+fn extract_lldb_version(full_version_line: &str) -> Option<u32> {
     // Extract the major LLDB version from the given version string.
     // LLDB version strings are different for Apple and non-Apple platforms.
     // The Apple variant looks like this:
@@ -1127,9 +1162,7 @@ fn extract_lldb_version(full_version_line: &str) -> Option<(u32, bool)> {
     // There doesn't seem to be a way to correlate the Apple version
     // with the upstream version, and since the tests were originally
     // written against Apple versions, we make a fake Apple version by
-    // multiplying the first number by 100.  This is a hack, but
-    // normally fine because the only non-Apple version we test is
-    // rust-enabled.
+    // multiplying the first number by 100. This is a hack.
 
     let full_version_line = full_version_line.trim();
 
@@ -1138,19 +1171,19 @@ fn extract_lldb_version(full_version_line: &str) -> Option<(u32, bool)> {
     {
         if let Some(idx) = apple_ver.find(not_a_digit) {
             let version: u32 = apple_ver[..idx].parse().unwrap();
-            return Some((version, full_version_line.contains("rust-enabled")));
+            return Some(version);
         }
     } else if let Some(lldb_ver) = full_version_line.strip_prefix("lldb version ") {
         if let Some(idx) = lldb_ver.find(not_a_digit) {
             let version: u32 = lldb_ver[..idx].parse().ok()?;
-            return Some((version * 100, full_version_line.contains("rust-enabled")));
+            return Some(version * 100);
         }
     }
     None
 }
 
 fn not_a_digit(c: char) -> bool {
-    !c.is_digit(10)
+    !c.is_ascii_digit()
 }
 
 fn check_overlapping_tests(found_paths: &HashSet<PathBuf>) {

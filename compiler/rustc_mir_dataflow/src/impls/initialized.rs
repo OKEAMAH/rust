@@ -1,18 +1,20 @@
-use rustc_index::bit_set::{BitSet, ChunkedBitSet};
+use std::assert_matches::assert_matches;
+
 use rustc_index::Idx;
+use rustc_index::bit_set::{BitSet, ChunkedBitSet};
 use rustc_middle::bug;
 use rustc_middle::mir::{self, Body, CallReturnPlaces, Location, TerminatorEdges};
 use rustc_middle::ty::{self, TyCtxt};
+use tracing::{debug, instrument};
 
-use crate::drop_flag_effects_for_function_entry;
-use crate::drop_flag_effects_for_location;
 use crate::elaborate_drops::DropFlagState;
 use crate::framework::SwitchIntEdgeEffects;
 use crate::move_paths::{HasMoveData, InitIndex, InitKind, LookupResult, MoveData, MovePathIndex};
-use crate::on_lookup_result_bits;
-use crate::MoveDataParamEnv;
-use crate::{drop_flag_effects, on_all_children_bits};
-use crate::{lattice, AnalysisDomain, GenKill, GenKillAnalysis, MaybeReachable};
+use crate::{
+    AnalysisDomain, GenKill, GenKillAnalysis, MaybeReachable, drop_flag_effects,
+    drop_flag_effects_for_function_entry, drop_flag_effects_for_location, lattice,
+    on_all_children_bits, on_lookup_result_bits,
+};
 
 /// `MaybeInitializedPlaces` tracks all places that might be
 /// initialized upon reaching a particular point in the control flow
@@ -52,13 +54,13 @@ use crate::{lattice, AnalysisDomain, GenKill, GenKillAnalysis, MaybeReachable};
 pub struct MaybeInitializedPlaces<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
     body: &'a Body<'tcx>,
-    mdpe: &'a MoveDataParamEnv<'tcx>,
+    move_data: &'a MoveData<'tcx>,
     skip_unreachable_unwind: bool,
 }
 
 impl<'a, 'tcx> MaybeInitializedPlaces<'a, 'tcx> {
-    pub fn new(tcx: TyCtxt<'tcx>, body: &'a Body<'tcx>, mdpe: &'a MoveDataParamEnv<'tcx>) -> Self {
-        MaybeInitializedPlaces { tcx, body, mdpe, skip_unreachable_unwind: false }
+    pub fn new(tcx: TyCtxt<'tcx>, body: &'a Body<'tcx>, move_data: &'a MoveData<'tcx>) -> Self {
+        MaybeInitializedPlaces { tcx, body, move_data, skip_unreachable_unwind: false }
     }
 
     pub fn skipping_unreachable_unwind(mut self) -> Self {
@@ -85,7 +87,7 @@ impl<'a, 'tcx> MaybeInitializedPlaces<'a, 'tcx> {
 
 impl<'a, 'tcx> HasMoveData<'tcx> for MaybeInitializedPlaces<'a, 'tcx> {
     fn move_data(&self) -> &MoveData<'tcx> {
-        &self.mdpe.move_data
+        self.move_data
     }
 }
 
@@ -127,18 +129,18 @@ impl<'a, 'tcx> HasMoveData<'tcx> for MaybeInitializedPlaces<'a, 'tcx> {
 pub struct MaybeUninitializedPlaces<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
     body: &'a Body<'tcx>,
-    mdpe: &'a MoveDataParamEnv<'tcx>,
+    move_data: &'a MoveData<'tcx>,
 
     mark_inactive_variants_as_uninit: bool,
     skip_unreachable_unwind: BitSet<mir::BasicBlock>,
 }
 
 impl<'a, 'tcx> MaybeUninitializedPlaces<'a, 'tcx> {
-    pub fn new(tcx: TyCtxt<'tcx>, body: &'a Body<'tcx>, mdpe: &'a MoveDataParamEnv<'tcx>) -> Self {
+    pub fn new(tcx: TyCtxt<'tcx>, body: &'a Body<'tcx>, move_data: &'a MoveData<'tcx>) -> Self {
         MaybeUninitializedPlaces {
             tcx,
             body,
-            mdpe,
+            move_data,
             mark_inactive_variants_as_uninit: false,
             skip_unreachable_unwind: BitSet::new_empty(body.basic_blocks.len()),
         }
@@ -163,9 +165,9 @@ impl<'a, 'tcx> MaybeUninitializedPlaces<'a, 'tcx> {
     }
 }
 
-impl<'a, 'tcx> HasMoveData<'tcx> for MaybeUninitializedPlaces<'a, 'tcx> {
+impl<'tcx> HasMoveData<'tcx> for MaybeUninitializedPlaces<'_, 'tcx> {
     fn move_data(&self) -> &MoveData<'tcx> {
-        &self.mdpe.move_data
+        self.move_data
     }
 }
 
@@ -205,18 +207,18 @@ impl<'a, 'tcx> HasMoveData<'tcx> for MaybeUninitializedPlaces<'a, 'tcx> {
 /// that would require a dynamic drop-flag at that statement.
 pub struct DefinitelyInitializedPlaces<'a, 'tcx> {
     body: &'a Body<'tcx>,
-    mdpe: &'a MoveDataParamEnv<'tcx>,
+    move_data: &'a MoveData<'tcx>,
 }
 
 impl<'a, 'tcx> DefinitelyInitializedPlaces<'a, 'tcx> {
-    pub fn new(body: &'a Body<'tcx>, mdpe: &'a MoveDataParamEnv<'tcx>) -> Self {
-        DefinitelyInitializedPlaces { body, mdpe }
+    pub fn new(body: &'a Body<'tcx>, move_data: &'a MoveData<'tcx>) -> Self {
+        DefinitelyInitializedPlaces { body, move_data }
     }
 }
 
 impl<'a, 'tcx> HasMoveData<'tcx> for DefinitelyInitializedPlaces<'a, 'tcx> {
     fn move_data(&self) -> &MoveData<'tcx> {
-        &self.mdpe.move_data
+        self.move_data
     }
 }
 
@@ -251,18 +253,18 @@ impl<'a, 'tcx> HasMoveData<'tcx> for DefinitelyInitializedPlaces<'a, 'tcx> {
 /// ```
 pub struct EverInitializedPlaces<'a, 'tcx> {
     body: &'a Body<'tcx>,
-    mdpe: &'a MoveDataParamEnv<'tcx>,
+    move_data: &'a MoveData<'tcx>,
 }
 
 impl<'a, 'tcx> EverInitializedPlaces<'a, 'tcx> {
-    pub fn new(body: &'a Body<'tcx>, mdpe: &'a MoveDataParamEnv<'tcx>) -> Self {
-        EverInitializedPlaces { body, mdpe }
+    pub fn new(body: &'a Body<'tcx>, move_data: &'a MoveData<'tcx>) -> Self {
+        EverInitializedPlaces { body, move_data }
     }
 }
 
-impl<'a, 'tcx> HasMoveData<'tcx> for EverInitializedPlaces<'a, 'tcx> {
+impl<'tcx> HasMoveData<'tcx> for EverInitializedPlaces<'_, 'tcx> {
     fn move_data(&self) -> &MoveData<'tcx> {
-        &self.mdpe.move_data
+        self.move_data
     }
 }
 
@@ -274,19 +276,19 @@ impl<'a, 'tcx> MaybeInitializedPlaces<'a, 'tcx> {
     ) {
         match state {
             DropFlagState::Absent => trans.kill(path),
-            DropFlagState::Present => trans.gen(path),
+            DropFlagState::Present => trans.gen_(path),
         }
     }
 }
 
-impl<'a, 'tcx> MaybeUninitializedPlaces<'a, 'tcx> {
+impl<'tcx> MaybeUninitializedPlaces<'_, 'tcx> {
     fn update_bits(
         trans: &mut impl GenKill<MovePathIndex>,
         path: MovePathIndex,
         state: DropFlagState,
     ) {
         match state {
-            DropFlagState::Absent => trans.gen(path),
+            DropFlagState::Absent => trans.gen_(path),
             DropFlagState::Present => trans.kill(path),
         }
     }
@@ -300,7 +302,7 @@ impl<'a, 'tcx> DefinitelyInitializedPlaces<'a, 'tcx> {
     ) {
         match state {
             DropFlagState::Absent => trans.kill(path),
-            DropFlagState::Present => trans.gen(path),
+            DropFlagState::Present => trans.gen_(path),
         }
     }
 }
@@ -320,9 +322,9 @@ impl<'tcx> AnalysisDomain<'tcx> for MaybeInitializedPlaces<'_, 'tcx> {
     fn initialize_start_block(&self, _: &mir::Body<'tcx>, state: &mut Self::Domain) {
         *state =
             MaybeReachable::Reachable(ChunkedBitSet::new_empty(self.move_data().move_paths.len()));
-        drop_flag_effects_for_function_entry(self.body, self.mdpe, |path, s| {
+        drop_flag_effects_for_function_entry(self.body, self.move_data, |path, s| {
             assert!(s == DropFlagState::Present);
-            state.gen(path);
+            state.gen_(path);
         });
     }
 }
@@ -340,7 +342,7 @@ impl<'tcx> GenKillAnalysis<'tcx> for MaybeInitializedPlaces<'_, 'tcx> {
         statement: &mir::Statement<'tcx>,
         location: Location,
     ) {
-        drop_flag_effects_for_location(self.body, self.mdpe, location, |path, s| {
+        drop_flag_effects_for_location(self.body, self.move_data, location, |path, s| {
             Self::update_bits(trans, path, s)
         });
 
@@ -349,11 +351,11 @@ impl<'tcx> GenKillAnalysis<'tcx> for MaybeInitializedPlaces<'_, 'tcx> {
             && let Some((_, rvalue)) = statement.kind.as_assign()
             && let mir::Rvalue::Ref(_, mir::BorrowKind::Mut { .. }, place)
                 // FIXME: Does `&raw const foo` allow mutation? See #90413.
-                | mir::Rvalue::AddressOf(_, place) = rvalue
+                | mir::Rvalue::RawPtr(_, place) = rvalue
             && let LookupResult::Exact(mpi) = self.move_data().rev_lookup.find(place.as_ref())
         {
             on_all_children_bits(self.move_data(), mpi, |child| {
-                trans.gen(child);
+                trans.gen_(child);
             })
         }
     }
@@ -372,7 +374,7 @@ impl<'tcx> GenKillAnalysis<'tcx> for MaybeInitializedPlaces<'_, 'tcx> {
         {
             edges = TerminatorEdges::Single(target);
         }
-        drop_flag_effects_for_location(self.body, self.mdpe, location, |path, s| {
+        drop_flag_effects_for_location(self.body, self.move_data, location, |path, s| {
             Self::update_bits(state, path, s)
         });
         edges
@@ -391,7 +393,7 @@ impl<'tcx> GenKillAnalysis<'tcx> for MaybeInitializedPlaces<'_, 'tcx> {
                 self.move_data(),
                 self.move_data().rev_lookup.find(place.as_ref()),
                 |mpi| {
-                    trans.gen(mpi);
+                    trans.gen_(mpi);
                 },
             );
         });
@@ -457,7 +459,7 @@ impl<'tcx> AnalysisDomain<'tcx> for MaybeUninitializedPlaces<'_, 'tcx> {
         // set all bits to 1 (uninit) before gathering counter-evidence
         state.insert_all();
 
-        drop_flag_effects_for_function_entry(self.body, self.mdpe, |path, s| {
+        drop_flag_effects_for_function_entry(self.body, self.move_data, |path, s| {
             assert!(s == DropFlagState::Present);
             state.remove(path);
         });
@@ -477,7 +479,7 @@ impl<'tcx> GenKillAnalysis<'tcx> for MaybeUninitializedPlaces<'_, 'tcx> {
         _statement: &mir::Statement<'tcx>,
         location: Location,
     ) {
-        drop_flag_effects_for_location(self.body, self.mdpe, location, |path, s| {
+        drop_flag_effects_for_location(self.body, self.move_data, location, |path, s| {
             Self::update_bits(trans, path, s)
         });
 
@@ -491,12 +493,12 @@ impl<'tcx> GenKillAnalysis<'tcx> for MaybeUninitializedPlaces<'_, 'tcx> {
         terminator: &'mir mir::Terminator<'tcx>,
         location: Location,
     ) -> TerminatorEdges<'mir, 'tcx> {
-        drop_flag_effects_for_location(self.body, self.mdpe, location, |path, s| {
+        drop_flag_effects_for_location(self.body, self.move_data, location, |path, s| {
             Self::update_bits(trans, path, s)
         });
         if self.skip_unreachable_unwind.contains(location.block) {
             let mir::TerminatorKind::Drop { target, unwind, .. } = terminator.kind else { bug!() };
-            assert!(matches!(unwind, mir::UnwindAction::Cleanup(_)));
+            assert_matches!(unwind, mir::UnwindAction::Cleanup(_));
             TerminatorEdges::Single(target)
         } else {
             terminator.edges()
@@ -563,7 +565,7 @@ impl<'tcx> GenKillAnalysis<'tcx> for MaybeUninitializedPlaces<'_, 'tcx> {
                 self.move_data(),
                 enum_place,
                 variant,
-                |mpi| trans.gen(mpi),
+                |mpi| trans.gen_(mpi),
             );
         });
     }
@@ -584,7 +586,7 @@ impl<'a, 'tcx> AnalysisDomain<'tcx> for DefinitelyInitializedPlaces<'a, 'tcx> {
     fn initialize_start_block(&self, _: &mir::Body<'tcx>, state: &mut Self::Domain) {
         state.0.clear();
 
-        drop_flag_effects_for_function_entry(self.body, self.mdpe, |path, s| {
+        drop_flag_effects_for_function_entry(self.body, self.move_data, |path, s| {
             assert!(s == DropFlagState::Present);
             state.0.insert(path);
         });
@@ -604,7 +606,7 @@ impl<'tcx> GenKillAnalysis<'tcx> for DefinitelyInitializedPlaces<'_, 'tcx> {
         _statement: &mir::Statement<'tcx>,
         location: Location,
     ) {
-        drop_flag_effects_for_location(self.body, self.mdpe, location, |path, s| {
+        drop_flag_effects_for_location(self.body, self.move_data, location, |path, s| {
             Self::update_bits(trans, path, s)
         })
     }
@@ -615,7 +617,7 @@ impl<'tcx> GenKillAnalysis<'tcx> for DefinitelyInitializedPlaces<'_, 'tcx> {
         terminator: &'mir mir::Terminator<'tcx>,
         location: Location,
     ) -> TerminatorEdges<'mir, 'tcx> {
-        drop_flag_effects_for_location(self.body, self.mdpe, location, |path, s| {
+        drop_flag_effects_for_location(self.body, self.move_data, location, |path, s| {
             Self::update_bits(trans, path, s)
         });
         terminator.edges()
@@ -634,7 +636,7 @@ impl<'tcx> GenKillAnalysis<'tcx> for DefinitelyInitializedPlaces<'_, 'tcx> {
                 self.move_data(),
                 self.move_data().rev_lookup.find(place.as_ref()),
                 |mpi| {
-                    trans.gen(mpi);
+                    trans.gen_(mpi);
                 },
             );
         });
@@ -679,7 +681,7 @@ impl<'tcx> GenKillAnalysis<'tcx> for EverInitializedPlaces<'_, 'tcx> {
         let init_loc_map = &move_data.init_loc_map;
         let rev_lookup = &move_data.rev_lookup;
 
-        debug!("initializes move_indexes {:?}", &init_loc_map[location]);
+        debug!("initializes move_indexes {:?}", init_loc_map[location]);
         trans.gen_all(init_loc_map[location].iter().copied());
 
         if let mir::StatementKind::StorageDead(local) = stmt.kind {
@@ -729,7 +731,7 @@ impl<'tcx> GenKillAnalysis<'tcx> for EverInitializedPlaces<'_, 'tcx> {
 
         let call_loc = self.body.terminator_loc(block);
         for init_index in &init_loc_map[call_loc] {
-            trans.gen(*init_index);
+            trans.gen_(*init_index);
         }
     }
 }

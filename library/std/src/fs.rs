@@ -8,7 +8,15 @@
 #![stable(feature = "rust1", since = "1.0.0")]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-#[cfg(all(test, not(any(target_os = "emscripten", target_env = "sgx", target_os = "xous"))))]
+#[cfg(all(
+    test,
+    not(any(
+        target_os = "emscripten",
+        target_os = "wasi",
+        target_env = "sgx",
+        target_os = "xous"
+    ))
+))]
 mod tests;
 
 use crate::ffi::OsString;
@@ -50,7 +58,7 @@ use crate::time::SystemTime;
 /// }
 /// ```
 ///
-/// Read the contents of a file into a [`String`] (you can also use [`read`]):
+/// Reads the contents of a file into a [`String`] (you can also use [`read`]):
 ///
 /// ```no_run
 /// use std::fs::File;
@@ -229,7 +237,7 @@ pub struct DirBuilder {
     recursive: bool,
 }
 
-/// Read the entire contents of a file into a bytes vector.
+/// Reads the entire contents of a file into a bytes vector.
 ///
 /// This is a convenience function for using [`File::open`] and [`read_to_end`]
 /// with fewer imports and without an intermediate variable.
@@ -268,7 +276,7 @@ pub fn read<P: AsRef<Path>>(path: P) -> io::Result<Vec<u8>> {
     inner(path.as_ref())
 }
 
-/// Read the entire contents of a file into a string.
+/// Reads the entire contents of a file into a string.
 ///
 /// This is a convenience function for using [`File::open`] and [`read_to_string`]
 /// with fewer imports and without an intermediate variable.
@@ -311,7 +319,7 @@ pub fn read_to_string<P: AsRef<Path>>(path: P) -> io::Result<String> {
     inner(path.as_ref())
 }
 
-/// Write a slice as the entire contents of a file.
+/// Writes a slice as the entire contents of a file.
 ///
 /// This function will create a file if it does not exist,
 /// and will entirely replace its contents if it does.
@@ -375,6 +383,45 @@ impl File {
         OpenOptions::new().read(true).open(path.as_ref())
     }
 
+    /// Attempts to open a file in read-only mode with buffering.
+    ///
+    /// See the [`OpenOptions::open`] method, the [`BufReader`][io::BufReader] type,
+    /// and the [`BufRead`][io::BufRead] trait for more details.
+    ///
+    /// If you only need to read the entire file contents,
+    /// consider [`std::fs::read()`][self::read] or
+    /// [`std::fs::read_to_string()`][self::read_to_string] instead.
+    ///
+    /// # Errors
+    ///
+    /// This function will return an error if `path` does not already exist,
+    /// or if memory allocation fails for the new buffer.
+    /// Other errors may also be returned according to [`OpenOptions::open`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// #![feature(file_buffered)]
+    /// use std::fs::File;
+    /// use std::io::BufRead;
+    ///
+    /// fn main() -> std::io::Result<()> {
+    ///     let mut f = File::open_buffered("foo.txt")?;
+    ///     assert!(f.capacity() > 0);
+    ///     for (line, i) in f.lines().zip(1..) {
+    ///         println!("{i:6}: {}", line?);
+    ///     }
+    ///     Ok(())
+    /// }
+    /// ```
+    #[unstable(feature = "file_buffered", issue = "130804")]
+    pub fn open_buffered<P: AsRef<Path>>(path: P) -> io::Result<io::BufReader<File>> {
+        // Allocate the buffer *first* so we don't affect the filesystem otherwise.
+        let buffer = io::BufReader::<Self>::try_new_buffer()?;
+        let file = File::open(path)?;
+        Ok(io::BufReader::with_buffer(file, buffer))
+    }
+
     /// Opens a file in write-only mode.
     ///
     /// This function will create a file if it does not exist,
@@ -402,6 +449,45 @@ impl File {
     #[stable(feature = "rust1", since = "1.0.0")]
     pub fn create<P: AsRef<Path>>(path: P) -> io::Result<File> {
         OpenOptions::new().write(true).create(true).truncate(true).open(path.as_ref())
+    }
+
+    /// Opens a file in write-only mode with buffering.
+    ///
+    /// This function will create a file if it does not exist,
+    /// and will truncate it if it does.
+    ///
+    /// Depending on the platform, this function may fail if the
+    /// full directory path does not exist.
+    ///
+    /// See the [`OpenOptions::open`] method and the
+    /// [`BufWriter`][io::BufWriter] type for more details.
+    ///
+    /// See also [`std::fs::write()`][self::write] for a simple function to
+    /// create a file with some given data.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// #![feature(file_buffered)]
+    /// use std::fs::File;
+    /// use std::io::Write;
+    ///
+    /// fn main() -> std::io::Result<()> {
+    ///     let mut f = File::create_buffered("foo.txt")?;
+    ///     assert!(f.capacity() > 0);
+    ///     for i in 0..100 {
+    ///         writeln!(&mut f, "{i}")?;
+    ///     }
+    ///     f.flush()?;
+    ///     Ok(())
+    /// }
+    /// ```
+    #[unstable(feature = "file_buffered", issue = "130804")]
+    pub fn create_buffered<P: AsRef<Path>>(path: P) -> io::Result<io::BufWriter<File>> {
+        // Allocate the buffer *first* so we don't affect the filesystem otherwise.
+        let buffer = io::BufWriter::<Self>::try_new_buffer()?;
+        let file = File::create(path)?;
+        Ok(io::BufWriter::with_buffer(file, buffer))
     }
 
     /// Creates a new file in read-write mode; error if the file exists.
@@ -466,6 +552,7 @@ impl File {
     /// ```
     #[must_use]
     #[stable(feature = "with_options", since = "1.58.0")]
+    #[cfg_attr(not(test), rustc_diagnostic_item = "file_options")]
     pub fn options() -> OpenOptions {
         OpenOptions::new()
     }
@@ -767,11 +854,33 @@ fn buffer_capacity_required(mut file: &File) -> Option<usize> {
 
 #[stable(feature = "rust1", since = "1.0.0")]
 impl Read for &File {
+    /// Reads some bytes from the file.
+    ///
+    /// See [`Read::read`] docs for more info.
+    ///
+    /// # Platform-specific behavior
+    ///
+    /// This function currently corresponds to the `read` function on Unix and
+    /// the `NtReadFile` function on Windows. Note that this [may change in
+    /// the future][changes].
+    ///
+    /// [changes]: io#platform-specific-behavior
     #[inline]
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.inner.read(buf)
     }
 
+    /// Like `read`, except that it reads into a slice of buffers.
+    ///
+    /// See [`Read::read_vectored`] docs for more info.
+    ///
+    /// # Platform-specific behavior
+    ///
+    /// This function currently corresponds to the `readv` function on Unix and
+    /// falls back to the `read` implementation on Windows. Note that this
+    /// [may change in the future][changes].
+    ///
+    /// [changes]: io#platform-specific-behavior
     #[inline]
     fn read_vectored(&mut self, bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
         self.inner.read_vectored(bufs)
@@ -782,6 +891,16 @@ impl Read for &File {
         self.inner.read_buf(cursor)
     }
 
+    /// Determines if `File` has an efficient `read_vectored` implementation.
+    ///
+    /// See [`Read::is_read_vectored`] docs for more info.
+    ///
+    /// # Platform-specific behavior
+    ///
+    /// This function currently returns `true` on Unix an `false` on Windows.
+    /// Note that this [may change in the future][changes].
+    ///
+    /// [changes]: io#platform-specific-behavior
     #[inline]
     fn is_read_vectored(&self) -> bool {
         self.inner.is_read_vectored()
@@ -803,19 +922,63 @@ impl Read for &File {
 }
 #[stable(feature = "rust1", since = "1.0.0")]
 impl Write for &File {
+    /// Writes some bytes to the file.
+    ///
+    /// See [`Write::write`] docs for more info.
+    ///
+    /// # Platform-specific behavior
+    ///
+    /// This function currently corresponds to the `write` function on Unix and
+    /// the `NtWriteFile` function on Windows. Note that this [may change in
+    /// the future][changes].
+    ///
+    /// [changes]: io#platform-specific-behavior
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.inner.write(buf)
     }
 
+    /// Like `write`, except that it writes into a slice of buffers.
+    ///
+    /// See [`Write::write_vectored`] docs for more info.
+    ///
+    /// # Platform-specific behavior
+    ///
+    /// This function currently corresponds to the `writev` function on Unix
+    /// and falls back to the `write` implementation on Windows. Note that this
+    /// [may change in the future][changes].
+    ///
+    /// [changes]: io#platform-specific-behavior
     fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
         self.inner.write_vectored(bufs)
     }
 
+    /// Determines if `File` has an efficient `write_vectored` implementation.
+    ///
+    /// See [`Write::is_write_vectored`] docs for more info.
+    ///
+    /// # Platform-specific behavior
+    ///
+    /// This function currently returns `true` on Unix an `false` on Windows.
+    /// Note that this [may change in the future][changes].
+    ///
+    /// [changes]: io#platform-specific-behavior
     #[inline]
     fn is_write_vectored(&self) -> bool {
         self.inner.is_write_vectored()
     }
 
+    /// Flushes the file, ensuring that all intermediately buffered contents
+    /// reach their destination.
+    ///
+    /// See [`Write::flush`] docs for more info.
+    ///
+    /// # Platform-specific behavior
+    ///
+    /// Since a `File` structure doesn't contain any buffers, this function is
+    /// currently a no-op on Unix and Windows. Note that this [may change in
+    /// the future][changes].
+    ///
+    /// [changes]: io#platform-specific-behavior
     #[inline]
     fn flush(&mut self) -> io::Result<()> {
         self.inner.flush()
@@ -933,6 +1096,7 @@ impl OpenOptions {
     /// let mut options = OpenOptions::new();
     /// let file = options.read(true).open("foo.txt");
     /// ```
+    #[cfg_attr(not(test), rustc_diagnostic_item = "open_options_new")]
     #[stable(feature = "rust1", since = "1.0.0")]
     #[must_use]
     pub fn new() -> Self {
@@ -1450,7 +1614,7 @@ impl FromInner<fs_imp::FileAttr> for Metadata {
 }
 
 impl FileTimes {
-    /// Create a new `FileTimes` with no times set.
+    /// Creates a new `FileTimes` with no times set.
     ///
     /// Using the resulting `FileTimes` in [`File::set_times`] will not modify any timestamps.
     #[stable(feature = "file_set_times", since = "1.75.0")]
@@ -1913,6 +2077,11 @@ impl AsInner<fs_imp::DirEntry> for DirEntry {
 /// * The file doesn't exist.
 /// * The user lacks permissions to remove the file.
 ///
+/// This function will only ever return an error of kind `NotFound` if the given
+/// path does not exist. Note that the inverse is not true,
+/// ie. if a path does not exist, its removal may fail for a number of reasons,
+/// such as insufficient permissions.
+///
 /// # Examples
 ///
 /// ```no_run
@@ -1929,7 +2098,7 @@ pub fn remove_file<P: AsRef<Path>>(path: P) -> io::Result<()> {
     fs_imp::unlink(path.as_ref())
 }
 
-/// Given a path, query the file system to get information about a file,
+/// Given a path, queries the file system to get information about a file,
 /// directory, etc.
 ///
 /// This function will traverse symbolic links to query information about the
@@ -1968,7 +2137,7 @@ pub fn metadata<P: AsRef<Path>>(path: P) -> io::Result<Metadata> {
     fs_imp::stat(path.as_ref()).map(Metadata)
 }
 
-/// Query the metadata about a file without following symlinks.
+/// Queries the metadata about a file without following symlinks.
 ///
 /// # Platform-specific behavior
 ///
@@ -2003,7 +2172,7 @@ pub fn symlink_metadata<P: AsRef<Path>>(path: P) -> io::Result<Metadata> {
     fs_imp::lstat(path.as_ref()).map(Metadata)
 }
 
-/// Rename a file or directory to a new name, replacing the original file if
+/// Renames a file or directory to a new name, replacing the original file if
 /// `to` already exists.
 ///
 /// This will not work if the new name is on a different mount point.
@@ -2226,7 +2395,7 @@ pub fn read_link<P: AsRef<Path>>(path: P) -> io::Result<PathBuf> {
 ///
 /// This function currently corresponds to the `realpath` function on Unix
 /// and the `CreateFile` and `GetFinalPathNameByHandle` functions on Windows.
-/// Note that, this [may change in the future][changes].
+/// Note that this [may change in the future][changes].
 ///
 /// On Windows, this converts the path to use [extended length path][path]
 /// syntax, which allows your program to use longer path names, but means you
@@ -2310,6 +2479,9 @@ pub fn create_dir<P: AsRef<Path>>(path: P) -> io::Result<()> {
 /// If this function returns an error, some of the parent components might have
 /// been created already.
 ///
+/// If the empty path is passed to this function, it always succeeds without
+/// creating any directories.
+///
 /// # Platform-specific behavior
 ///
 /// This function currently corresponds to multiple calls to the `mkdir`
@@ -2321,13 +2493,8 @@ pub fn create_dir<P: AsRef<Path>>(path: P) -> io::Result<()> {
 ///
 /// # Errors
 ///
-/// This function will return an error in the following situations, but is not
-/// limited to just these cases:
-///
-/// * If any directory in the path specified by `path`
-/// does not already exist and it could not be created otherwise. The specific
-/// error conditions for when a directory is being created (after it is
-/// determined to not exist) are outlined by [`fs::create_dir`].
+/// The function will return an error if any directory specified in path does not exist and
+/// could not be created. There may be other error conditions; see [`fs::create_dir`] for specifics.
 ///
 /// Notable exception is made for situations where any of the directories
 /// specified in the `path` could not be created as it was being created concurrently.
@@ -2372,6 +2539,11 @@ pub fn create_dir_all<P: AsRef<Path>>(path: P) -> io::Result<()> {
 /// * The user lacks permissions to remove the directory at the provided `path`.
 /// * The directory isn't empty.
 ///
+/// This function will only ever return an error of kind `NotFound` if the given
+/// path does not exist. Note that the inverse is not true,
+/// ie. if a path does not exist, its removal may fail for a number of reasons,
+/// such as insufficient permissions.
+///
 /// # Examples
 ///
 /// ```no_run
@@ -2397,16 +2569,15 @@ pub fn remove_dir<P: AsRef<Path>>(path: P) -> io::Result<()> {
 /// # Platform-specific behavior
 ///
 /// This function currently corresponds to `openat`, `fdopendir`, `unlinkat` and `lstat` functions
-/// on Unix (except for macOS before version 10.10 and REDOX) and the `CreateFileW`,
-/// `GetFileInformationByHandleEx`, `SetFileInformationByHandle`, and `NtCreateFile` functions on
-/// Windows. Note that, this [may change in the future][changes].
+/// on Unix (except for REDOX) and the `CreateFileW`, `GetFileInformationByHandleEx`,
+/// `SetFileInformationByHandle`, and `NtCreateFile` functions on Windows. Note that, this
+/// [may change in the future][changes].
 ///
 /// [changes]: io#platform-specific-behavior
 ///
-/// On macOS before version 10.10 and REDOX, as well as when running in Miri for any target, this
-/// function is not protected against time-of-check to time-of-use (TOCTOU) race conditions, and
-/// should not be used in security-sensitive code on those platforms. All other platforms are
-/// protected.
+/// On REDOX, as well as when running in Miri for any target, this function is not protected against
+/// time-of-check to time-of-use (TOCTOU) race conditions, and should not be used in
+/// security-sensitive code on those platforms. All other platforms are protected.
 ///
 /// # Errors
 ///
@@ -2416,6 +2587,8 @@ pub fn remove_dir<P: AsRef<Path>>(path: P) -> io::Result<()> {
 /// As a result, the directory you are deleting must exist, meaning that this function is not idempotent.
 ///
 /// Consider ignoring the error if validating the removal is not required for your use case.
+///
+/// [`io::ErrorKind::NotFound`] is only returned if no removal occurs.
 ///
 /// [`fs::remove_file`]: remove_file
 /// [`fs::remove_dir`]: remove_dir
@@ -2663,18 +2836,15 @@ impl AsInnerMut<fs_imp::DirBuilder> for DirBuilder {
 /// # Examples
 ///
 /// ```no_run
-/// #![feature(fs_try_exists)]
 /// use std::fs;
 ///
-/// assert!(!fs::try_exists("does_not_exist.txt").expect("Can't check existence of file does_not_exist.txt"));
-/// assert!(fs::try_exists("/root/secret_file.txt").is_err());
+/// assert!(!fs::exists("does_not_exist.txt").expect("Can't check existence of file does_not_exist.txt"));
+/// assert!(fs::exists("/root/secret_file.txt").is_err());
 /// ```
 ///
 /// [`Path::exists`]: crate::path::Path::exists
-// FIXME: stabilization should modify documentation of `exists()` to recommend this method
-// instead.
-#[unstable(feature = "fs_try_exists", issue = "83186")]
+#[stable(feature = "fs_try_exists", since = "1.81.0")]
 #[inline]
-pub fn try_exists<P: AsRef<Path>>(path: P) -> io::Result<bool> {
-    fs_imp::try_exists(path.as_ref())
+pub fn exists<P: AsRef<Path>>(path: P) -> io::Result<bool> {
+    fs_imp::exists(path.as_ref())
 }

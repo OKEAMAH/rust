@@ -5,9 +5,10 @@ use std::{cmp, ops::Bound};
 use base_db::salsa::Cycle;
 use hir_def::{
     data::adt::VariantData,
-    layout::{Integer, LayoutCalculator, ReprOptions, TargetDataLayout},
+    layout::{Integer, ReprOptions, TargetDataLayout},
     AdtId, VariantId,
 };
+use intern::sym;
 use rustc_index::IndexVec;
 use smallvec::SmallVec;
 use triomphe::Arc;
@@ -35,8 +36,8 @@ pub fn layout_of_adt_query(
     let Ok(target) = db.target_data_layout(krate) else {
         return Err(LayoutError::TargetLayoutNotAvailable);
     };
-    let cx = LayoutCx { target: &target };
-    let dl = cx.current_data_layout();
+    let dl = &*target;
+    let cx = LayoutCx::new(dl);
     let handle_variant = |def: VariantId, var: &VariantData| {
         var.fields()
             .iter()
@@ -72,9 +73,9 @@ pub fn layout_of_adt_query(
         .collect::<SmallVec<[_; 1]>>();
     let variants = variants.iter().map(|it| it.iter().collect()).collect::<IndexVec<_, _>>();
     let result = if matches!(def, AdtId::UnionId(..)) {
-        cx.layout_of_union(&repr, &variants).ok_or(LayoutError::Unknown)?
+        cx.calc.layout_of_union(&repr, &variants)?
     } else {
-        cx.layout_of_struct_or_enum(
+        cx.calc.layout_of_struct_or_enum(
             &repr,
             &variants,
             matches!(def, AdtId::EnumId(..)),
@@ -102,8 +103,7 @@ pub fn layout_of_adt_query(
                     .next()
                     .and_then(|it| it.iter().last().map(|it| !it.is_unsized()))
                     .unwrap_or(true),
-        )
-        .ok_or(LayoutError::SizeOverflow)?
+        )?
     };
     Ok(Arc::new(result))
 }
@@ -129,7 +129,10 @@ fn layout_scalar_valid_range(db: &dyn HirDatabase, def: AdtId) -> (Bound<u128>, 
         }
         Bound::Unbounded
     };
-    (get("rustc_layout_scalar_valid_range_start"), get("rustc_layout_scalar_valid_range_end"))
+    (
+        get(&sym::rustc_layout_scalar_valid_range_start),
+        get(&sym::rustc_layout_scalar_valid_range_end),
+    )
 }
 
 pub fn layout_of_adt_recover(

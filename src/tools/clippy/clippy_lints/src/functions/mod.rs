@@ -2,18 +2,21 @@ mod impl_trait_in_params;
 mod misnamed_getters;
 mod must_use;
 mod not_unsafe_ptr_arg_deref;
+mod ref_option;
 mod renamed_function_params;
 mod result;
 mod too_many_arguments;
 mod too_many_lines;
 
+use clippy_config::Conf;
 use clippy_utils::def_path_def_ids;
 use rustc_hir as hir;
 use rustc_hir::intravisit;
 use rustc_lint::{LateContext, LateLintPass};
+use rustc_middle::ty::TyCtxt;
 use rustc_session::impl_lint_pass;
-use rustc_span::def_id::{DefIdSet, LocalDefId};
 use rustc_span::Span;
+use rustc_span::def_id::{DefIdSet, LocalDefId};
 
 declare_clippy_lint! {
     /// ### What it does
@@ -338,8 +341,10 @@ declare_clippy_lint! {
 declare_clippy_lint! {
     /// ### What it does
     /// Lints when `impl Trait` is being used in a function's parameters.
-    /// ### Why is this bad?
-    /// Turbofish syntax (`::<>`) cannot be used when `impl Trait` is being used, making `impl Trait` less powerful. Readability may also be a factor.
+    ///
+    /// ### Why restrict this?
+    /// Turbofish syntax (`::<>`) cannot be used to specify the type of an `impl Trait` parameter,
+    /// making `impl Trait` less powerful. Readability may also be a factor.
     ///
     /// ### Example
     /// ```no_run
@@ -366,9 +371,8 @@ declare_clippy_lint! {
     /// Lints when the name of function parameters from trait impl is
     /// different than its default implementation.
     ///
-    /// ### Why is this bad?
-    /// Using the default name for parameters of a trait method is often
-    /// more desirable for consistency's sake.
+    /// ### Why restrict this?
+    /// Using the default name for parameters of a trait method is more consistent.
     ///
     /// ### Example
     /// ```rust
@@ -390,39 +394,81 @@ declare_clippy_lint! {
     ///     }
     /// }
     /// ```
-    #[clippy::version = "1.74.0"]
+    #[clippy::version = "1.80.0"]
     pub RENAMED_FUNCTION_PARAMS,
     restriction,
     "renamed function parameters in trait implementation"
 }
 
-#[derive(Clone)]
+declare_clippy_lint! {
+    /// ### What it does
+    /// Warns when a function signature uses `&Option<T>` instead of `Option<&T>`.
+    ///
+    /// ### Why is this bad?
+    /// More flexibility, better memory optimization, and more idiomatic Rust code.
+    ///
+    /// `&Option<T>` in a function signature breaks encapsulation because the caller must own T
+    /// and move it into an Option to call with it. When returned, the owner must internally store
+    /// it as `Option<T>` in order to return it.
+    /// At a lower level, `&Option<T>` points to memory with the `presence` bit flag plus the `T` value,
+    /// whereas `Option<&T>` is usually [optimized](https://doc.rust-lang.org/1.81.0/std/option/index.html#representation)
+    /// to a single pointer, so it may be more optimal.
+    ///
+    /// See this [YouTube video](https://www.youtube.com/watch?v=6c7pZYP_iIE) by
+    /// Logan Smith for an in-depth explanation of why this is important.
+    ///
+    /// ### Known problems
+    /// This lint recommends changing the function signatures, but it cannot
+    /// automatically change the function calls or the function implementations.
+    ///
+    /// ### Example
+    /// ```no_run
+    /// // caller uses  foo(&opt)
+    /// fn foo(a: &Option<String>) {}
+    /// # struct Unit {}
+    /// # impl Unit {
+    /// fn bar(&self) -> &Option<String> { &None }
+    /// # }
+    /// ```
+    /// Use instead:
+    /// ```no_run
+    /// // caller should use  `foo1(opt.as_ref())`
+    /// fn foo1(a: Option<&String>) {}
+    /// // better yet, use string slice  `foo2(opt.as_deref())`
+    /// fn foo2(a: Option<&str>) {}
+    /// # struct Unit {}
+    /// # impl Unit {
+    /// fn bar(&self) -> Option<&String> { None }
+    /// # }
+    /// ```
+    #[clippy::version = "1.82.0"]
+    pub REF_OPTION,
+    pedantic,
+    "function signature uses `&Option<T>` instead of `Option<&T>`"
+}
+
 pub struct Functions {
     too_many_arguments_threshold: u64,
     too_many_lines_threshold: u64,
     large_error_threshold: u64,
     avoid_breaking_exported_api: bool,
-    allow_renamed_params_for: Vec<String>,
     /// A set of resolved `def_id` of traits that are configured to allow
     /// function params renaming.
     trait_ids: DefIdSet,
 }
 
 impl Functions {
-    pub fn new(
-        too_many_arguments_threshold: u64,
-        too_many_lines_threshold: u64,
-        large_error_threshold: u64,
-        avoid_breaking_exported_api: bool,
-        allow_renamed_params_for: Vec<String>,
-    ) -> Self {
+    pub fn new(tcx: TyCtxt<'_>, conf: &'static Conf) -> Self {
         Self {
-            too_many_arguments_threshold,
-            too_many_lines_threshold,
-            large_error_threshold,
-            avoid_breaking_exported_api,
-            allow_renamed_params_for,
-            trait_ids: DefIdSet::default(),
+            too_many_arguments_threshold: conf.too_many_arguments_threshold,
+            too_many_lines_threshold: conf.too_many_lines_threshold,
+            large_error_threshold: conf.large_error_threshold,
+            avoid_breaking_exported_api: conf.avoid_breaking_exported_api,
+            trait_ids: conf
+                .allow_renamed_params_for
+                .iter()
+                .flat_map(|p| def_path_def_ids(tcx, &p.split("::").collect::<Vec<_>>()))
+                .collect(),
         }
     }
 }
@@ -439,6 +485,7 @@ impl_lint_pass!(Functions => [
     MISNAMED_GETTERS,
     IMPL_TRAIT_IN_PARAMS,
     RENAMED_FUNCTION_PARAMS,
+    REF_OPTION,
 ]);
 
 impl<'tcx> LateLintPass<'tcx> for Functions {
@@ -457,6 +504,16 @@ impl<'tcx> LateLintPass<'tcx> for Functions {
         not_unsafe_ptr_arg_deref::check_fn(cx, kind, decl, body, def_id);
         misnamed_getters::check_fn(cx, kind, decl, body, span);
         impl_trait_in_params::check_fn(cx, &kind, body, hir_id);
+        ref_option::check_fn(
+            cx,
+            kind,
+            decl,
+            span,
+            hir_id,
+            def_id,
+            body,
+            self.avoid_breaking_exported_api,
+        );
     }
 
     fn check_item(&mut self, cx: &LateContext<'tcx>, item: &'tcx hir::Item<'_>) {
@@ -477,13 +534,6 @@ impl<'tcx> LateLintPass<'tcx> for Functions {
         must_use::check_trait_item(cx, item);
         result::check_trait_item(cx, item, self.large_error_threshold);
         impl_trait_in_params::check_trait_item(cx, item, self.avoid_breaking_exported_api);
-    }
-
-    fn check_crate(&mut self, cx: &LateContext<'tcx>) {
-        for path in &self.allow_renamed_params_for {
-            let path_segments: Vec<&str> = path.split("::").collect();
-            let ids = def_path_def_ids(cx, &path_segments);
-            self.trait_ids.extend(ids);
-        }
+        ref_option::check_trait_item(cx, item, self.avoid_breaking_exported_api);
     }
 }

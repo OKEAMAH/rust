@@ -1,4 +1,6 @@
 #![deny(warnings)]
+// FIXME(static_mut_refs): Do not allow `static_mut_refs` lint
+#![allow(static_mut_refs)]
 
 use std::cell::RefCell;
 use std::fmt::{self, Write};
@@ -217,19 +219,19 @@ fn test_format_macro_interface() {
 
     // make sure that format! doesn't move out of local variables
     let a = Box::new(3);
-    format!("{a}");
-    format!("{a}");
+    let _ = format!("{a}");
+    let _ = format!("{a}");
 
     // make sure that format! doesn't cause spurious unused-unsafe warnings when
     // it's inside of an outer unsafe block
     unsafe {
         let a: isize = ::std::mem::transmute(3_usize);
-        format!("{a}");
+        let _ = format!("{a}");
     }
 
     // test that trailing commas are acceptable
-    format!("{}", "test",);
-    format!("{foo}", foo = "test",);
+    let _ = format!("{}", "test",);
+    let _ = format!("{foo}", foo = "test",);
 }
 
 // Basic test to make sure that we can invoke the `write!` macro with an

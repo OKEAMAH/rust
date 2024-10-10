@@ -2,10 +2,10 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
 
+use crate::NewlineStyle;
 use crate::config::FileName;
 use crate::emitter::{self, Emitter};
 use crate::parse::session::ParseSess;
-use crate::NewlineStyle;
 
 #[cfg(test)]
 use crate::config::Config;
@@ -33,7 +33,7 @@ where
     let mut emitter = create_emitter(config);
 
     emitter.emit_header(out)?;
-    for &(ref filename, ref text) in source_file {
+    for (filename, text) in source_file {
         write_file(
             None,
             filename,

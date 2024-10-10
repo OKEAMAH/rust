@@ -1,26 +1,27 @@
 use clippy_utils::diagnostics::{span_lint_and_sugg, span_lint_hir_and_then};
-use clippy_utils::source::{snippet_opt, snippet_with_context};
+use clippy_utils::source::{SpanRangeExt, snippet_with_context};
 use clippy_utils::sugg::has_enclosing_paren;
-use clippy_utils::visitors::{for_each_expr_with_closures, Descend};
+use clippy_utils::visitors::{Descend, for_each_expr, for_each_unconsumed_temporary};
 use clippy_utils::{
-    fn_def_id, is_from_proc_macro, is_inside_let_else, is_res_lang_ctor, path_res, path_to_local_id, span_contains_cfg,
-    span_find_starting_semi,
+    binary_expr_needs_parentheses, fn_def_id, is_from_proc_macro, is_inside_let_else, is_res_lang_ctor, path_res,
+    path_to_local_id, span_contains_cfg, span_find_starting_semi,
 };
 use core::ops::ControlFlow;
+use rustc_ast::MetaItemInner;
 use rustc_errors::Applicability;
-use rustc_hir::intravisit::FnKind;
 use rustc_hir::LangItem::ResultErr;
+use rustc_hir::intravisit::FnKind;
 use rustc_hir::{
     Block, Body, Expr, ExprKind, FnDecl, HirId, ItemKind, LangItem, MatchSource, Node, OwnerNode, PatKind, QPath, Stmt,
     StmtKind,
 };
-use rustc_lint::{LateContext, LateLintPass, LintContext};
+use rustc_lint::{LateContext, LateLintPass, Level, LintContext};
 use rustc_middle::lint::in_external_macro;
 use rustc_middle::ty::adjustment::Adjust;
 use rustc_middle::ty::{self, GenericArgKind, Ty};
 use rustc_session::declare_lint_pass;
 use rustc_span::def_id::LocalDefId;
-use rustc_span::{BytePos, Pos, Span};
+use rustc_span::{BytePos, Pos, Span, sym};
 use std::borrow::Cow;
 use std::fmt::Display;
 
@@ -80,6 +81,9 @@ declare_clippy_lint! {
     /// ```
     #[clippy::version = "pre 1.29.0"]
     pub NEEDLESS_RETURN,
+    // This lint requires some special handling in `check_final_expr` for `#[expect]`.
+    // This handling needs to be updated if the group gets changed. This should also
+    // be caught by tests.
     style,
     "using a return statement like `return expr;` where an expression would suffice"
 }
@@ -90,6 +94,9 @@ declare_clippy_lint! {
     ///
     /// ### Why is this bad?
     /// The `return` is unnecessary.
+    ///
+    /// Returns may be used to add attributes to the return expression. Return
+    /// statements with attributes are therefore be accepted by this lint.
     ///
     /// ### Example
     /// ```rust,ignore
@@ -129,35 +136,35 @@ enum RetReplacement<'tcx> {
     Empty,
     Block,
     Unit,
-    IfSequence(Cow<'tcx, str>, Applicability),
+    NeedsPar(Cow<'tcx, str>, Applicability),
     Expr(Cow<'tcx, str>, Applicability),
 }
 
-impl<'tcx> RetReplacement<'tcx> {
+impl RetReplacement<'_> {
     fn sugg_help(&self) -> &'static str {
         match self {
             Self::Empty | Self::Expr(..) => "remove `return`",
             Self::Block => "replace `return` with an empty block",
             Self::Unit => "replace `return` with a unit value",
-            Self::IfSequence(..) => "remove `return` and wrap the sequence with parentheses",
+            Self::NeedsPar(..) => "remove `return` and wrap the sequence with parentheses",
         }
     }
 
     fn applicability(&self) -> Applicability {
         match self {
-            Self::Expr(_, ap) | Self::IfSequence(_, ap) => *ap,
+            Self::Expr(_, ap) | Self::NeedsPar(_, ap) => *ap,
             _ => Applicability::MachineApplicable,
         }
     }
 }
 
-impl<'tcx> Display for RetReplacement<'tcx> {
+impl Display for RetReplacement<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Empty => write!(f, ""),
             Self::Block => write!(f, "{{}}"),
             Self::Unit => write!(f, "()"),
-            Self::IfSequence(inner, _) => write!(f, "({inner})"),
+            Self::NeedsPar(inner, _) => write!(f, "({inner})"),
             Self::Expr(inner, _) => write!(f, "{inner}"),
         }
     }
@@ -243,16 +250,25 @@ impl<'tcx> LateLintPass<'tcx> for Return {
                 |err| {
                     err.span_label(local.span, "unnecessary `let` binding");
 
-                    if let Some(mut snippet) = snippet_opt(cx, initexpr.span) {
-                        if !cx.typeck_results().expr_adjustments(retexpr).is_empty() {
-                            if !has_enclosing_paren(&snippet) {
-                                snippet = format!("({snippet})");
+                    if let Some(src) = initexpr.span.get_source_text(cx) {
+                        let sugg = if binary_expr_needs_parentheses(initexpr) {
+                            if has_enclosing_paren(&src) {
+                                src.to_owned()
+                            } else {
+                                format!("({src})")
                             }
-                            snippet.push_str(" as _");
-                        }
+                        } else if !cx.typeck_results().expr_adjustments(retexpr).is_empty() {
+                            if has_enclosing_paren(&src) {
+                                format!("{src} as _")
+                            } else {
+                                format!("({src}) as _")
+                            }
+                        } else {
+                            src.to_owned()
+                        };
                         err.multipart_suggestion(
                             "return the expression directly",
-                            vec![(local.span, String::new()), (retexpr.span, snippet)],
+                            vec![(local.span, String::new()), (retexpr.span, sugg)],
                             Applicability::MachineApplicable,
                         );
                     } else {
@@ -349,8 +365,8 @@ fn check_final_expr<'tcx>(
 
                 let mut applicability = Applicability::MachineApplicable;
                 let (snippet, _) = snippet_with_context(cx, inner_expr.span, ret_span.ctxt(), "..", &mut applicability);
-                if expr_contains_conjunctive_ifs(inner_expr) {
-                    RetReplacement::IfSequence(snippet, applicability)
+                if binary_expr_needs_parentheses(inner_expr) {
+                    RetReplacement::NeedsPar(snippet, applicability)
                 } else {
                     RetReplacement::Expr(snippet, applicability)
                 }
@@ -373,12 +389,52 @@ fn check_final_expr<'tcx>(
                 }
             };
 
-            if !cx.tcx.hir().attrs(expr.hir_id).is_empty() {
+            if let Some(inner) = inner {
+                if for_each_unconsumed_temporary(cx, inner, |temporary_ty| {
+                    if temporary_ty.has_significant_drop(cx.tcx, cx.param_env)
+                        && temporary_ty
+                            .walk()
+                            .any(|arg| matches!(arg.unpack(), GenericArgKind::Lifetime(re) if !re.is_static()))
+                    {
+                        ControlFlow::Break(())
+                    } else {
+                        ControlFlow::Continue(())
+                    }
+                })
+                .is_break()
+                {
+                    return;
+                }
+            }
+
+            if ret_span.from_expansion() || is_from_proc_macro(cx, expr) {
                 return;
             }
-            let borrows = inner.map_or(false, |inner| last_statement_borrows(cx, inner));
-            if borrows {
-                return;
+
+            // Returns may be used to turn an expression into a statement in rustc's AST.
+            // This allows the addition of attributes, like `#[allow]` (See: clippy#9361)
+            // `#[expect(clippy::needless_return)]` needs to be handled separately to
+            // actually fulfill the expectation (clippy::#12998)
+            match cx.tcx.hir().attrs(expr.hir_id) {
+                [] => {},
+                [attr] => {
+                    if matches!(Level::from_attr(attr), Some(Level::Expect(_)))
+                        && let metas = attr.meta_item_list()
+                        && let Some(lst) = metas
+                        && let [MetaItemInner::MetaItem(meta_item), ..] = lst.as_slice()
+                        && let [tool, lint_name] = meta_item.path.segments.as_slice()
+                        && tool.ident.name == sym::clippy
+                        && matches!(
+                            lint_name.ident.name.as_str(),
+                            "needless_return" | "style" | "all" | "warnings"
+                        )
+                    {
+                        // This is an expectation of the `needless_return` lint
+                    } else {
+                        return;
+                    }
+                },
+                _ => return,
             }
 
             emit_return_lint(cx, ret_span, semi_spans, &replacement, expr.hir_id);
@@ -404,18 +460,6 @@ fn check_final_expr<'tcx>(
     }
 }
 
-fn expr_contains_conjunctive_ifs<'tcx>(expr: &'tcx Expr<'tcx>) -> bool {
-    fn contains_if(expr: &Expr<'_>, on_if: bool) -> bool {
-        match expr.kind {
-            ExprKind::If(..) => on_if,
-            ExprKind::Binary(_, left, right) => contains_if(left, true) || contains_if(right, true),
-            _ => false,
-        }
-    }
-
-    contains_if(expr, false)
-}
-
 fn emit_return_lint(
     cx: &LateContext<'_>,
     ret_span: Span,
@@ -423,10 +467,6 @@ fn emit_return_lint(
     replacement: &RetReplacement<'_>,
     at: HirId,
 ) {
-    if ret_span.from_expansion() {
-        return;
-    }
-
     span_lint_hir_and_then(
         cx,
         NEEDLESS_RETURN,
@@ -444,7 +484,7 @@ fn emit_return_lint(
 }
 
 fn last_statement_borrows<'tcx>(cx: &LateContext<'tcx>, expr: &'tcx Expr<'tcx>) -> bool {
-    for_each_expr_with_closures(cx, expr, |e| {
+    for_each_expr(cx, expr, |e| {
         if let Some(def_id) = fn_def_id(cx, e)
             && cx
                 .tcx

@@ -1,4 +1,4 @@
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use rustc_ast::ast;
 use rustc_ast::token::{Delimiter, TokenKind};
@@ -67,7 +67,7 @@ fn parse_cfg_if_inner<'a>(
                 Ok(None) => continue,
                 Err(err) => {
                     err.cancel();
-                    parser.psess.dcx.reset_err_count();
+                    parser.psess.dcx().reset_err_count();
                     return Err(
                         "Expected item inside cfg_if block, but failed to parse it as an item",
                     );

@@ -11,44 +11,49 @@ use rustc_hir as hir;
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_middle::bug;
-use rustc_middle::ty::fast_reject::{simplify_type, SimplifiedType, TreatParams};
+use rustc_middle::ty::fast_reject::{SimplifiedType, TreatParams, simplify_type};
 use rustc_middle::ty::{self, CrateInherentImpls, Ty, TyCtxt};
-use rustc_span::symbol::sym;
 use rustc_span::ErrorGuaranteed;
+use rustc_span::symbol::sym;
 
 use crate::errors;
 
 /// On-demand query: yields a map containing all types mapped to their inherent impls.
-pub fn crate_inherent_impls(
+pub(crate) fn crate_inherent_impls(
     tcx: TyCtxt<'_>,
     (): (),
-) -> Result<&'_ CrateInherentImpls, ErrorGuaranteed> {
+) -> (&'_ CrateInherentImpls, Result<(), ErrorGuaranteed>) {
     let mut collect = InherentCollect { tcx, impls_map: Default::default() };
+
     let mut res = Ok(());
     for id in tcx.hir().items() {
         res = res.and(collect.check_item(id));
     }
-    res?;
-    Ok(tcx.arena.alloc(collect.impls_map))
+
+    (tcx.arena.alloc(collect.impls_map), res)
 }
 
-pub fn crate_incoherent_impls(
+pub(crate) fn crate_inherent_impls_validity_check(
     tcx: TyCtxt<'_>,
-    simp: SimplifiedType,
-) -> Result<&[DefId], ErrorGuaranteed> {
-    let crate_map = tcx.crate_inherent_impls(())?;
-    Ok(tcx.arena.alloc_from_iter(
+    (): (),
+) -> Result<(), ErrorGuaranteed> {
+    tcx.crate_inherent_impls(()).1
+}
+
+pub(crate) fn crate_incoherent_impls(tcx: TyCtxt<'_>, simp: SimplifiedType) -> &[DefId] {
+    let (crate_map, _) = tcx.crate_inherent_impls(());
+    tcx.arena.alloc_from_iter(
         crate_map.incoherent_impls.get(&simp).unwrap_or(&Vec::new()).iter().map(|d| d.to_def_id()),
-    ))
+    )
 }
 
 /// On-demand query: yields a vector of the inherent impls for a specific type.
-pub fn inherent_impls(tcx: TyCtxt<'_>, ty_def_id: LocalDefId) -> Result<&[DefId], ErrorGuaranteed> {
-    let crate_map = tcx.crate_inherent_impls(())?;
-    Ok(match crate_map.inherent_impls.get(&ty_def_id) {
+pub(crate) fn inherent_impls(tcx: TyCtxt<'_>, ty_def_id: LocalDefId) -> &[DefId] {
+    let (crate_map, _) = tcx.crate_inherent_impls(());
+    match crate_map.inherent_impls.get(&ty_def_id) {
         Some(v) => &v[..],
         None => &[],
-    })
+    }
 }
 
 struct InherentCollect<'tcx> {
@@ -90,7 +95,8 @@ impl<'tcx> InherentCollect<'tcx> {
                 }
             }
 
-            if let Some(simp) = simplify_type(self.tcx, self_ty, TreatParams::AsCandidateKey) {
+            if let Some(simp) = simplify_type(self.tcx, self_ty, TreatParams::InstantiateWithInfer)
+            {
                 self.impls_map.incoherent_impls.entry(simp).or_default().push(impl_def_id);
             } else {
                 bug!("unexpected self type: {:?}", self_ty);
@@ -129,7 +135,7 @@ impl<'tcx> InherentCollect<'tcx> {
             }
         }
 
-        if let Some(simp) = simplify_type(self.tcx, ty, TreatParams::AsCandidateKey) {
+        if let Some(simp) = simplify_type(self.tcx, ty, TreatParams::InstantiateWithInfer) {
             self.impls_map.incoherent_impls.entry(simp).or_default().push(impl_def_id);
         } else {
             bug!("unexpected primitive type: {:?}", ty);
@@ -172,7 +178,7 @@ impl<'tcx> InherentCollect<'tcx> {
             | ty::RawPtr(_, _)
             | ty::Ref(..)
             | ty::Never
-            | ty::FnPtr(_)
+            | ty::FnPtr(..)
             | ty::Tuple(..) => self.check_primitive_impl(id, self_ty),
             ty::Alias(ty::Projection | ty::Inherent | ty::Opaque, _) | ty::Param(_) => {
                 Err(self.tcx.dcx().emit_err(errors::InherentNominal { span: item_span }))

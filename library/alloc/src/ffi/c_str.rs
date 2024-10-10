@@ -3,25 +3,21 @@
 #[cfg(test)]
 mod tests;
 
+use core::borrow::Borrow;
+use core::ffi::{CStr, c_char};
+use core::num::NonZero;
+use core::slice::memchr;
+use core::str::{self, Utf8Error};
+use core::{fmt, mem, ops, ptr, slice};
+
 use crate::borrow::{Cow, ToOwned};
 use crate::boxed::Box;
 use crate::rc::Rc;
 use crate::slice::hack::into_vec;
 use crate::string::String;
-use crate::vec::Vec;
-use core::borrow::Borrow;
-use core::ffi::{c_char, CStr};
-use core::fmt;
-use core::mem;
-use core::num::NonZero;
-use core::ops;
-use core::ptr;
-use core::slice;
-use core::slice::memchr;
-use core::str::{self, Utf8Error};
-
 #[cfg(target_has_atomic = "ptr")]
 use crate::sync::Arc;
+use crate::vec::Vec;
 
 /// A type representing an owned, C-compatible, nul-terminated string with no nul bytes in the
 /// middle.
@@ -580,6 +576,7 @@ impl CString {
     #[inline]
     #[must_use]
     #[stable(feature = "as_c_str", since = "1.20.0")]
+    #[cfg_attr(not(test), rustc_diagnostic_item = "cstring_as_c_str")]
     pub fn as_c_str(&self) -> &CStr {
         &*self
     }
@@ -699,6 +696,7 @@ impl CString {
 // memory-unsafe code from working by accident. Inline
 // to prevent LLVM from optimizing it away in debug builds.
 #[stable(feature = "cstring_drop", since = "1.13.0")]
+#[rustc_insignificant_dtor]
 impl Drop for CString {
     #[inline]
     fn drop(&mut self) {
@@ -911,7 +909,7 @@ impl From<&CStr> for Rc<CStr> {
 }
 
 #[cfg(not(no_global_oom_handling))]
-#[stable(feature = "more_rc_default_impls", since = "CURRENT_RUSTC_VERSION")]
+#[stable(feature = "more_rc_default_impls", since = "1.80.0")]
 impl Default for Rc<CStr> {
     /// Creates an empty CStr inside an Rc
     ///

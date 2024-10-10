@@ -1,16 +1,18 @@
 use std::fmt::Write;
 
 use gccjit::{Struct, Type};
-use rustc_codegen_ssa::traits::{BaseTypeMethods, DerivedTypeMethods, LayoutTypeMethods};
+use rustc_abi as abi;
+use rustc_abi::Primitive::*;
+use rustc_abi::{Abi, FieldsShape, Integer, PointeeInfo, Size, Variants};
+use rustc_codegen_ssa::traits::{
+    BaseTypeCodegenMethods, DerivedTypeCodegenMethods, LayoutTypeCodegenMethods,
+};
 use rustc_middle::bug;
 use rustc_middle::ty::layout::{LayoutOf, TyAndLayout};
 use rustc_middle::ty::print::with_no_trimmed_paths;
-use rustc_middle::ty::{self, Ty, TypeVisitableExt};
+use rustc_middle::ty::{self, CoroutineArgsExt, Ty, TypeVisitableExt};
+use rustc_target::abi::TyAbiInterface;
 use rustc_target::abi::call::{CastTarget, FnAbi, Reg};
-use rustc_target::abi::{
-    self, Abi, Align, FieldsShape, Float, Int, Integer, PointeeInfo, Pointer, Size, TyAbiInterface,
-    Variants,
-};
 
 use crate::abi::{FnAbiGcc, FnAbiGccExt, GccType};
 use crate::context::CodegenCx;
@@ -53,12 +55,6 @@ impl<'gcc, 'tcx> CodegenCx<'gcc, 'tcx> {
     }
 }
 
-impl<'a, 'tcx> CodegenCx<'a, 'tcx> {
-    pub fn align_of(&self, ty: Ty<'tcx>) -> Align {
-        self.layout_of(ty).align.abi
-    }
-}
-
 fn uncached_gcc_type<'gcc, 'tcx>(
     cx: &CodegenCx<'gcc, 'tcx>,
     layout: TyAndLayout<'tcx>,
@@ -90,7 +86,7 @@ fn uncached_gcc_type<'gcc, 'tcx>(
         Abi::Uninhabited | Abi::Aggregate { .. } => {}
     }
 
-    let name = match layout.ty.kind() {
+    let name = match *layout.ty.kind() {
         // FIXME(eddyb) producing readable type names for trait objects can result
         // in problematically distinct types due to HRTB and subtyping (see #47638).
         // ty::Dynamic(..) |
@@ -211,7 +207,7 @@ impl<'tcx> LayoutGccExt<'tcx> for TyAndLayout<'tcx> {
         // layout.
         if let Abi::Scalar(ref scalar) = self.abi {
             // Use a different cache for scalars because pointers to DSTs
-            // can be either fat or thin (data pointers of fat pointers).
+            // can be either wide or thin (data pointers of wide pointers).
             if let Some(&ty) = cx.scalar_types.borrow().get(&self.ty) {
                 return ty;
             }
@@ -219,9 +215,8 @@ impl<'tcx> LayoutGccExt<'tcx> for TyAndLayout<'tcx> {
                 // NOTE: we cannot remove this match like in the LLVM codegen because the call
                 // to fn_ptr_backend_type handle the on-stack attribute.
                 // TODO(antoyo): find a less hackish way to hande the on-stack attribute.
-                ty::FnPtr(sig) => {
-                    cx.fn_ptr_backend_type(&cx.fn_abi_of_fn_ptr(sig, ty::List::empty()))
-                }
+                ty::FnPtr(sig_tys, hdr) => cx
+                    .fn_ptr_backend_type(cx.fn_abi_of_fn_ptr(sig_tys.with(hdr), ty::List::empty())),
                 _ => self.scalar_gcc_type_at(cx, scalar, Size::ZERO),
             };
             cx.scalar_types.borrow_mut().insert(self.ty, ty);
@@ -337,7 +332,7 @@ impl<'tcx> LayoutGccExt<'tcx> for TyAndLayout<'tcx> {
     }
 }
 
-impl<'gcc, 'tcx> LayoutTypeMethods<'tcx> for CodegenCx<'gcc, 'tcx> {
+impl<'gcc, 'tcx> LayoutTypeCodegenMethods<'tcx> for CodegenCx<'gcc, 'tcx> {
     fn backend_type(&self, layout: TyAndLayout<'tcx>) -> Type<'gcc> {
         layout.gcc_type(self)
     }

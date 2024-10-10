@@ -1,26 +1,28 @@
-use super::ty::{AllowPlus, RecoverQPath, RecoverReturnSign};
-use super::{Parser, Restrictions, TokenType};
-use crate::errors::PathSingleColon;
-use crate::parser::{CommaRecoveryMode, RecoverColon, RecoverComma};
-use crate::{errors, maybe_whole};
+use std::mem;
+
 use ast::token::IdentIsRaw;
 use rustc_ast::ptr::P;
 use rustc_ast::token::{self, Delimiter, Token, TokenKind};
 use rustc_ast::{
-    self as ast, AngleBracketedArg, AngleBracketedArgs, AnonConst, AssocConstraint,
-    AssocConstraintKind, BlockCheckMode, GenericArg, GenericArgs, Generics, ParenthesizedArgs,
+    self as ast, AngleBracketedArg, AngleBracketedArgs, AnonConst, AssocItemConstraint,
+    AssocItemConstraintKind, BlockCheckMode, GenericArg, GenericArgs, Generics, ParenthesizedArgs,
     Path, PathSegment, QSelf,
 };
 use rustc_errors::{Applicability, Diag, PResult};
-use rustc_span::symbol::{kw, sym, Ident};
+use rustc_span::symbol::{Ident, kw, sym};
 use rustc_span::{BytePos, Span};
-use std::mem;
 use thin_vec::ThinVec;
 use tracing::debug;
 
+use super::ty::{AllowPlus, RecoverQPath, RecoverReturnSign};
+use super::{Parser, Restrictions, TokenType};
+use crate::errors::{PathSingleColon, PathTripleColon};
+use crate::parser::{CommaRecoveryMode, RecoverColon, RecoverComma};
+use crate::{errors, maybe_whole};
+
 /// Specifies how to parse a path.
 #[derive(Copy, Clone, PartialEq)]
-pub enum PathStyle {
+pub(super) enum PathStyle {
     /// In some contexts, notably in expressions, paths with generic arguments are ambiguous
     /// with something else. For example, in expressions `segment < ....` can be interpreted
     /// as a comparison and `segment ( ....` can be interpreted as a function call.
@@ -105,10 +107,11 @@ impl<'a> Parser<'a> {
             self.parse_path_segments(&mut path.segments, style, None)?;
         }
 
-        Ok((
-            qself,
-            Path { segments: path.segments, span: lo.to(self.prev_token.span), tokens: None },
-        ))
+        Ok((qself, Path {
+            segments: path.segments,
+            span: lo.to(self.prev_token.span),
+            tokens: None,
+        }))
     }
 
     /// Recover from an invalid single colon, when the user likely meant a qualified path.
@@ -208,7 +211,7 @@ impl<'a> Parser<'a> {
         let lo = self.token.span;
         let mut segments = ThinVec::new();
         let mod_sep_ctxt = self.token.span.ctxt();
-        if self.eat(&token::PathSep) {
+        if self.eat_path_sep() {
             segments.push(PathSegment::path_root(lo.shrink_to_lo().with_ctxt(mod_sep_ctxt)));
         }
         self.parse_path_segments(&mut segments, style, ty_generics)?;
@@ -244,7 +247,7 @@ impl<'a> Parser<'a> {
             }
             segments.push(segment);
 
-            if self.is_import_coupler() || !self.eat(&token::PathSep) {
+            if self.is_import_coupler() || !self.eat_path_sep() {
                 if style == PathStyle::Expr
                     && self.may_recover()
                     && self.token == token::Colon
@@ -258,11 +261,8 @@ impl<'a> Parser<'a> {
                         self.bump(); // bump past the colon
                         self.dcx().emit_err(PathSingleColon {
                             span: self.prev_token.span,
-                            type_ascription: self
-                                .psess
-                                .unstable_features
-                                .is_nightly_build()
-                                .then_some(()),
+                            suggestion: self.prev_token.span.shrink_to_hi(),
+                            type_ascription: self.psess.unstable_features.is_nightly_build(),
                         });
                     }
                     continue;
@@ -271,6 +271,18 @@ impl<'a> Parser<'a> {
                 return Ok(());
             }
         }
+    }
+
+    /// Eat `::` or, potentially, `:::`.
+    #[must_use]
+    pub(super) fn eat_path_sep(&mut self) -> bool {
+        let result = self.eat(&token::PathSep);
+        if result && self.may_recover() {
+            if self.eat_noexpect(&token::Colon) {
+                self.dcx().emit_err(PathTripleColon { span: self.prev_token.span });
+            }
+        }
+        result
     }
 
     pub(super) fn parse_path_segment(
@@ -298,9 +310,7 @@ impl<'a> Parser<'a> {
 
         Ok(
             if style == PathStyle::Type && check_args_start(self)
-                || style != PathStyle::Mod
-                    && self.check(&token::PathSep)
-                    && self.look_ahead(1, |t| is_args_start(t))
+                || style != PathStyle::Mod && self.check_path_sep_and_look_ahead(is_args_start)
             {
                 // We use `style == PathStyle::Expr` to check if this is in a recursion or not. If
                 // it isn't, then we reset the unmatched angle bracket count as we're about to start
@@ -310,7 +320,9 @@ impl<'a> Parser<'a> {
                 }
 
                 // Generic arguments are found - `<`, `(`, `::<` or `::(`.
-                self.eat(&token::PathSep);
+                // First, eat `::` if it exists.
+                let _ = self.eat_path_sep();
+
                 let lo = self.token.span;
                 let args = if self.eat_lt() {
                     // `<'a, T, A = U>`
@@ -329,11 +341,8 @@ impl<'a> Parser<'a> {
                             err.cancel();
                             err = self.dcx().create_err(PathSingleColon {
                                 span: self.token.span,
-                                type_ascription: self
-                                    .psess
-                                    .unstable_features
-                                    .is_nightly_build()
-                                    .then_some(()),
+                                suggestion: self.prev_token.span.shrink_to_hi(),
+                                type_ascription: self.psess.unstable_features.is_nightly_build(),
                             });
                         }
                         // Attempt to find places where a missing `>` might belong.
@@ -353,17 +362,16 @@ impl<'a> Parser<'a> {
                     })?;
                     let span = lo.to(self.prev_token.span);
                     AngleBracketedArgs { args, span }.into()
-                } else if self.may_recover()
-                    && self.token.kind == token::OpenDelim(Delimiter::Parenthesis)
+                } else if self.token == token::OpenDelim(Delimiter::Parenthesis)
                     // FIXME(return_type_notation): Could also recover `...` here.
-                    && self.look_ahead(1, |tok| tok.kind == token::DotDot)
+                    && self.look_ahead(1, |t| *t == token::DotDot)
                 {
-                    self.bump();
-                    self.dcx()
-                        .emit_err(errors::BadReturnTypeNotationDotDot { span: self.token.span });
-                    self.bump();
+                    self.bump(); // (
+                    self.bump(); // ..
                     self.expect(&token::CloseDelim(Delimiter::Parenthesis))?;
                     let span = lo.to(self.prev_token.span);
+
+                    self.psess.gated_spans.gate(sym::return_type_notation, span);
 
                     if self.eat_noexpect(&token::RArrow) {
                         let lo = self.prev_token.span;
@@ -372,13 +380,7 @@ impl<'a> Parser<'a> {
                             .emit_err(errors::BadReturnTypeNotationOutput { span: lo.to(ty.span) });
                     }
 
-                    ParenthesizedArgs {
-                        span,
-                        inputs: ThinVec::new(),
-                        inputs_span: span,
-                        output: ast::FnRetTy::Default(self.prev_token.span.shrink_to_hi()),
-                    }
-                    .into()
+                    P(ast::GenericArgs::ParenthesizedElided(span))
                 } else {
                     // `(T, U) -> R`
 
@@ -386,16 +388,19 @@ impl<'a> Parser<'a> {
                     let token_before_parsing = self.token.clone();
                     let mut snapshot = None;
                     if self.may_recover()
-                        && prev_token_before_parsing.kind == token::PathSep
+                        && prev_token_before_parsing == token::PathSep
                         && (style == PathStyle::Expr && self.token.can_begin_expr()
-                            || style == PathStyle::Pat && self.token.can_begin_pattern())
+                            || style == PathStyle::Pat
+                                && self.token.can_begin_pattern(token::NtPatKind::PatParam {
+                                    inferred: false,
+                                }))
                     {
                         snapshot = Some(self.create_snapshot_for_diagnostic());
                     }
 
                     let (inputs, _) = match self.parse_paren_comma_seq(|p| p.parse_ty()) {
                         Ok(output) => output,
-                        Err(mut error) if prev_token_before_parsing.kind == token::PathSep => {
+                        Err(mut error) if prev_token_before_parsing == token::PathSep => {
                             error.span_label(
                                 prev_token_before_parsing.span.to(token_before_parsing.span),
                                 "while parsing this parenthesized list of type arguments starting here",
@@ -483,16 +488,13 @@ impl<'a> Parser<'a> {
 
         error.span_suggestion_verbose(
             prev_token_before_parsing.span,
-            format!(
-                "consider removing the `::` here to {}",
-                match style {
-                    PathStyle::Expr => "call the expression",
-                    PathStyle::Pat => "turn this into a tuple struct pattern",
-                    _ => {
-                        return;
-                    }
+            format!("consider removing the `::` here to {}", match style {
+                PathStyle::Expr => "call the expression",
+                PathStyle::Pat => "turn this into a tuple struct pattern",
+                _ => {
+                    return;
                 }
-            ),
+            }),
             "",
             Applicability::MaybeIncorrect,
         );
@@ -678,12 +680,12 @@ impl<'a> Parser<'a> {
                     err.emit();
                     continue;
                 }
-                if !self.token.kind.should_end_const_arg() {
-                    if self.handle_ambiguous_unbraced_const_arg(&mut args)? {
-                        // We've managed to (partially) recover, so continue trying to parse
-                        // arguments.
-                        continue;
-                    }
+                if !self.token.kind.should_end_const_arg()
+                    && self.handle_ambiguous_unbraced_const_arg(&mut args)?
+                {
+                    // We've managed to (partially) recover, so continue trying to parse
+                    // arguments.
+                    continue;
                 }
                 break;
             }
@@ -720,10 +722,7 @@ impl<'a> Parser<'a> {
                         ));
                     }
                     let kind = if self.eat(&token::Colon) {
-                        // Parse associated type constraint bound.
-
-                        let bounds = self.parse_generic_bounds()?;
-                        AssocConstraintKind::Bound { bounds }
+                        AssocItemConstraintKind::Bound { bounds: self.parse_generic_bounds()? }
                     } else if self.eat(&token::Eq) {
                         self.parse_assoc_equality_term(
                             ident,
@@ -735,17 +734,9 @@ impl<'a> Parser<'a> {
                     };
 
                     let span = lo.to(self.prev_token.span);
-                    // Gate associated type bounds, e.g., `Iterator<Item: Ord>`.
-                    if let AssocConstraintKind::Bound { .. } = kind {
-                        if let Some(ast::GenericArgs::Parenthesized(args)) = &gen_args
-                            && args.inputs.is_empty()
-                            && matches!(args.output, ast::FnRetTy::Default(..))
-                        {
-                            self.psess.gated_spans.gate(sym::return_type_notation, span);
-                        }
-                    }
+
                     let constraint =
-                        AssocConstraint { id: ast::DUMMY_NODE_ID, ident, gen_args, kind, span };
+                        AssocItemConstraint { id: ast::DUMMY_NODE_ID, ident, gen_args, kind, span };
                     Ok(Some(AngleBracketedArg::Constraint(constraint)))
                 } else {
                     // we only want to suggest `:` and `=` in contexts where the previous token
@@ -772,7 +763,7 @@ impl<'a> Parser<'a> {
         ident: Ident,
         gen_args: Option<&GenericArgs>,
         eq: Span,
-    ) -> PResult<'a, AssocConstraintKind> {
+    ) -> PResult<'a, AssocItemConstraintKind> {
         let arg = self.parse_generic_arg(None)?;
         let span = ident.span.to(self.prev_token.span);
         let term = match arg {
@@ -820,7 +811,7 @@ impl<'a> Parser<'a> {
                 return Err(err);
             }
         };
-        Ok(AssocConstraintKind::Equality { term })
+        Ok(AssocItemConstraintKind::Equality { term })
     }
 
     /// We do not permit arbitrary expressions as const arguments. They must be one of:
@@ -839,7 +830,8 @@ impl<'a> Parser<'a> {
             // We can only resolve single-segment paths at the moment, because multi-segment paths
             // require type-checking: see `visit_generic_arg` in `src/librustc_resolve/late.rs`.
             ast::ExprKind::Path(None, path)
-                if path.segments.len() == 1 && path.segments[0].args.is_none() =>
+                if let [segment] = path.segments.as_slice()
+                    && segment.args.is_none() =>
             {
                 true
             }
@@ -923,8 +915,9 @@ impl<'a> Parser<'a> {
             // Fall back by trying to parse a const-expr expression. If we successfully do so,
             // then we should report an error that it needs to be wrapped in braces.
             let snapshot = self.create_snapshot_for_diagnostic();
-            match self.parse_expr_res(Restrictions::CONST_EXPR, None) {
-                Ok(expr) => {
+            let attrs = self.parse_outer_attributes()?;
+            match self.parse_expr_res(Restrictions::CONST_EXPR, attrs) {
+                Ok((expr, _)) => {
                     return Ok(Some(self.dummy_const_arg_needs_braces(
                         self.dcx().struct_span_err(expr.span, "invalid const generic expression"),
                         expr.span,
@@ -941,7 +934,7 @@ impl<'a> Parser<'a> {
     }
 
     /// Given a arg inside of generics, we try to destructure it as if it were the LHS in
-    /// `LHS = ...`, i.e. an associated type binding.
+    /// `LHS = ...`, i.e. an associated item binding.
     /// This returns a bool indicating if there are any `for<'a, 'b>` binder args, the
     /// identifier, and any GAT arguments.
     fn get_ident_from_generic_arg(

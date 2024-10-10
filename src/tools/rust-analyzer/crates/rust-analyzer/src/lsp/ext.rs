@@ -3,20 +3,44 @@
 #![allow(clippy::disallowed_types)]
 
 use std::ops;
-use std::path::PathBuf;
 
-use ide_db::line_index::WideEncoding;
 use lsp_types::request::Request;
+use lsp_types::Url;
 use lsp_types::{
     notification::Notification, CodeActionKind, DocumentOnTypeFormattingParams,
     PartialResultParams, Position, Range, TextDocumentIdentifier, WorkDoneProgressParams,
 };
-use lsp_types::{PositionEncodingKind, Url};
+use paths::Utf8PathBuf;
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
-use crate::line_index::PositionEncoding;
+pub enum InternalTestingFetchConfig {}
 
+#[derive(Deserialize, Serialize, Debug)]
+pub enum InternalTestingFetchConfigOption {
+    AssistEmitMustUse,
+    CheckWorkspace,
+}
+
+#[derive(Deserialize, Serialize, Debug, PartialEq, Eq)]
+pub enum InternalTestingFetchConfigResponse {
+    AssistEmitMustUse(bool),
+    CheckWorkspace(bool),
+}
+
+impl Request for InternalTestingFetchConfig {
+    type Params = InternalTestingFetchConfigParams;
+    // Option is solely to circumvent Default bound.
+    type Result = Option<InternalTestingFetchConfigResponse>;
+    const METHOD: &'static str = "rust-analyzer-internal/internalTestingFetchConfig";
+}
+
+#[derive(Deserialize, Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct InternalTestingFetchConfigParams {
+    pub text_document: Option<TextDocumentIdentifier>,
+    pub config: InternalTestingFetchConfigOption,
+}
 pub enum AnalyzerStatus {}
 
 impl Request for AnalyzerStatus {
@@ -50,7 +74,7 @@ impl Request for FetchDependencyList {
 #[serde(rename_all = "camelCase")]
 pub struct FetchDependencyListParams {}
 
-#[derive(Deserialize, Serialize, Debug)]
+#[derive(Deserialize, Serialize, Debug, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct FetchDependencyListResult {
     pub crates: Vec<CrateInfoResult>,
@@ -62,14 +86,6 @@ impl Request for MemoryUsage {
     type Params = ();
     type Result = String;
     const METHOD: &'static str = "rust-analyzer/memoryUsage";
-}
-
-pub enum ShuffleCrateGraph {}
-
-impl Request for ShuffleCrateGraph {
-    type Params = ();
-    type Result = ();
-    const METHOD: &'static str = "rust-analyzer/shuffleCrateGraph";
 }
 
 pub enum ReloadWorkspace {}
@@ -191,7 +207,7 @@ pub struct TestItem {
     pub runnable: Option<Runnable>,
 }
 
-#[derive(Deserialize, Serialize, Debug)]
+#[derive(Deserialize, Serialize, Debug, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct DiscoverTestResults {
     pub tests: Vec<TestItem>,
@@ -425,30 +441,48 @@ pub struct Runnable {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub location: Option<lsp_types::LocationLink>,
     pub kind: RunnableKind,
-    pub args: CargoRunnable,
+    pub args: RunnableArgs,
+}
+
+#[derive(Deserialize, Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+#[serde(untagged)]
+pub enum RunnableArgs {
+    Cargo(CargoRunnableArgs),
+    Shell(ShellRunnableArgs),
 }
 
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(rename_all = "lowercase")]
 pub enum RunnableKind {
     Cargo,
+    Shell,
 }
 
 #[derive(Deserialize, Serialize, Debug)]
 #[serde(rename_all = "camelCase")]
-pub struct CargoRunnable {
-    // command to be executed instead of cargo
+pub struct CargoRunnableArgs {
+    #[serde(skip_serializing_if = "FxHashMap::is_empty")]
+    pub environment: FxHashMap<String, String>,
+    pub cwd: Utf8PathBuf,
+    /// Command to be executed instead of cargo
     pub override_cargo: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub workspace_root: Option<PathBuf>,
+    pub workspace_root: Option<Utf8PathBuf>,
     // command, --package and --lib stuff
     pub cargo_args: Vec<String>,
-    // user-specified additional cargo args, like `--release`.
-    pub cargo_extra_args: Vec<String>,
     // stuff after --
     pub executable_args: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub expect_test: Option<bool>,
+}
+
+#[derive(Deserialize, Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ShellRunnableArgs {
+    #[serde(skip_serializing_if = "FxHashMap::is_empty")]
+    pub environment: FxHashMap<String, String>,
+    pub cwd: Utf8PathBuf,
+    pub program: String,
+    pub args: Vec<String>,
 }
 
 pub enum RelatedTests {}
@@ -500,10 +534,9 @@ pub struct ServerStatusParams {
     pub health: Health,
     pub quiescent: bool,
     pub message: Option<String>,
-    pub workspace_info: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 #[serde(rename_all = "camelCase")]
 pub enum Health {
     Ok,
@@ -670,6 +703,12 @@ pub enum ExternalDocsResponse {
     WithLocal(ExternalDocsPair),
 }
 
+impl Default for ExternalDocsResponse {
+    fn default() -> Self {
+        ExternalDocsResponse::Simple(None)
+    }
+}
+
 #[derive(Debug, Default, PartialEq, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct ExternalDocsPair {
@@ -704,24 +743,6 @@ pub struct CodeLensResolveData {
 pub enum CodeLensResolveDataKind {
     Impls(lsp_types::request::GotoImplementationParams),
     References(lsp_types::TextDocumentPositionParams),
-}
-
-pub fn negotiated_encoding(caps: &lsp_types::ClientCapabilities) -> PositionEncoding {
-    let client_encodings = match &caps.general {
-        Some(general) => general.position_encodings.as_deref().unwrap_or_default(),
-        None => &[],
-    };
-
-    for enc in client_encodings {
-        if enc == &PositionEncodingKind::UTF8 {
-            return PositionEncoding::Utf8;
-        } else if enc == &PositionEncodingKind::UTF32 {
-            return PositionEncoding::Wide(WideEncoding::Utf32);
-        }
-        // NB: intentionally prefer just about anything else to utf-16.
-    }
-
-    PositionEncoding::Wide(WideEncoding::Utf16)
 }
 
 pub enum MoveItem {}
@@ -804,6 +825,7 @@ pub struct CompletionResolveData {
     pub position: lsp_types::TextDocumentPositionParams,
     pub imports: Vec<CompletionImport>,
     pub version: Option<i32>,
+    pub trigger_character: Option<char>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -811,6 +833,7 @@ pub struct InlayHintResolveData {
     pub file_id: u32,
     // This is a string instead of a u64 as javascript can't represent u64 fully
     pub hash: String,
+    pub resolve_range: lsp_types::Range,
     pub version: Option<i32>,
 }
 
@@ -823,17 +846,4 @@ pub struct CompletionImport {
 #[derive(Debug, Deserialize, Default)]
 pub struct ClientCommandOptions {
     pub commands: Vec<String>,
-}
-
-pub enum UnindexedProject {}
-
-impl Notification for UnindexedProject {
-    type Params = UnindexedProjectParams;
-    const METHOD: &'static str = "rust-analyzer/unindexedProject";
-}
-
-#[derive(Deserialize, Serialize, Debug)]
-#[serde(rename_all = "camelCase")]
-pub struct UnindexedProjectParams {
-    pub text_documents: Vec<TextDocumentIdentifier>,
 }

@@ -1,7 +1,7 @@
 #[cfg(feature = "master")]
 use gccjit::{FnAttribute, ToRValue};
 use gccjit::{Function, FunctionType, GlobalKind, LValue, RValue, Type};
-use rustc_codegen_ssa::traits::BaseTypeMethods;
+use rustc_codegen_ssa::traits::BaseTypeCodegenMethods;
 use rustc_middle::ty::Ty;
 use rustc_span::Symbol;
 use rustc_target::abi::call::FnAbi;
@@ -35,7 +35,7 @@ impl<'gcc, 'tcx> CodegenCx<'gcc, 'tcx> {
 
     pub fn declare_unnamed_global(&self, ty: Type<'gcc>) -> LValue<'gcc> {
         let name = self.generate_local_symbol_name("global");
-        self.context.new_global(None, GlobalKind::Internal, ty, &name)
+        self.context.new_global(None, GlobalKind::Internal, ty, name)
     }
 
     pub fn declare_global_with_linkage(
@@ -168,7 +168,15 @@ fn declare_raw_fn<'gcc>(
     variadic: bool,
 ) -> Function<'gcc> {
     if name.starts_with("llvm.") {
-        let intrinsic = llvm::intrinsic(name, cx);
+        let intrinsic = match name {
+            "llvm.fma.f16" => {
+                // fma is not a target builtin, but a normal builtin, so we handle it differently
+                // here.
+                cx.context.get_builtin_function("fma")
+            }
+            _ => llvm::intrinsic(name, cx),
+        };
+
         cx.intrinsics.borrow_mut().insert(name.to_string(), intrinsic);
         return intrinsic;
     }
@@ -176,16 +184,14 @@ fn declare_raw_fn<'gcc>(
         cx.functions.borrow()[name]
     } else {
         let params: Vec<_> = param_types
-            .into_iter()
+            .iter()
             .enumerate()
-            .map(|(index, param)| {
-                cx.context.new_parameter(None, *param, &format!("param{}", index))
-            }) // TODO(antoyo): set name.
+            .map(|(index, param)| cx.context.new_parameter(None, *param, format!("param{}", index))) // TODO(antoyo): set name.
             .collect();
         #[cfg(not(feature = "master"))]
-        let name = mangle_name(name);
+        let name = &mangle_name(name);
         let func =
-            cx.context.new_function(None, cx.linkage.get(), return_type, &params, &name, variadic);
+            cx.context.new_function(None, cx.linkage.get(), return_type, &params, name, variadic);
         cx.functions.borrow_mut().insert(name.to_string(), func);
 
         #[cfg(feature = "master")]
@@ -200,10 +206,10 @@ fn declare_raw_fn<'gcc>(
             // create a wrapper function that calls rust_eh_personality.
 
             let params: Vec<_> = param_types
-                .into_iter()
+                .iter()
                 .enumerate()
                 .map(|(index, param)| {
-                    cx.context.new_parameter(None, *param, &format!("param{}", index))
+                    cx.context.new_parameter(None, *param, format!("param{}", index))
                 }) // TODO(antoyo): set name.
                 .collect();
             let gcc_func = cx.context.new_function(

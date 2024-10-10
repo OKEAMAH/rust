@@ -6,14 +6,15 @@ pub mod scope;
 #[cfg(test)]
 mod tests;
 
-use std::ops::Index;
+use std::ops::{Deref, Index};
 
 use base_db::CrateId;
 use cfg::{CfgExpr, CfgOptions};
-use hir_expand::{name::Name, InFile};
-use la_arena::{Arena, ArenaMap};
+use hir_expand::{name::Name, ExpandError, InFile};
+use la_arena::{Arena, ArenaMap, Idx, RawIdx};
 use rustc_hash::FxHashMap;
-use span::MacroFileId;
+use smallvec::SmallVec;
+use span::{Edition, MacroFileId};
 use syntax::{ast, AstPtr, SyntaxNodePtr};
 use triomphe::Arc;
 
@@ -23,6 +24,7 @@ use crate::{
     hir::{
         dummy_expr_id, Binding, BindingId, Expr, ExprId, Label, LabelId, Pat, PatId, RecordFieldPat,
     },
+    item_tree::AttrOwner,
     nameres::DefMap,
     path::{ModPath, Path},
     src::HasSource,
@@ -91,13 +93,21 @@ pub struct BodySourceMap {
     label_map_back: ArenaMap<LabelId, LabelSource>,
 
     self_param: Option<InFile<AstPtr<ast::SelfParam>>>,
+    binding_definitions: FxHashMap<BindingId, SmallVec<[PatId; 4]>>,
 
     /// We don't create explicit nodes for record fields (`S { record_field: 92 }`).
     /// Instead, we use id of expression (`92`) to identify the field.
     field_map_back: FxHashMap<ExprId, FieldSource>,
     pat_field_map_back: FxHashMap<PatId, PatFieldSource>,
 
-    format_args_template_map: FxHashMap<ExprId, Vec<(syntax::TextRange, Name)>>,
+    template_map: Option<
+        Box<(
+            // format_args!
+            FxHashMap<ExprId, Vec<(syntax::TextRange, Name)>>,
+            // asm!
+            FxHashMap<ExprId, Vec<Vec<(syntax::TextRange, usize)>>>,
+        )>,
+    >,
 
     expansions: FxHashMap<InFile<AstPtr<ast::MacroCall>>, MacroFileId>,
 
@@ -112,10 +122,10 @@ pub struct SyntheticSyntax;
 #[derive(Debug, Eq, PartialEq)]
 pub enum BodyDiagnostic {
     InactiveCode { node: InFile<SyntaxNodePtr>, cfg: CfgExpr, opts: CfgOptions },
-    MacroError { node: InFile<AstPtr<ast::MacroCall>>, message: String },
-    UnresolvedProcMacro { node: InFile<AstPtr<ast::MacroCall>>, krate: CrateId },
+    MacroError { node: InFile<AstPtr<ast::MacroCall>>, err: ExpandError },
     UnresolvedMacroCall { node: InFile<AstPtr<ast::MacroCall>>, path: ModPath },
     UnreachableLabel { node: InFile<AstPtr<ast::Lifetime>>, name: Name },
+    AwaitOutsideOfAsync { node: InFile<AstPtr<ast::AwaitExpr>>, location: String },
     UndeclaredLabel { node: InFile<AstPtr<ast::Lifetime>>, name: Name },
 }
 
@@ -124,7 +134,7 @@ impl Body {
         db: &dyn DefDatabase,
         def: DefWithBodyId,
     ) -> (Arc<Body>, Arc<BodySourceMap>) {
-        let _p = tracing::span!(tracing::Level::INFO, "body_with_source_map_query").entered();
+        let _p = tracing::info_span!("body_with_source_map_query").entered();
         let mut params = None;
 
         let mut is_async_fn = false;
@@ -134,21 +144,28 @@ impl Body {
                     let data = db.function_data(f);
                     let f = f.lookup(db);
                     let src = f.source(db);
-                    params = src.value.param_list().map(|param_list| {
+                    params = src.value.param_list().map(move |param_list| {
                         let item_tree = f.id.item_tree(db);
                         let func = &item_tree[f.id.value];
                         let krate = f.container.module(db).krate;
                         let crate_graph = db.crate_graph();
                         (
                             param_list,
-                            func.params.clone().map(move |param| {
+                            (0..func.params.len()).map(move |idx| {
                                 item_tree
-                                    .attrs(db, krate, param.into())
+                                    .attrs(
+                                        db,
+                                        krate,
+                                        AttrOwner::Param(
+                                            f.id.value,
+                                            Idx::from_raw(RawIdx::from(idx as u32)),
+                                        ),
+                                    )
                                     .is_cfg_enabled(&crate_graph[krate].cfg_options)
                             }),
                         )
                     });
-                    is_async_fn = data.has_async_kw();
+                    is_async_fn = data.is_async();
                     src.map(|it| it.body().map(ast::Expr::from))
                 }
                 DefWithBodyId::ConstId(c) => {
@@ -187,12 +204,17 @@ impl Body {
     pub fn blocks<'a>(
         &'a self,
         db: &'a dyn DefDatabase,
-    ) -> impl Iterator<Item = (BlockId, Arc<DefMap>)> + '_ {
+    ) -> impl Iterator<Item = (BlockId, Arc<DefMap>)> + 'a {
         self.block_scopes.iter().map(move |&block| (block, db.block_def_map(block)))
     }
 
-    pub fn pretty_print(&self, db: &dyn DefDatabase, owner: DefWithBodyId) -> String {
-        pretty::print_body_hir(db, self, owner)
+    pub fn pretty_print(
+        &self,
+        db: &dyn DefDatabase,
+        owner: DefWithBodyId,
+        edition: Edition,
+    ) -> String {
+        pretty::print_body_hir(db, self, owner, edition)
     }
 
     pub fn pretty_print_expr(
@@ -200,8 +222,20 @@ impl Body {
         db: &dyn DefDatabase,
         owner: DefWithBodyId,
         expr: ExprId,
+        edition: Edition,
     ) -> String {
-        pretty::print_expr_hir(db, self, owner, expr)
+        pretty::print_expr_hir(db, self, owner, expr, edition)
+    }
+
+    pub fn pretty_print_pat(
+        &self,
+        db: &dyn DefDatabase,
+        owner: DefWithBodyId,
+        pat: PatId,
+        oneline: bool,
+        edition: Edition,
+    ) -> String {
+        pretty::print_pat_hir(db, self, owner, pat, oneline, edition)
     }
 
     fn new(
@@ -377,6 +411,10 @@ impl BodySourceMap {
         self.label_map_back[label]
     }
 
+    pub fn patterns_for_binding(&self, binding: BindingId) -> &[PatId] {
+        self.binding_definitions.get(&binding).map_or(&[], Deref::deref)
+    }
+
     pub fn node_label(&self, node: InFile<&ast::Label>) -> Option<LabelId> {
         let src = node.map(AstPtr::new);
         self.label_map.get(&src).cloned()
@@ -395,12 +433,27 @@ impl BodySourceMap {
         self.expr_map.get(&src).copied()
     }
 
+    pub fn expansions(
+        &self,
+    ) -> impl Iterator<Item = (&InFile<AstPtr<ast::MacroCall>>, &MacroFileId)> {
+        self.expansions.iter()
+    }
+
     pub fn implicit_format_args(
         &self,
         node: InFile<&ast::FormatArgsExpr>,
     ) -> Option<&[(syntax::TextRange, Name)]> {
         let src = node.map(AstPtr::new).map(AstPtr::upcast::<ast::Expr>);
-        self.format_args_template_map.get(self.expr_map.get(&src)?).map(std::ops::Deref::deref)
+        self.template_map.as_ref()?.0.get(self.expr_map.get(&src)?).map(std::ops::Deref::deref)
+    }
+
+    pub fn asm_template_args(
+        &self,
+        node: InFile<&ast::AsmExpr>,
+    ) -> Option<(ExprId, &[Vec<(syntax::TextRange, usize)>])> {
+        let src = node.map(AstPtr::new).map(AstPtr::upcast::<ast::Expr>);
+        let expr = self.expr_map.get(&src)?;
+        Some(*expr).zip(self.template_map.as_ref()?.1.get(expr).map(std::ops::Deref::deref))
     }
 
     /// Get a reference to the body source map's diagnostics.
@@ -420,10 +473,14 @@ impl BodySourceMap {
             field_map_back,
             pat_field_map_back,
             expansions,
-            format_args_template_map,
+            template_map,
             diagnostics,
+            binding_definitions,
         } = self;
-        format_args_template_map.shrink_to_fit();
+        if let Some(template_map) = template_map {
+            template_map.0.shrink_to_fit();
+            template_map.1.shrink_to_fit();
+        }
         expr_map.shrink_to_fit();
         expr_map_back.shrink_to_fit();
         pat_map.shrink_to_fit();
@@ -434,5 +491,15 @@ impl BodySourceMap {
         pat_field_map_back.shrink_to_fit();
         expansions.shrink_to_fit();
         diagnostics.shrink_to_fit();
+        binding_definitions.shrink_to_fit();
+    }
+
+    pub fn template_map(
+        &self,
+    ) -> Option<&(
+        FxHashMap<Idx<Expr>, Vec<(tt::TextRange, Name)>>,
+        FxHashMap<Idx<Expr>, Vec<Vec<(tt::TextRange, usize)>>>,
+    )> {
+        self.template_map.as_deref()
     }
 }

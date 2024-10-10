@@ -3,23 +3,25 @@
 //! For that, we define APIs that will temporarily be public to 3P that exposes rustc internal APIs
 //! until stable MIR is complete.
 
-use crate::rustc_smir::{context::TablesWrapper, Stable, Tables};
+use std::cell::{Cell, RefCell};
+use std::fmt::Debug;
+use std::hash::Hash;
+use std::ops::Index;
+
 use rustc_data_structures::fx;
 use rustc_data_structures::fx::FxIndexMap;
 use rustc_middle::mir::interpret::AllocId;
 use rustc_middle::ty;
 use rustc_middle::ty::TyCtxt;
-use rustc_span::def_id::{CrateNum, DefId};
 use rustc_span::Span;
+use rustc_span::def_id::{CrateNum, DefId};
 use scoped_tls::scoped_thread_local;
+use stable_mir::Error;
 use stable_mir::abi::Layout;
 use stable_mir::ty::IndexedVal;
-use stable_mir::Error;
-use std::cell::Cell;
-use std::cell::RefCell;
-use std::fmt::Debug;
-use std::hash::Hash;
-use std::ops::Index;
+
+use crate::rustc_smir::context::TablesWrapper;
+use crate::rustc_smir::{Stable, Tables};
 
 mod internal;
 pub mod pretty;
@@ -214,7 +216,8 @@ where
         spans: IndexMap::default(),
         types: IndexMap::default(),
         instances: IndexMap::default(),
-        constants: IndexMap::default(),
+        ty_consts: IndexMap::default(),
+        mir_consts: IndexMap::default(),
         layouts: IndexMap::default(),
     }));
     stable_mir::compiler_interface::run(&tables, || init(&tables, f))
@@ -394,7 +397,7 @@ macro_rules! run_driver {
     }};
 }
 
-/// Simmilar to rustc's `FxIndexMap`, `IndexMap` with extra
+/// Similar to rustc's `FxIndexMap`, `IndexMap` with extra
 /// safety features added.
 pub struct IndexMap<K, V> {
     index_map: fx::FxIndexMap<K, V>,

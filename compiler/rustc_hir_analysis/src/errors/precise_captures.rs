@@ -1,10 +1,11 @@
+use rustc_errors::E0799;
 use rustc_macros::Diagnostic;
 use rustc_span::{Span, Symbol};
 
 #[derive(Diagnostic)]
 #[diag(hir_analysis_param_not_captured)]
 #[note]
-pub struct ParamNotCaptured {
+pub(crate) struct ParamNotCaptured {
     #[primary_span]
     pub opaque_span: Span,
     #[label]
@@ -15,7 +16,7 @@ pub struct ParamNotCaptured {
 #[derive(Diagnostic)]
 #[diag(hir_analysis_self_ty_not_captured)]
 #[note]
-pub struct SelfTyNotCaptured {
+pub(crate) struct SelfTyNotCaptured {
     #[primary_span]
     pub opaque_span: Span,
     #[label]
@@ -24,7 +25,7 @@ pub struct SelfTyNotCaptured {
 
 #[derive(Diagnostic)]
 #[diag(hir_analysis_lifetime_not_captured)]
-pub struct LifetimeNotCaptured {
+pub(crate) struct LifetimeNotCaptured {
     #[primary_span]
     pub use_span: Span,
     #[label(hir_analysis_param_label)]
@@ -35,7 +36,7 @@ pub struct LifetimeNotCaptured {
 
 #[derive(Diagnostic)]
 #[diag(hir_analysis_bad_precise_capture)]
-pub struct BadPreciseCapture {
+pub(crate) struct BadPreciseCapture {
     #[primary_span]
     pub span: Span,
     pub kind: &'static str,
@@ -43,8 +44,8 @@ pub struct BadPreciseCapture {
 }
 
 #[derive(Diagnostic)]
-#[diag(hir_analysis_precise_capture_self_alias)]
-pub struct PreciseCaptureSelfAlias {
+#[diag(hir_analysis_precise_capture_self_alias, code = E0799)]
+pub(crate) struct PreciseCaptureSelfAlias {
     #[primary_span]
     pub span: Span,
     #[label]
@@ -54,7 +55,7 @@ pub struct PreciseCaptureSelfAlias {
 
 #[derive(Diagnostic)]
 #[diag(hir_analysis_duplicate_precise_capture)]
-pub struct DuplicatePreciseCapture {
+pub(crate) struct DuplicatePreciseCapture {
     #[primary_span]
     pub first_span: Span,
     pub name: Symbol,
@@ -64,7 +65,7 @@ pub struct DuplicatePreciseCapture {
 
 #[derive(Diagnostic)]
 #[diag(hir_analysis_lifetime_must_be_first)]
-pub struct LifetimesMustBeFirst {
+pub(crate) struct LifetimesMustBeFirst {
     #[primary_span]
     pub lifetime_span: Span,
     pub name: Symbol,

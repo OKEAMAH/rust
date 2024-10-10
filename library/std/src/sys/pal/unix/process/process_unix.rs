@@ -1,22 +1,7 @@
-use crate::fmt;
-use crate::io::{self, Error, ErrorKind};
-use crate::mem;
-use crate::num::NonZero;
-use crate::sys;
-use crate::sys::cvt;
-use crate::sys::process::process_common::*;
-
-#[cfg(target_os = "linux")]
-use crate::os::linux::process::PidFd;
-#[cfg(target_os = "linux")]
-use crate::os::unix::io::AsRawFd;
-
 #[cfg(target_os = "vxworks")]
 use libc::RTP_ID as pid_t;
-
 #[cfg(not(target_os = "vxworks"))]
 use libc::{c_int, pid_t};
-
 #[cfg(not(any(
     target_os = "vxworks",
     target_os = "l4re",
@@ -25,8 +10,17 @@ use libc::{c_int, pid_t};
 )))]
 use libc::{gid_t, uid_t};
 
+use crate::io::{self, Error, ErrorKind};
+use crate::num::NonZero;
+use crate::sys::cvt;
+#[cfg(target_os = "linux")]
+use crate::sys::pal::unix::linux::pidfd::PidFd;
+use crate::sys::process::process_common::*;
+use crate::{fmt, mem, sys};
+
 cfg_if::cfg_if! {
-    if #[cfg(all(target_os = "nto", target_env = "nto71"))] {
+    // This workaround is only needed for QNX 7.0 and 7.1. The bug should have been fixed in 8.0
+    if #[cfg(any(target_env = "nto70", target_env = "nto71"))] {
         use crate::thread;
         use libc::{c_char, posix_spawn_file_actions_t, posix_spawnattr_t};
         use crate::time::Duration;
@@ -196,7 +190,8 @@ impl Command {
     #[cfg(not(any(
         target_os = "watchos",
         target_os = "tvos",
-        all(target_os = "nto", target_env = "nto71"),
+        target_env = "nto70",
+        target_env = "nto71"
     )))]
     unsafe fn do_fork(&mut self) -> Result<pid_t, io::Error> {
         cvt(libc::fork())
@@ -206,7 +201,8 @@ impl Command {
     // or closed a file descriptor while the fork() was occurring".
     // Documentation says "... or try calling fork() again". This is what we do here.
     // See also https://www.qnx.com/developers/docs/7.1/#com.qnx.doc.neutrino.lib_ref/topic/f/fork.html
-    #[cfg(all(target_os = "nto", target_env = "nto71"))]
+    // This workaround is only needed for QNX 7.0 and 7.1. The bug should have been fixed in 8.0
+    #[cfg(any(target_env = "nto70", target_env = "nto71"))]
     unsafe fn do_fork(&mut self) -> Result<pid_t, io::Error> {
         use crate::sys::os::errno;
 
@@ -448,6 +444,9 @@ impl Command {
         stdio: &ChildPipes,
         envp: Option<&CStringArray>,
     ) -> io::Result<Option<Process>> {
+        #[cfg(target_os = "linux")]
+        use core::sync::atomic::{AtomicU8, Ordering};
+
         use crate::mem::MaybeUninit;
         use crate::sys::weak::weak;
         use crate::sys::{self, cvt_nz, on_broken_pipe_flag_used};
@@ -457,9 +456,72 @@ impl Command {
             || (self.env_saw_path() && !self.program_is_path())
             || !self.get_closures().is_empty()
             || self.get_groups().is_some()
-            || self.get_create_pidfd()
         {
             return Ok(None);
+        }
+
+        cfg_if::cfg_if! {
+            if #[cfg(target_os = "linux")] {
+                weak! {
+                    fn pidfd_spawnp(
+                        *mut libc::c_int,
+                        *const libc::c_char,
+                        *const libc::posix_spawn_file_actions_t,
+                        *const libc::posix_spawnattr_t,
+                        *const *mut libc::c_char,
+                        *const *mut libc::c_char
+                    ) -> libc::c_int
+                }
+
+                weak! { fn pidfd_getpid(libc::c_int) -> libc::c_int }
+
+                static PIDFD_SUPPORTED: AtomicU8 = AtomicU8::new(0);
+                const UNKNOWN: u8 = 0;
+                const SPAWN: u8 = 1;
+                // Obtaining a pidfd via the fork+exec path might work
+                const FORK_EXEC: u8 = 2;
+                // Neither pidfd_spawn nor fork/exec will get us a pidfd.
+                // Instead we'll just posix_spawn if the other preconditions are met.
+                const NO: u8 = 3;
+
+                if self.get_create_pidfd() {
+                    let mut support = PIDFD_SUPPORTED.load(Ordering::Relaxed);
+                    if support == FORK_EXEC {
+                        return Ok(None);
+                    }
+                    if support == UNKNOWN {
+                        support = NO;
+                        let our_pid = crate::process::id();
+                        let pidfd = cvt(unsafe { libc::syscall(libc::SYS_pidfd_open, our_pid, 0) } as c_int);
+                        match pidfd {
+                            Ok(pidfd) => {
+                                support = FORK_EXEC;
+                                if let Some(Ok(pid)) = pidfd_getpid.get().map(|f| cvt(unsafe { f(pidfd) } as i32)) {
+                                    if pidfd_spawnp.get().is_some() && pid as u32 == our_pid {
+                                        support = SPAWN
+                                    }
+                                }
+                                unsafe { libc::close(pidfd) };
+                            }
+                            Err(e) if e.raw_os_error() == Some(libc::EMFILE) => {
+                                // We're temporarily(?) out of file descriptors.  In this case obtaining a pidfd would also fail
+                                // Don't update the support flag so we can probe again later.
+                                return Err(e)
+                            }
+                            _ => {}
+                        }
+                        PIDFD_SUPPORTED.store(support, Ordering::Relaxed);
+                        if support == FORK_EXEC {
+                            return Ok(None);
+                        }
+                    }
+                    core::assert_matches::debug_assert_matches!(support, SPAWN | NO);
+                }
+            } else {
+                if self.get_create_pidfd() {
+                    unreachable!("only implemented on linux")
+                }
+            }
         }
 
         // Only glibc 2.24+ posix_spawn() supports returning ENOENT directly.
@@ -478,7 +540,7 @@ impl Command {
         // or closed a file descriptor while the posix_spawn() was occurring".
         // Documentation says "... or try calling posix_spawn() again". This is what we do here.
         // See also http://www.qnx.com/developers/docs/7.1/#com.qnx.doc.neutrino.lib_ref/topic/p/posix_spawn.html
-        #[cfg(all(target_os = "nto", target_env = "nto71"))]
+        #[cfg(target_os = "nto")]
         unsafe fn retrying_libc_posix_spawnp(
             pid: *mut pid_t,
             file: *const c_char,
@@ -544,9 +606,6 @@ impl Command {
         };
 
         let pgroup = self.get_pgroup();
-
-        // Safety: -1 indicates we don't have a pidfd.
-        let mut p = unsafe { Process::new(0, -1) };
 
         struct PosixSpawnFileActions<'a>(&'a mut MaybeUninit<libc::posix_spawn_file_actions_t>);
 
@@ -642,6 +701,47 @@ impl Command {
             #[cfg(target_os = "nto")]
             let spawn_fn = retrying_libc_posix_spawnp;
 
+            #[cfg(target_os = "linux")]
+            if self.get_create_pidfd() && PIDFD_SUPPORTED.load(Ordering::Relaxed) == SPAWN {
+                let mut pidfd: libc::c_int = -1;
+                let spawn_res = pidfd_spawnp.get().unwrap()(
+                    &mut pidfd,
+                    self.get_program_cstr().as_ptr(),
+                    file_actions.0.as_ptr(),
+                    attrs.0.as_ptr(),
+                    self.get_argv().as_ptr() as *const _,
+                    envp as *const _,
+                );
+
+                let spawn_res = cvt_nz(spawn_res);
+                if let Err(ref e) = spawn_res
+                    && e.raw_os_error() == Some(libc::ENOSYS)
+                {
+                    PIDFD_SUPPORTED.store(FORK_EXEC, Ordering::Relaxed);
+                    return Ok(None);
+                }
+                spawn_res?;
+
+                let pid = match cvt(pidfd_getpid.get().unwrap()(pidfd)) {
+                    Ok(pid) => pid,
+                    Err(e) => {
+                        // The child has been spawned and we are holding its pidfd.
+                        // But we cannot obtain its pid even though pidfd_getpid support was verified earlier.
+                        // This might happen if libc can't open procfs because the file descriptor limit has been reached.
+                        libc::close(pidfd);
+                        return Err(Error::new(
+                            e.kind(),
+                            "pidfd_spawnp succeeded but the child's PID could not be obtained",
+                        ));
+                    }
+                };
+
+                return Ok(Some(Process::new(pid, pidfd)));
+            }
+
+            // Safety: -1 indicates we don't have a pidfd.
+            let mut p = Process::new(0, -1);
+
             let spawn_res = spawn_fn(
                 &mut p.pid,
                 self.get_program_cstr().as_ptr(),
@@ -661,10 +761,11 @@ impl Command {
 
     #[cfg(target_os = "linux")]
     fn send_pidfd(&self, sock: &crate::sys::net::Socket) {
+        use libc::{CMSG_DATA, CMSG_FIRSTHDR, CMSG_LEN, CMSG_SPACE, SCM_RIGHTS, SOL_SOCKET};
+
         use crate::io::IoSlice;
         use crate::os::fd::RawFd;
         use crate::sys::cvt_r;
-        use libc::{CMSG_DATA, CMSG_FIRSTHDR, CMSG_LEN, CMSG_SPACE, SCM_RIGHTS, SOL_SOCKET};
 
         unsafe {
             let child_pid = libc::getpid();
@@ -687,15 +788,15 @@ impl Command {
             let mut iov = [IoSlice::new(b"")];
             let mut msg: libc::msghdr = mem::zeroed();
 
-            msg.msg_iov = core::ptr::addr_of_mut!(iov) as *mut _;
+            msg.msg_iov = (&raw mut iov) as *mut _;
             msg.msg_iovlen = 1;
 
             // only attach cmsg if we successfully acquired the pidfd
             if pidfd >= 0 {
                 msg.msg_controllen = mem::size_of_val(&cmsg.buf) as _;
-                msg.msg_control = core::ptr::addr_of_mut!(cmsg.buf) as *mut _;
+                msg.msg_control = (&raw mut cmsg.buf) as *mut _;
 
-                let hdr = CMSG_FIRSTHDR(core::ptr::addr_of_mut!(msg) as *mut _);
+                let hdr = CMSG_FIRSTHDR((&raw mut msg) as *mut _);
                 (*hdr).cmsg_level = SOL_SOCKET;
                 (*hdr).cmsg_type = SCM_RIGHTS;
                 (*hdr).cmsg_len = CMSG_LEN(SCM_MSG_LEN as _) as _;
@@ -718,10 +819,10 @@ impl Command {
 
     #[cfg(target_os = "linux")]
     fn recv_pidfd(&self, sock: &crate::sys::net::Socket) -> pid_t {
+        use libc::{CMSG_DATA, CMSG_FIRSTHDR, CMSG_LEN, CMSG_SPACE, SCM_RIGHTS, SOL_SOCKET};
+
         use crate::io::IoSliceMut;
         use crate::sys::cvt_r;
-
-        use libc::{CMSG_DATA, CMSG_FIRSTHDR, CMSG_LEN, CMSG_SPACE, SCM_RIGHTS, SOL_SOCKET};
 
         unsafe {
             const SCM_MSG_LEN: usize = mem::size_of::<[c_int; 1]>();
@@ -737,17 +838,17 @@ impl Command {
 
             let mut msg: libc::msghdr = mem::zeroed();
 
-            msg.msg_iov = core::ptr::addr_of_mut!(iov) as *mut _;
+            msg.msg_iov = (&raw mut iov) as *mut _;
             msg.msg_iovlen = 1;
             msg.msg_controllen = mem::size_of::<Cmsg>() as _;
-            msg.msg_control = core::ptr::addr_of_mut!(cmsg) as *mut _;
+            msg.msg_control = (&raw mut cmsg) as *mut _;
 
             match cvt_r(|| libc::recvmsg(sock.as_raw(), &mut msg, libc::MSG_CMSG_CLOEXEC)) {
                 Err(_) => return -1,
                 Ok(_) => {}
             }
 
-            let hdr = CMSG_FIRSTHDR(core::ptr::addr_of_mut!(msg) as *mut _);
+            let hdr = CMSG_FIRSTHDR((&raw mut msg) as *mut _);
             if hdr.is_null()
                 || (*hdr).cmsg_level != SOL_SOCKET
                 || (*hdr).cmsg_type != SCM_RIGHTS
@@ -788,6 +889,12 @@ pub struct Process {
 
 impl Process {
     #[cfg(target_os = "linux")]
+    /// # Safety
+    ///
+    /// `pidfd` must either be -1 (representing no file descriptor) or a valid, exclusively owned file
+    /// descriptor (See [I/O Safety]).
+    ///
+    /// [I/O Safety]: crate::io#io-safety
     unsafe fn new(pid: pid_t, pidfd: pid_t) -> Self {
         use crate::os::unix::io::FromRawFd;
         use crate::sys_common::FromInner;
@@ -815,16 +922,7 @@ impl Process {
         #[cfg(target_os = "linux")]
         if let Some(pid_fd) = self.pidfd.as_ref() {
             // pidfd_send_signal predates pidfd_open. so if we were able to get an fd then sending signals will work too
-            return cvt(unsafe {
-                libc::syscall(
-                    libc::SYS_pidfd_send_signal,
-                    pid_fd.as_raw_fd(),
-                    libc::SIGKILL,
-                    crate::ptr::null::<()>(),
-                    0,
-                )
-            })
-            .map(drop);
+            return pid_fd.kill();
         }
         cvt(unsafe { libc::kill(self.pid, libc::SIGKILL) }).map(drop)
     }
@@ -836,12 +934,7 @@ impl Process {
         }
         #[cfg(target_os = "linux")]
         if let Some(pid_fd) = self.pidfd.as_ref() {
-            let mut siginfo: libc::siginfo_t = unsafe { crate::mem::zeroed() };
-
-            cvt_r(|| unsafe {
-                libc::waitid(libc::P_PIDFD, pid_fd.as_raw_fd() as u32, &mut siginfo, libc::WEXITED)
-            })?;
-            let status = ExitStatus::from_waitid_siginfo(siginfo);
+            let status = pid_fd.wait()?;
             self.status = Some(status);
             return Ok(status);
         }
@@ -857,22 +950,11 @@ impl Process {
         }
         #[cfg(target_os = "linux")]
         if let Some(pid_fd) = self.pidfd.as_ref() {
-            let mut siginfo: libc::siginfo_t = unsafe { crate::mem::zeroed() };
-
-            cvt(unsafe {
-                libc::waitid(
-                    libc::P_PIDFD,
-                    pid_fd.as_raw_fd() as u32,
-                    &mut siginfo,
-                    libc::WEXITED | libc::WNOHANG,
-                )
-            })?;
-            if unsafe { siginfo.si_pid() } == 0 {
-                return Ok(None);
+            let status = pid_fd.try_wait()?;
+            if let Some(status) = status {
+                self.status = Some(status)
             }
-            let status = ExitStatus::from_waitid_siginfo(siginfo);
-            self.status = Some(status);
-            return Ok(Some(status));
+            return Ok(status);
         }
         let mut status = 0 as c_int;
         let pid = cvt(unsafe { libc::waitpid(self.pid, &mut status, libc::WNOHANG) })?;
@@ -965,7 +1047,7 @@ impl From<c_int> for ExitStatus {
     }
 }
 
-/// Convert a signal number to a readable, searchable name.
+/// Converts a signal number to a readable, searchable name.
 ///
 /// This string should be displayed right after the signal number.
 /// If a signal is unrecognized, it returns the empty string, so that
@@ -1007,13 +1089,13 @@ fn signal_string(signal: i32) -> &'static str {
         libc::SIGURG => " (SIGURG)",
         #[cfg(not(target_os = "l4re"))]
         libc::SIGXCPU => " (SIGXCPU)",
-        #[cfg(not(target_os = "l4re"))]
+        #[cfg(not(any(target_os = "l4re", target_os = "rtems")))]
         libc::SIGXFSZ => " (SIGXFSZ)",
-        #[cfg(not(target_os = "l4re"))]
+        #[cfg(not(any(target_os = "l4re", target_os = "rtems")))]
         libc::SIGVTALRM => " (SIGVTALRM)",
         #[cfg(not(target_os = "l4re"))]
         libc::SIGPROF => " (SIGPROF)",
-        #[cfg(not(target_os = "l4re"))]
+        #[cfg(not(any(target_os = "l4re", target_os = "rtems")))]
         libc::SIGWINCH => " (SIGWINCH)",
         #[cfg(not(any(target_os = "haiku", target_os = "l4re")))]
         libc::SIGIO => " (SIGIO)",
@@ -1053,6 +1135,10 @@ fn signal_string(signal: i32) -> &'static str {
         libc::SIGINFO => " (SIGINFO)",
         #[cfg(target_os = "hurd")]
         libc::SIGLOST => " (SIGLOST)",
+        #[cfg(target_os = "freebsd")]
+        libc::SIGTHR => " (SIGTHR)",
+        #[cfg(target_os = "freebsd")]
+        libc::SIGLIBRT => " (SIGLIBRT)",
         _ => "",
     }
 }
@@ -1101,20 +1187,32 @@ impl ExitStatusError {
 }
 
 #[cfg(target_os = "linux")]
-#[unstable(feature = "linux_pidfd", issue = "82971")]
-impl crate::os::linux::process::ChildExt for crate::process::Child {
-    fn pidfd(&self) -> io::Result<&PidFd> {
-        self.handle
-            .pidfd
-            .as_ref()
-            .ok_or_else(|| Error::new(ErrorKind::Uncategorized, "No pidfd was created."))
-    }
+mod linux_child_ext {
 
-    fn take_pidfd(&mut self) -> io::Result<PidFd> {
-        self.handle
-            .pidfd
-            .take()
-            .ok_or_else(|| Error::new(ErrorKind::Uncategorized, "No pidfd was created."))
+    use crate::os::linux::process as os;
+    use crate::sys::pal::unix::ErrorKind;
+    use crate::sys::pal::unix::linux::pidfd as imp;
+    use crate::sys_common::FromInner;
+    use crate::{io, mem};
+
+    #[unstable(feature = "linux_pidfd", issue = "82971")]
+    impl crate::os::linux::process::ChildExt for crate::process::Child {
+        fn pidfd(&self) -> io::Result<&os::PidFd> {
+            self.handle
+                .pidfd
+                .as_ref()
+                // SAFETY: The os type is a transparent wrapper, therefore we can transmute references
+                .map(|fd| unsafe { mem::transmute::<&imp::PidFd, &os::PidFd>(fd) })
+                .ok_or_else(|| io::Error::new(ErrorKind::Uncategorized, "No pidfd was created."))
+        }
+
+        fn into_pidfd(mut self) -> Result<os::PidFd, Self> {
+            self.handle
+                .pidfd
+                .take()
+                .map(|fd| <os::PidFd as FromInner<imp::PidFd>>::from_inner(fd))
+                .ok_or_else(|| self)
+        }
     }
 }
 

@@ -1,10 +1,13 @@
 //! Assorted functions shared by several assists.
 
 pub(crate) use gen_trait_fn_body::gen_trait_fn_body;
-use hir::{db::HirDatabase, HasAttrs as HirHasAttrs, HirDisplay, InFile, Semantics};
+use hir::{
+    db::{ExpandDatabase, HirDatabase},
+    HasAttrs as HirHasAttrs, HirDisplay, InFile, Semantics,
+};
 use ide_db::{
     famous_defs::FamousDefs, path_transform::PathTransform,
-    syntax_helpers::insert_whitespace_into_node::insert_ws_into, RootDatabase,
+    syntax_helpers::prettify_macro_expansion, RootDatabase,
 };
 use stdx::format_to;
 use syntax::{
@@ -14,16 +17,15 @@ use syntax::{
         edit_in_place::{AttrsOwnerEdit, Indent, Removable},
         make, HasArgList, HasAttrs, HasGenericParams, HasName, HasTypeBounds, Whitespace,
     },
-    ted, AstNode, AstToken, Direction, SourceFile,
+    ted, AstNode, AstToken, Direction, Edition, NodeOrToken, SourceFile,
     SyntaxKind::*,
-    SyntaxNode, TextRange, TextSize, T,
+    SyntaxNode, SyntaxToken, TextRange, TextSize, T,
 };
 
 use crate::assist_context::{AssistContext, SourceChangeBuilder};
 
 mod gen_trait_fn_body;
 pub(crate) mod ref_field_expr;
-pub(crate) mod suggest_name;
 
 pub(crate) fn unwrap_trivial_block(block_expr: ast::BlockExpr) -> ast::Expr {
     extract_trivial_expression(&block_expr)
@@ -88,8 +90,8 @@ pub fn has_test_related_attribute(attrs: &hir::AttrsWithOwner) -> bool {
         let path = attr.path();
         (|| {
             Some(
-                path.segments().first()?.as_text()?.starts_with("test")
-                    || path.segments().last()?.as_text()?.ends_with("test"),
+                path.segments().first()?.as_str().starts_with("test")
+                    || path.segments().last()?.as_str().ends_with("test"),
             )
         })()
         .unwrap_or_default()
@@ -174,15 +176,20 @@ pub fn add_trait_assoc_items_to_impl(
     original_items: &[InFile<ast::AssocItem>],
     trait_: hir::Trait,
     impl_: &ast::Impl,
-    target_scope: hir::SemanticsScope<'_>,
+    target_scope: &hir::SemanticsScope<'_>,
 ) -> ast::AssocItem {
     let new_indent_level = IndentLevel::from_node(impl_.syntax()) + 1;
     let items = original_items.iter().map(|InFile { file_id, value: original_item }| {
         let cloned_item = {
-            if file_id.is_macro() {
-                if let Some(formatted) =
-                    ast::AssocItem::cast(insert_ws_into(original_item.syntax().clone()))
-                {
+            if let Some(macro_file) = file_id.macro_file() {
+                let span_map = sema.db.expansion_span_map(macro_file);
+                let item_prettified = prettify_macro_expansion(
+                    sema.db,
+                    original_item.syntax().clone(),
+                    &span_map,
+                    target_scope.krate().into(),
+                );
+                if let Some(formatted) = ast::AssocItem::cast(item_prettified) {
                     return formatted;
                 } else {
                     stdx::never!("formatted `AssocItem` could not be cast back to `AssocItem`");
@@ -195,7 +202,7 @@ pub fn add_trait_assoc_items_to_impl(
             // FIXME: Paths in nested macros are not handled well. See
             // `add_missing_impl_members::paths_in_nested_macro_should_get_transformed` test.
             let transform =
-                PathTransform::trait_impl(&target_scope, &source_scope, trait_, impl_.clone());
+                PathTransform::trait_impl(target_scope, &source_scope, trait_, impl_.clone());
             transform.apply(cloned_item.syntax());
         }
         cloned_item.remove_attrs_and_docs();
@@ -684,31 +691,31 @@ enum ReferenceConversionType {
 }
 
 impl ReferenceConversion {
-    pub(crate) fn convert_type(&self, db: &dyn HirDatabase) -> ast::Type {
+    pub(crate) fn convert_type(&self, db: &dyn HirDatabase, edition: Edition) -> ast::Type {
         let ty = match self.conversion {
-            ReferenceConversionType::Copy => self.ty.display(db).to_string(),
+            ReferenceConversionType::Copy => self.ty.display(db, edition).to_string(),
             ReferenceConversionType::AsRefStr => "&str".to_owned(),
             ReferenceConversionType::AsRefSlice => {
                 let type_argument_name =
-                    self.ty.type_arguments().next().unwrap().display(db).to_string();
+                    self.ty.type_arguments().next().unwrap().display(db, edition).to_string();
                 format!("&[{type_argument_name}]")
             }
             ReferenceConversionType::Dereferenced => {
                 let type_argument_name =
-                    self.ty.type_arguments().next().unwrap().display(db).to_string();
+                    self.ty.type_arguments().next().unwrap().display(db, edition).to_string();
                 format!("&{type_argument_name}")
             }
             ReferenceConversionType::Option => {
                 let type_argument_name =
-                    self.ty.type_arguments().next().unwrap().display(db).to_string();
+                    self.ty.type_arguments().next().unwrap().display(db, edition).to_string();
                 format!("Option<&{type_argument_name}>")
             }
             ReferenceConversionType::Result => {
                 let mut type_arguments = self.ty.type_arguments();
                 let first_type_argument_name =
-                    type_arguments.next().unwrap().display(db).to_string();
+                    type_arguments.next().unwrap().display(db, edition).to_string();
                 let second_type_argument_name =
-                    type_arguments.next().unwrap().display(db).to_string();
+                    type_arguments.next().unwrap().display(db, edition).to_string();
                 format!("Result<&{first_type_argument_name}, &{second_type_argument_name}>")
             }
         };
@@ -915,4 +922,47 @@ pub(crate) fn replace_record_field_expr(
         let file_range = ctx.sema.original_range(expr.syntax());
         edit.replace(file_range.range, initializer.syntax().text());
     }
+}
+
+/// Creates a token tree list from a syntax node, creating the needed delimited sub token trees.
+/// Assumes that the input syntax node is a valid syntax tree.
+pub(crate) fn tt_from_syntax(node: SyntaxNode) -> Vec<NodeOrToken<ast::TokenTree, SyntaxToken>> {
+    let mut tt_stack = vec![(None, vec![])];
+
+    for element in node.descendants_with_tokens() {
+        let NodeOrToken::Token(token) = element else { continue };
+
+        match token.kind() {
+            T!['('] | T!['{'] | T!['['] => {
+                // Found an opening delimiter, start a new sub token tree
+                tt_stack.push((Some(token.kind()), vec![]));
+            }
+            T![')'] | T!['}'] | T![']'] => {
+                // Closing a subtree
+                let (delimiter, tt) = tt_stack.pop().expect("unbalanced delimiters");
+                let (_, parent_tt) = tt_stack
+                    .last_mut()
+                    .expect("parent token tree was closed before it was completed");
+                let closing_delimiter = delimiter.map(|it| match it {
+                    T!['('] => T![')'],
+                    T!['{'] => T!['}'],
+                    T!['['] => T![']'],
+                    _ => unreachable!(),
+                });
+                stdx::always!(
+                    closing_delimiter == Some(token.kind()),
+                    "mismatched opening and closing delimiters"
+                );
+
+                let sub_tt = make::token_tree(delimiter.expect("unbalanced delimiters"), tt);
+                parent_tt.push(NodeOrToken::Node(sub_tt));
+            }
+            _ => {
+                let (_, current_tt) = tt_stack.last_mut().expect("unmatched delimiters");
+                current_tt.push(NodeOrToken::Token(token))
+            }
+        }
+    }
+
+    tt_stack.pop().expect("parent token tree was closed before it was completed").1
 }

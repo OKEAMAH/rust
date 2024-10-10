@@ -1,35 +1,15 @@
+// tidy-alphabetical-start
+#![allow(internal_features)]
 #![doc(html_root_url = "https://doc.rust-lang.org/nightly/nightly-rustc/")]
 #![doc(rust_logo)]
-#![feature(rustdoc_internals)]
-#![allow(internal_features)]
 #![feature(associated_type_defaults)]
-#![feature(try_blocks)]
 #![feature(let_chains)]
+#![feature(rustdoc_internals)]
+#![feature(try_blocks)]
+#![warn(unreachable_pub)]
+// tidy-alphabetical-end
 
 mod errors;
-
-use rustc_ast::visit::{try_visit, VisitorResult};
-use rustc_ast::MacroDef;
-use rustc_attr as attr;
-use rustc_data_structures::fx::FxHashSet;
-use rustc_data_structures::intern::Interned;
-use rustc_hir as hir;
-use rustc_hir::def::{DefKind, Res};
-use rustc_hir::def_id::{DefId, LocalDefId, LocalModDefId, CRATE_DEF_ID};
-use rustc_hir::intravisit::{self, Visitor};
-use rustc_hir::{AssocItemKind, ForeignItemKind, ItemId, ItemKind, PatKind};
-use rustc_middle::middle::privacy::{EffectiveVisibilities, EffectiveVisibility, Level};
-use rustc_middle::query::Providers;
-use rustc_middle::ty::print::PrintTraitRefExt as _;
-use rustc_middle::ty::GenericArgs;
-use rustc_middle::ty::{self, Const, GenericParamDefKind};
-use rustc_middle::ty::{TraitRef, Ty, TyCtxt, TypeSuperVisitable, TypeVisitable, TypeVisitor};
-use rustc_middle::{bug, span_bug};
-use rustc_session::lint;
-use rustc_span::hygiene::Transparency;
-use rustc_span::symbol::{kw, sym, Ident};
-use rustc_span::Span;
-use tracing::debug;
 
 use std::fmt;
 use std::marker::PhantomData;
@@ -40,6 +20,28 @@ use errors::{
     ItemIsPrivate, PrivateInterfacesOrBoundsLint, ReportEffectiveVisibility, UnnameableTypesLint,
     UnnamedItemIsPrivate,
 };
+use rustc_ast::MacroDef;
+use rustc_ast::visit::{VisitorResult, try_visit};
+use rustc_data_structures::fx::FxHashSet;
+use rustc_data_structures::intern::Interned;
+use rustc_hir::def::{DefKind, Res};
+use rustc_hir::def_id::{CRATE_DEF_ID, DefId, LocalDefId, LocalModDefId};
+use rustc_hir::intravisit::{self, Visitor};
+use rustc_hir::{AssocItemKind, ForeignItemKind, ItemId, ItemKind, PatKind};
+use rustc_middle::middle::privacy::{EffectiveVisibilities, EffectiveVisibility, Level};
+use rustc_middle::query::Providers;
+use rustc_middle::ty::print::PrintTraitRefExt as _;
+use rustc_middle::ty::{
+    self, Const, GenericArgs, GenericParamDefKind, TraitRef, Ty, TyCtxt, TypeSuperVisitable,
+    TypeVisitable, TypeVisitor,
+};
+use rustc_middle::{bug, span_bug};
+use rustc_session::lint;
+use rustc_span::Span;
+use rustc_span::hygiene::Transparency;
+use rustc_span::symbol::{Ident, kw, sym};
+use tracing::debug;
+use {rustc_attr as attr, rustc_hir as hir};
 
 rustc_fluent_macro::fluent_messages! { "../messages.ftl" }
 
@@ -400,8 +402,6 @@ struct EmbargoVisitor<'tcx> {
     ///     n::p::f()
     /// }
     macro_reachable: FxHashSet<(LocalModDefId, LocalModDefId)>,
-    /// Preliminary pass for marking all underlying types of `impl Trait`s as reachable.
-    impl_trait_pass: bool,
     /// Has something changed in the level map?
     changed: bool,
 }
@@ -625,28 +625,14 @@ impl<'tcx> EmbargoVisitor<'tcx> {
             | DefKind::Field
             | DefKind::GlobalAsm
             | DefKind::Impl { .. }
-            | DefKind::Closure => (),
+            | DefKind::Closure
+            | DefKind::SyntheticCoroutineBody => (),
         }
     }
 }
 
 impl<'tcx> Visitor<'tcx> for EmbargoVisitor<'tcx> {
     fn visit_item(&mut self, item: &'tcx hir::Item<'tcx>) {
-        if self.impl_trait_pass
-            && let hir::ItemKind::OpaqueTy(opaque) = item.kind
-            && !opaque.in_trait
-        {
-            // FIXME: This is some serious pessimization intended to workaround deficiencies
-            // in the reachability pass (`middle/reachable.rs`). Types are marked as link-time
-            // reachable if they are returned via `impl Trait`, even from private functions.
-            let pub_ev = EffectiveVisibility::from_vis(ty::Visibility::Public);
-            self.reach_through_impl_trait(item.owner_id.def_id, pub_ev)
-                .generics()
-                .predicates()
-                .ty();
-            return;
-        }
-
         // Update levels of nested things and mark all items
         // in interfaces of reachable items as reachable.
         let item_ev = self.get(item.owner_id.def_id);
@@ -656,7 +642,7 @@ impl<'tcx> Visitor<'tcx> for EmbargoVisitor<'tcx> {
             | hir::ItemKind::ExternCrate(..)
             | hir::ItemKind::GlobalAsm(..) => {}
             // The interface is empty, and all nested items are processed by `visit_item`.
-            hir::ItemKind::Mod(..) | hir::ItemKind::OpaqueTy(..) => {}
+            hir::ItemKind::Mod(..) => {}
             hir::ItemKind::Macro(macro_def, _) => {
                 if let Some(item_ev) = item_ev {
                     self.update_reachability_from_macro(item.owner_id.def_id, macro_def, item_ev);
@@ -849,12 +835,12 @@ impl<'tcx> DefIdVisitor<'tcx> for ReachEverythingInTheInterfaceVisitor<'_, 'tcx>
 ////////////////////////////////////////////////////////////////////////////////
 /// Visitor, used for EffectiveVisibilities table checking
 ////////////////////////////////////////////////////////////////////////////////
-pub struct TestReachabilityVisitor<'tcx, 'a> {
+pub struct TestReachabilityVisitor<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
     effective_visibilities: &'a EffectiveVisibilities,
 }
 
-impl<'tcx, 'a> TestReachabilityVisitor<'tcx, 'a> {
+impl<'a, 'tcx> TestReachabilityVisitor<'a, 'tcx> {
     fn effective_visibility_diagnostic(&mut self, def_id: LocalDefId) {
         if self.tcx.has_attr(def_id, sym::rustc_effective_visibility) {
             let mut error_msg = String::new();
@@ -875,7 +861,7 @@ impl<'tcx, 'a> TestReachabilityVisitor<'tcx, 'a> {
     }
 }
 
-impl<'tcx, 'a> Visitor<'tcx> for TestReachabilityVisitor<'tcx, 'a> {
+impl<'a, 'tcx> Visitor<'tcx> for TestReachabilityVisitor<'a, 'tcx> {
     fn visit_item(&mut self, item: &'tcx hir::Item<'tcx>) {
         self.effective_visibility_diagnostic(item.owner_id.def_id);
 
@@ -971,8 +957,12 @@ impl<'tcx> NamePrivacyVisitor<'tcx> {
 
 impl<'tcx> Visitor<'tcx> for NamePrivacyVisitor<'tcx> {
     fn visit_nested_body(&mut self, body_id: hir::BodyId) {
-        let old_maybe_typeck_results =
-            self.maybe_typeck_results.replace(self.tcx.typeck_body(body_id));
+        let new_typeck_results = self.tcx.typeck_body(body_id);
+        // Do not try reporting privacy violations if we failed to infer types.
+        if new_typeck_results.tainted_by_errors.is_some() {
+            return;
+        }
+        let old_maybe_typeck_results = self.maybe_typeck_results.replace(new_typeck_results);
         self.visit_body(self.tcx.hir().body(body_id));
         self.maybe_typeck_results = old_maybe_typeck_results;
     }
@@ -1418,12 +1408,12 @@ impl<'tcx> DefIdVisitor<'tcx> for SearchInterfaceForPrivateItemsVisitor<'tcx> {
     }
 }
 
-struct PrivateItemsInPublicInterfacesChecker<'tcx, 'a> {
+struct PrivateItemsInPublicInterfacesChecker<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
     effective_visibilities: &'a EffectiveVisibilities,
 }
 
-impl<'tcx> PrivateItemsInPublicInterfacesChecker<'tcx, '_> {
+impl<'tcx> PrivateItemsInPublicInterfacesChecker<'_, 'tcx> {
     fn check(
         &self,
         def_id: LocalDefId,
@@ -1491,7 +1481,7 @@ impl<'tcx> PrivateItemsInPublicInterfacesChecker<'tcx, '_> {
         self.effective_visibilities.effective_vis(def_id).copied()
     }
 
-    pub fn check_item(&mut self, id: ItemId) {
+    fn check_item(&mut self, id: ItemId) {
         let tcx = self.tcx;
         let def_id = id.owner_id.def_id;
         let item_visibility = tcx.local_visibility(def_id);
@@ -1695,7 +1685,7 @@ fn check_mod_privacy(tcx: TyCtxt<'_>, module_def_id: LocalModDefId) {
         rustc_ty_utils::sig_types::walk_types(tcx, def_id, &mut visitor);
 
         if let Some(body_id) = tcx.hir().maybe_body_owned_by(def_id) {
-            visitor.visit_nested_body(body_id);
+            visitor.visit_nested_body(body_id.id());
         }
     }
 
@@ -1718,19 +1708,59 @@ fn effective_visibilities(tcx: TyCtxt<'_>, (): ()) -> &EffectiveVisibilities {
         tcx,
         effective_visibilities: tcx.resolutions(()).effective_visibilities.clone(),
         macro_reachable: Default::default(),
-        // HACK(jynelson): trying to infer the type of `impl Trait` breaks `async-std` (and
-        // `pub async fn` in general). Since rustdoc never needs to do codegen and doesn't
-        // care about link-time reachability, keep them unreachable (issue #75100).
-        impl_trait_pass: !tcx.sess.opts.actually_rustdoc,
         changed: false,
     };
 
     visitor.effective_visibilities.check_invariants(tcx);
-    if visitor.impl_trait_pass {
+
+    // HACK(jynelson): trying to infer the type of `impl Trait` breaks `async-std` (and
+    // `pub async fn` in general). Since rustdoc never needs to do codegen and doesn't
+    // care about link-time reachability, keep them unreachable (issue #75100).
+    let impl_trait_pass = !tcx.sess.opts.actually_rustdoc;
+    if impl_trait_pass {
         // Underlying types of `impl Trait`s are marked as reachable unconditionally,
         // so this pass doesn't need to be a part of the fixed point iteration below.
-        tcx.hir().visit_all_item_likes_in_crate(&mut visitor);
-        visitor.impl_trait_pass = false;
+        let krate = tcx.hir_crate_items(());
+        for id in krate.opaques() {
+            let opaque = tcx.hir_node_by_def_id(id).expect_opaque_ty();
+            let should_visit = match opaque.origin {
+                hir::OpaqueTyOrigin::FnReturn {
+                    parent,
+                    in_trait_or_impl: Some(hir::RpitContext::Trait),
+                }
+                | hir::OpaqueTyOrigin::AsyncFn {
+                    parent,
+                    in_trait_or_impl: Some(hir::RpitContext::Trait),
+                } => match tcx.hir_node_by_def_id(parent).expect_trait_item().expect_fn().1 {
+                    hir::TraitFn::Required(_) => false,
+                    hir::TraitFn::Provided(..) => true,
+                },
+
+                // Always visit RPITs in functions that have definitions,
+                // and all TAITs.
+                hir::OpaqueTyOrigin::FnReturn {
+                    in_trait_or_impl: None | Some(hir::RpitContext::TraitImpl),
+                    ..
+                }
+                | hir::OpaqueTyOrigin::AsyncFn {
+                    in_trait_or_impl: None | Some(hir::RpitContext::TraitImpl),
+                    ..
+                }
+                | hir::OpaqueTyOrigin::TyAlias { .. } => true,
+            };
+            if should_visit {
+                // FIXME: This is some serious pessimization intended to workaround deficiencies
+                // in the reachability pass (`middle/reachable.rs`). Types are marked as link-time
+                // reachable if they are returned via `impl Trait`, even from private functions.
+                let pub_ev = EffectiveVisibility::from_vis(ty::Visibility::Public);
+                visitor
+                    .reach_through_impl_trait(opaque.def_id, pub_ev)
+                    .generics()
+                    .predicates()
+                    .ty();
+            }
+        }
+
         visitor.changed = false;
     }
 

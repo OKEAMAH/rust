@@ -1,7 +1,7 @@
 use crate::abi::Endian;
-use crate::spec::{base, Target, TargetOptions};
+use crate::spec::{Target, TargetOptions, base};
 
-pub fn target() -> Target {
+pub(crate) fn target() -> Target {
     let mut base = base::linux_musl::opts();
     base.cpu = "mips64r2".into();
     base.features = "+mips64r2".into();
@@ -10,10 +10,10 @@ pub fn target() -> Target {
         // LLVM doesn't recognize "muslabi64" yet.
         llvm_target: "mips64-unknown-linux-musl".into(),
         metadata: crate::spec::TargetMetadata {
-            description: None,
-            tier: None,
-            host_tools: None,
-            std: None,
+            description: Some("MIPS64 Linux, N64 ABI, musl 1.2.3".into()),
+            tier: Some(3),
+            host_tools: Some(false),
+            std: Some(true),
         },
         pointer_width: 64,
         data_layout: "E-m:e-i8:8:32-i16:16:32-i64:64-n32:64-S128".into(),

@@ -89,7 +89,7 @@ fn size_of_val() {
     );
     check_number(
         r#"
-        //- minicore: coerce_unsized, fmt, builtin_impls
+        //- minicore: coerce_unsized, fmt, builtin_impls, dispatch_from_dyn
         extern "rust-intrinsic" {
             pub fn size_of_val<T: ?Sized>(_: *const T) -> usize;
         }
@@ -311,6 +311,7 @@ fn saturating() {
 fn allocator() {
     check_number(
         r#"
+        //- minicore: sized
         extern "Rust" {
             #[rustc_allocator]
             fn __rust_alloc(size: usize, align: usize) -> *mut u8;
@@ -411,6 +412,7 @@ fn likely() {
 
 #[test]
 fn floating_point() {
+    // FIXME(#17451): Add `f16` and `f128` tests once intrinsics are added.
     check_number(
         r#"
         extern "rust-intrinsic" {
@@ -426,6 +428,7 @@ fn floating_point() {
             true,
         )),
     );
+    #[allow(unknown_lints, clippy::unnecessary_min_or_max)]
     check_number(
         r#"
         extern "rust-intrinsic" {

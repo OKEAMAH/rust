@@ -4,9 +4,10 @@
 //! This probably isn't the best way to do this -- ideally, diagnostics should
 //! be expressed in terms of hir types themselves.
 pub use hir_ty::diagnostics::{CaseType, IncorrectCase};
-use hir_ty::{db::HirDatabase, diagnostics::BodyValidationDiagnostic, InferenceDiagnostic};
+use hir_ty::{
+    db::HirDatabase, diagnostics::BodyValidationDiagnostic, CastError, InferenceDiagnostic,
+};
 
-use base_db::CrateId;
 use cfg::{CfgExpr, CfgOptions};
 use either::Either;
 pub use hir_def::VariantId;
@@ -15,7 +16,7 @@ use hir_expand::{name::Name, HirFileId, InFile};
 use syntax::{ast, AstPtr, SyntaxError, SyntaxNodePtr, TextRange};
 use triomphe::Arc;
 
-use crate::{AssocItem, Field, Local, MacroKind, Trait, Type};
+use crate::{AssocItem, Field, Local, Trait, Type};
 
 macro_rules! diagnostics {
     ($($diag:ident,)*) => {
@@ -49,11 +50,14 @@ macro_rules! diagnostics {
 // ]
 
 diagnostics![
+    AwaitOutsideOfAsync,
     BreakOutsideOfLoop,
+    CastToUnsized,
     ExpectedFunction,
     InactiveCode,
     IncoherentImpl,
     IncorrectCase,
+    InvalidCast,
     InvalidDeriveTarget,
     MacroDefError,
     MacroError,
@@ -90,7 +94,6 @@ diagnostics![
     UnresolvedMethodCall,
     UnresolvedModule,
     UnresolvedIdent,
-    UnresolvedProcMacro,
     UnusedMut,
     UnusedVariable,
 ];
@@ -137,6 +140,12 @@ pub struct UnreachableLabel {
     pub name: Name,
 }
 
+#[derive(Debug)]
+pub struct AwaitOutsideOfAsync {
+    pub node: InFile<AstPtr<ast::AwaitExpr>>,
+    pub location: String,
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct UndeclaredLabel {
     pub node: InFile<AstPtr<ast::Lifetime>>,
@@ -151,22 +160,11 @@ pub struct InactiveCode {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
-pub struct UnresolvedProcMacro {
-    pub node: InFile<SyntaxNodePtr>,
-    /// If the diagnostic can be pinpointed more accurately than via `node`, this is the `TextRange`
-    /// to use instead.
-    pub precise_location: Option<TextRange>,
-    pub macro_name: Option<String>,
-    pub kind: MacroKind,
-    /// The crate id of the proc-macro this macro belongs to, or `None` if the proc-macro can't be found.
-    pub krate: CrateId,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct MacroError {
     pub node: InFile<SyntaxNodePtr>,
     pub precise_location: Option<TextRange>,
     pub message: String,
+    pub error: bool,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -260,6 +258,8 @@ pub struct PrivateField {
 #[derive(Debug)]
 pub struct MissingUnsafe {
     pub expr: InFile<AstPtr<ast::Expr>>,
+    /// If true, the diagnostics is an `unsafe_op_in_unsafe_fn` lint instead of a hard error.
+    pub only_lint: bool,
 }
 
 #[derive(Debug)]
@@ -368,6 +368,20 @@ pub struct RemoveTrailingReturn {
 #[derive(Debug)]
 pub struct RemoveUnnecessaryElse {
     pub if_expr: InFile<AstPtr<ast::IfExpr>>,
+}
+
+#[derive(Debug)]
+pub struct CastToUnsized {
+    pub expr: InFile<AstPtr<ast::Expr>>,
+    pub cast_ty: Type,
+}
+
+#[derive(Debug)]
+pub struct InvalidCast {
+    pub expr: InFile<AstPtr<ast::Expr>>,
+    pub error: CastError,
+    pub expr_ty: Type,
+    pub cast_ty: Type,
 }
 
 impl AnyDiagnostic {
@@ -625,6 +639,16 @@ impl AnyDiagnostic {
                     }
                 };
                 MismatchedTupleStructPatArgCount { expr_or_pat, expected, found }.into()
+            }
+            InferenceDiagnostic::CastToUnsized { expr, cast_ty } => {
+                let expr = expr_syntax(*expr)?;
+                CastToUnsized { expr, cast_ty: Type::new(db, def, cast_ty.clone()) }.into()
+            }
+            InferenceDiagnostic::InvalidCast { expr, error, expr_ty, cast_ty } => {
+                let expr = expr_syntax(*expr)?;
+                let expr_ty = Type::new(db, def, expr_ty.clone());
+                let cast_ty = Type::new(db, def, cast_ty.clone());
+                InvalidCast { expr, error: *error, expr_ty, cast_ty }.into()
             }
         })
     }

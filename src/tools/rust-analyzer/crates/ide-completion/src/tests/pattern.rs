@@ -146,7 +146,7 @@ enum SingleVariantEnum {
 }
 use SingleVariantEnum::Variant;
 fn foo() {
-   let a$0
+   for a$0
 }
 "#,
         expect![[r#"
@@ -198,6 +198,7 @@ fn foo(a$0: Tuple) {
             st Unit
             bn Record {…} Record { field$1 }$0
             bn Tuple(…)   Tuple($1)$0
+            bn tuple
             kw mut
             kw ref
         "#]],
@@ -814,6 +815,109 @@ pub enum Enum {
             en Enum
             md std
             st S
+            kw mut
+            kw ref
+        "#]],
+    );
+}
+
+#[test]
+fn add_space_after_mut_ref_kw() {
+    check_edit(
+        "mut",
+        r#"
+fn foo() {
+    let $0
+}
+"#,
+        r#"
+fn foo() {
+    let mut $0
+}
+"#,
+    );
+
+    check_edit(
+        "ref",
+        r#"
+fn foo() {
+    let $0
+}
+"#,
+        r#"
+fn foo() {
+    let ref $0
+}
+"#,
+    );
+}
+
+#[test]
+fn suggest_name_for_pattern() {
+    check_edit(
+        "s1",
+        r#"
+struct S1;
+
+fn foo() {
+    let $0 = S1;
+}
+"#,
+        r#"
+struct S1;
+
+fn foo() {
+    let s1 = S1;
+}
+"#,
+    );
+
+    check_edit(
+        "s1",
+        r#"
+struct S1;
+
+fn foo(s$0: S1) {
+}
+"#,
+        r#"
+struct S1;
+
+fn foo(s1: S1) {
+}
+"#,
+    );
+
+    // Tests for &adt
+    check_edit(
+        "s1",
+        r#"
+struct S1;
+
+fn foo() {
+    let $0 = &S1;
+}
+"#,
+        r#"
+struct S1;
+
+fn foo() {
+    let s1 = &S1;
+}
+"#,
+    );
+
+    // Do not suggest reserved keywords
+    check_empty(
+        r#"
+struct Struct;
+
+fn foo() {
+    let $0 = Struct;
+}
+"#,
+        expect![[r#"
+            st Struct
             kw mut
             kw ref
         "#]],

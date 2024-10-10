@@ -1,10 +1,11 @@
-use rustc_errors::{codes::*, Diag, DiagMessage, LintDiagnostic};
+use rustc_errors::codes::*;
+use rustc_errors::{Diag, LintDiagnostic};
 use rustc_macros::{Diagnostic, LintDiagnostic, Subdiagnostic};
 use rustc_middle::mir::AssertKind;
 use rustc_middle::ty::TyCtxt;
 use rustc_session::lint::{self, Lint};
-use rustc_span::def_id::DefId;
 use rustc_span::Span;
+use rustc_span::def_id::DefId;
 
 use crate::fluent_generated as fluent;
 
@@ -50,23 +51,20 @@ pub(crate) enum AssertLintKind {
 
 impl<'a, P: std::fmt::Debug> LintDiagnostic<'a, ()> for AssertLint<P> {
     fn decorate_lint<'b>(self, diag: &'b mut Diag<'a, ()>) {
-        let message = self.assert_kind.diagnostic_message();
+        diag.primary_message(match self.lint_kind {
+            AssertLintKind::ArithmeticOverflow => fluent::mir_transform_arithmetic_overflow,
+            AssertLintKind::UnconditionalPanic => fluent::mir_transform_operation_will_panic,
+        });
+        let label = self.assert_kind.diagnostic_message();
         self.assert_kind.add_args(&mut |name, value| {
             diag.arg(name, value);
         });
-        diag.span_label(self.span, message);
-    }
-
-    fn msg(&self) -> DiagMessage {
-        match self.lint_kind {
-            AssertLintKind::ArithmeticOverflow => fluent::mir_transform_arithmetic_overflow,
-            AssertLintKind::UnconditionalPanic => fluent::mir_transform_operation_will_panic,
-        }
+        diag.span_label(self.span, label);
     }
 }
 
 impl AssertLintKind {
-    pub fn lint(&self) -> &'static Lint {
+    pub(crate) fn lint(&self) -> &'static Lint {
         match self {
             AssertLintKind::ArithmeticOverflow => lint::builtin::ARITHMETIC_OVERFLOW,
             AssertLintKind::UnconditionalPanic => lint::builtin::UNCONDITIONAL_PANIC,
@@ -91,7 +89,15 @@ pub(crate) struct FnItemRef {
     pub ident: String,
 }
 
-pub(crate) struct MustNotSupend<'tcx, 'a> {
+#[derive(Diagnostic)]
+#[diag(mir_transform_exceeds_mcdc_test_vector_limit)]
+pub(crate) struct MCDCExceedsTestVectorLimit {
+    #[primary_span]
+    pub(crate) span: Span,
+    pub(crate) max_num_test_vectors: usize,
+}
+
+pub(crate) struct MustNotSupend<'a, 'tcx> {
     pub tcx: TyCtxt<'tcx>,
     pub yield_sp: Span,
     pub reason: Option<MustNotSuspendReason>,
@@ -104,18 +110,15 @@ pub(crate) struct MustNotSupend<'tcx, 'a> {
 // Needed for def_path_str
 impl<'a> LintDiagnostic<'a, ()> for MustNotSupend<'_, '_> {
     fn decorate_lint<'b>(self, diag: &'b mut rustc_errors::Diag<'a, ()>) {
+        diag.primary_message(fluent::mir_transform_must_not_suspend);
         diag.span_label(self.yield_sp, fluent::_subdiag::label);
         if let Some(reason) = self.reason {
-            diag.subdiagnostic(diag.dcx, reason);
+            diag.subdiagnostic(reason);
         }
         diag.span_help(self.src_sp, fluent::_subdiag::help);
         diag.arg("pre", self.pre);
         diag.arg("def_path", self.tcx.def_path_str(self.def_id));
         diag.arg("post", self.post);
-    }
-
-    fn msg(&self) -> rustc_errors::DiagMessage {
-        fluent::mir_transform_must_not_suspend
     }
 }
 
@@ -126,3 +129,10 @@ pub(crate) struct MustNotSuspendReason {
     pub span: Span,
     pub reason: String,
 }
+
+#[derive(LintDiagnostic)]
+#[diag(mir_transform_undefined_transmute)]
+#[note]
+#[note(mir_transform_note2)]
+#[help]
+pub(crate) struct UndefinedTransmute;

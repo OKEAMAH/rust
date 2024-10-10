@@ -1,42 +1,44 @@
 //! Support for serializing the dep-graph and reloading it.
 
+// tidy-alphabetical-start
+#![allow(internal_features)]
+#![allow(unused_parens)]
 #![doc(html_root_url = "https://doc.rust-lang.org/nightly/nightly-rustc/")]
 #![doc(rust_logo)]
-#![feature(rustdoc_internals)]
 #![feature(min_specialization)]
 #![feature(rustc_attrs)]
-#![allow(rustc::potential_query_instability, unused_parens)]
-#![allow(internal_features)]
+#![feature(rustdoc_internals)]
+#![warn(unreachable_pub)]
+// tidy-alphabetical-end
 
-use crate::plumbing::{__rust_begin_short_backtrace, encode_all_query_results, try_mark_green};
-use crate::profiling_support::QueryKeyStringCache;
 use field_offset::offset_of;
 use rustc_data_structures::stable_hasher::HashStable;
 use rustc_data_structures::sync::AtomicU64;
 use rustc_middle::arena::Arena;
-use rustc_middle::dep_graph::DepNodeIndex;
-use rustc_middle::dep_graph::{self, DepKind, DepKindStruct};
-use rustc_middle::query::erase::{erase, restore, Erase};
+use rustc_middle::dep_graph::{self, DepKind, DepKindStruct, DepNodeIndex};
+use rustc_middle::query::erase::{Erase, erase, restore};
 use rustc_middle::query::on_disk_cache::{CacheEncoder, EncodedDepNodeIndex, OnDiskCache};
 use rustc_middle::query::plumbing::{DynamicQuery, QuerySystem, QuerySystemFns};
-use rustc_middle::query::AsLocalKey;
 use rustc_middle::query::{
-    queries, DynamicQueries, ExternProviders, Providers, QueryCaches, QueryEngine, QueryStates,
+    AsLocalKey, DynamicQueries, ExternProviders, Providers, QueryCaches, QueryEngine, QueryStates,
+    queries,
 };
 use rustc_middle::ty::TyCtxt;
 use rustc_query_system::dep_graph::SerializedDepNodeIndex;
 use rustc_query_system::ich::StableHashingContext;
 use rustc_query_system::query::{
-    get_query_incr, get_query_non_incr, CycleError, HashResult, QueryCache, QueryConfig, QueryMap,
-    QueryMode, QueryState,
+    CycleError, HashResult, QueryCache, QueryConfig, QueryMap, QueryMode, QueryState,
+    get_query_incr, get_query_non_incr,
 };
-use rustc_query_system::HandleCycleError;
-use rustc_query_system::Value;
+use rustc_query_system::{HandleCycleError, Value};
 use rustc_span::{ErrorGuaranteed, Span};
+
+use crate::plumbing::{__rust_begin_short_backtrace, encode_all_query_results, try_mark_green};
+use crate::profiling_support::QueryKeyStringCache;
 
 #[macro_use]
 mod plumbing;
-pub use crate::plumbing::{query_key_hash_verify_all, QueryCtxt};
+pub use crate::plumbing::{QueryCtxt, query_key_hash_verify_all};
 
 mod profiling_support;
 pub use self::profiling_support::alloc_self_profile_query_strings;
@@ -213,7 +215,7 @@ pub fn query_system<'tcx>(
             local_providers,
             extern_providers,
             encode_query_results: encode_all_query_results,
-            try_mark_green: try_mark_green,
+            try_mark_green,
         },
         jobs: AtomicU64::new(1),
     }

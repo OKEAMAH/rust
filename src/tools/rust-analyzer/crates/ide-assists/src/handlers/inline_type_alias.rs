@@ -43,6 +43,7 @@ use super::inline_call::split_refs_and_uses;
 // fn foo() {
 //     let _: i32 = 3;
 // }
+// ```
 pub(crate) fn inline_type_alias_uses(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<()> {
     let name = ctx.find_node_at_offset::<ast::Name>()?;
     let ast_alias = name.syntax().parent().and_then(ast::TypeAlias::cast)?;
@@ -92,7 +93,7 @@ pub(crate) fn inline_type_alias_uses(acc: &mut Assists, ctx: &AssistContext<'_>)
             };
 
             for (file_id, refs) in usages.into_iter() {
-                inline_refs_for_file(file_id, refs);
+                inline_refs_for_file(file_id.file_id(), refs);
             }
             if !definition_deleted {
                 builder.edit_file(ctx.file_id());

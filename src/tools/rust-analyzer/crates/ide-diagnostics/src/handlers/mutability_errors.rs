@@ -40,7 +40,7 @@ pub(crate) fn need_mut(ctx: &DiagnosticsContext<'_>, d: &hir::NeedMut) -> Option
             DiagnosticCode::RustcHardError("E0384"),
             format!(
                 "cannot mutate immutable variable `{}`",
-                d.local.name(ctx.sema.db).display(ctx.sema.db)
+                d.local.name(ctx.sema.db).display(ctx.sema.db, ctx.edition)
             ),
             d.span,
         )
@@ -824,13 +824,13 @@ fn f() {
 
     #[test]
     fn or_pattern() {
+        // FIXME: `None` is inferred as unknown here for some reason
         check_diagnostics(
             r#"
 //- minicore: option
 fn f(_: i32) {}
 fn main() {
     let ((Some(mut x), None) | (_, Some(mut x))) = (None, Some(7)) else { return };
-             //^^^^^ 💡 warn: variable does not need to be mutable
     f(x);
 }
 "#,

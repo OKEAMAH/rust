@@ -19,11 +19,11 @@ mod simd;
 
 use cranelift_codegen::ir::AtomicRmwOp;
 use rustc_middle::ty;
+use rustc_middle::ty::GenericArgsRef;
 use rustc_middle::ty::layout::{HasParamEnv, ValidityRequirement};
 use rustc_middle::ty::print::{with_no_trimmed_paths, with_no_visible_paths};
-use rustc_middle::ty::GenericArgsRef;
 use rustc_span::source_map::Spanned;
-use rustc_span::symbol::{sym, Symbol};
+use rustc_span::symbol::{Symbol, sym};
 
 pub(crate) use self::llvm::codegen_llvm_intrinsic_call;
 use crate::cast::clif_intcast;
@@ -600,9 +600,11 @@ fn codegen_regular_intrinsic_call<'tcx>(
 
         sym::ptr_mask => {
             intrinsic_args!(fx, args => (ptr, mask); intrinsic);
+            let ptr_layout = ptr.layout();
             let ptr = ptr.load_scalar(fx);
             let mask = mask.load_scalar(fx);
-            fx.bcx.ins().band(ptr, mask);
+            let res = fx.bcx.ins().band(ptr, mask);
+            ret.write_cvalue(fx, CValue::by_val(res, ptr_layout));
         }
 
         sym::write_bytes | sym::volatile_set_memory => {
@@ -725,7 +727,8 @@ fn codegen_regular_intrinsic_call<'tcx>(
 
             // Cranelift treats stores as volatile by default
             // FIXME correctly handle unaligned_volatile_store
-            // FIXME actually do nontemporal stores if requested
+            // FIXME actually do nontemporal stores if requested (but do not just emit MOVNT on x86;
+            // see the LLVM backend for details)
             let dest = CPlace::for_ptr(Pointer::new(ptr), val.layout());
             dest.write_cvalue(fx, val);
         }
@@ -1261,7 +1264,7 @@ fn codegen_regular_intrinsic_call<'tcx>(
         }
 
         // Unimplemented intrinsics must have a fallback body. The fallback body is obtained
-        // by converting the `InstanceDef::Intrinsic` to an `InstanceDef::Item`.
+        // by converting the `InstanceKind::Intrinsic` to an `InstanceKind::Item`.
         _ => {
             let intrinsic = fx.tcx.intrinsic(instance.def_id()).unwrap();
             if intrinsic.must_be_overridden {

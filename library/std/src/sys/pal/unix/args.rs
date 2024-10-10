@@ -6,9 +6,8 @@
 #![allow(dead_code)] // runtime init functions not used during testing
 
 use crate::ffi::{CStr, OsString};
-use crate::fmt;
 use crate::os::unix::ffi::OsStringExt;
-use crate::vec;
+use crate::{fmt, vec};
 
 /// One-time global initialization.
 pub unsafe fn init(argc: isize, argv: *const *const u8) {
@@ -113,6 +112,8 @@ impl DoubleEndedIterator for Args {
     target_os = "aix",
     target_os = "nto",
     target_os = "hurd",
+    target_os = "rtems",
+    target_os = "nuttx",
 ))]
 mod imp {
     use crate::ffi::c_char;
@@ -183,7 +184,7 @@ mod imp {
 // Use `_NSGetArgc` and `_NSGetArgv` on Apple platforms.
 //
 // Even though these have underscores in their names, they've been available
-// since since the first versions of both macOS and iOS, and are declared in
+// since the first versions of both macOS and iOS, and are declared in
 // the header `crt_externs.h`.
 //
 // NOTE: This header was added to the iOS 13.0 SDK, which has been the source

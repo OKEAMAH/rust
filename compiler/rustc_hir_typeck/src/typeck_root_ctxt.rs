@@ -1,4 +1,5 @@
-use super::callee::DeferredCallResolution;
+use std::cell::RefCell;
+use std::ops::Deref;
 
 use rustc_data_structures::unord::{UnordMap, UnordSet};
 use rustc_hir as hir;
@@ -8,19 +9,21 @@ use rustc_infer::infer::{InferCtxt, InferOk, TyCtxtInferExt};
 use rustc_middle::span_bug;
 use rustc_middle::ty::visit::TypeVisitableExt;
 use rustc_middle::ty::{self, Ty, TyCtxt};
-use rustc_span::def_id::LocalDefIdMap;
 use rustc_span::Span;
+use rustc_span::def_id::LocalDefIdMap;
 use rustc_trait_selection::traits::query::evaluate_obligation::InferCtxtExt;
-use rustc_trait_selection::traits::{self, PredicateObligation, TraitEngine, TraitEngineExt as _};
+use rustc_trait_selection::traits::{
+    self, FulfillmentError, PredicateObligation, TraitEngine, TraitEngineExt as _,
+};
+use tracing::{debug, instrument};
 
-use std::cell::RefCell;
-use std::ops::Deref;
+use super::callee::DeferredCallResolution;
 
-// Data shared between a "typeck root" and its nested bodies,
+/// Data shared between a "typeck root" and its nested bodies,
 /// e.g. closures defined within the function. For example:
 /// ```ignore (illustrative)
 /// fn foo() {
-///     bar(move|| { ... })
+///     bar(move || { ... })
 /// }
 /// ```
 /// Here, the function `foo()` and the closure passed to
@@ -34,7 +37,7 @@ pub(crate) struct TypeckRootCtxt<'tcx> {
 
     pub(super) locals: RefCell<HirIdMap<Ty<'tcx>>>,
 
-    pub(super) fulfillment_cx: RefCell<Box<dyn TraitEngine<'tcx>>>,
+    pub(super) fulfillment_cx: RefCell<Box<dyn TraitEngine<'tcx, FulfillmentError<'tcx>>>>,
 
     /// Some additional `Sized` obligations badly affect type inference.
     /// These obligations are added in a later stage of typeck.
@@ -75,7 +78,7 @@ impl<'tcx> Deref for TypeckRootCtxt<'tcx> {
 }
 
 impl<'tcx> TypeckRootCtxt<'tcx> {
-    pub fn new(tcx: TyCtxt<'tcx>, def_id: LocalDefId) -> Self {
+    pub(crate) fn new(tcx: TyCtxt<'tcx>, def_id: LocalDefId) -> Self {
         let hir_owner = tcx.local_def_id_to_hir_id(def_id).owner;
 
         let infcx = tcx.infer_ctxt().ignoring_regions().with_opaque_type_inference(def_id).build();
@@ -83,7 +86,7 @@ impl<'tcx> TypeckRootCtxt<'tcx> {
 
         TypeckRootCtxt {
             typeck_results,
-            fulfillment_cx: RefCell::new(<dyn TraitEngine<'_>>::new(&infcx)),
+            fulfillment_cx: RefCell::new(<dyn TraitEngine<'_, _>>::new(&infcx)),
             infcx,
             locals: RefCell::new(Default::default()),
             deferred_sized_obligations: RefCell::new(Vec::new()),
@@ -122,7 +125,7 @@ impl<'tcx> TypeckRootCtxt<'tcx> {
         infer_ok.value
     }
 
-    pub fn update_infer_var_info(&self, obligation: &PredicateObligation<'tcx>) {
+    fn update_infer_var_info(&self, obligation: &PredicateObligation<'tcx>) {
         let infer_var_info = &mut self.infer_var_info.borrow_mut();
 
         // (*) binder skipped
@@ -158,7 +161,7 @@ impl<'tcx> TypeckRootCtxt<'tcx> {
         {
             // If the projection predicate (Foo::Bar == X) has X as a non-TyVid,
             // we need to make it into one.
-            if let Some(vid) = predicate.term.ty().and_then(|ty| ty.ty_vid()) {
+            if let Some(vid) = predicate.term.as_type().and_then(|ty| ty.ty_vid()) {
                 debug!("infer_var_info: {:?}.output = true", vid);
                 infer_var_info.entry(vid).or_default().output = true;
             }

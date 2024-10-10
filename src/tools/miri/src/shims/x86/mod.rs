@@ -1,92 +1,85 @@
 use rand::Rng as _;
-
-use rustc_apfloat::{ieee::Single, Float};
-use rustc_middle::ty::layout::LayoutOf as _;
+use rustc_apfloat::Float;
+use rustc_apfloat::ieee::Single;
 use rustc_middle::ty::Ty;
+use rustc_middle::ty::layout::LayoutOf as _;
 use rustc_middle::{mir, ty};
 use rustc_span::Symbol;
 use rustc_target::abi::Size;
 use rustc_target::spec::abi::Abi;
 
+use self::helpers::bool_to_simd_element;
 use crate::*;
-use helpers::bool_to_simd_element;
 
 mod aesni;
 mod avx;
 mod avx2;
+mod bmi;
+mod gfni;
+mod sha;
 mod sse;
 mod sse2;
 mod sse3;
 mod sse41;
+mod sse42;
 mod ssse3;
 
-impl<'mir, 'tcx: 'mir> EvalContextExt<'mir, 'tcx> for crate::MiriInterpCx<'mir, 'tcx> {}
-pub(super) trait EvalContextExt<'mir, 'tcx: 'mir>:
-    crate::MiriInterpCxExt<'mir, 'tcx>
-{
+impl<'tcx> EvalContextExt<'tcx> for crate::MiriInterpCx<'tcx> {}
+pub(super) trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
     fn emulate_x86_intrinsic(
         &mut self,
         link_name: Symbol,
         abi: Abi,
-        args: &[OpTy<'tcx, Provenance>],
-        dest: &MPlaceTy<'tcx, Provenance>,
+        args: &[OpTy<'tcx>],
+        dest: &MPlaceTy<'tcx>,
     ) -> InterpResult<'tcx, EmulateItemResult> {
         let this = self.eval_context_mut();
         // Prefix should have already been checked.
         let unprefixed_name = link_name.as_str().strip_prefix("llvm.x86.").unwrap();
         match unprefixed_name {
-            // Used to implement the `_addcarry_u32` and `_addcarry_u64` functions.
-            // Computes a + b with input and output carry. The input carry is an 8-bit
-            // value, which is interpreted as 1 if it is non-zero. The output carry is
-            // an 8-bit value that will be 0 or 1.
+            // Used to implement the `_addcarry_u{32, 64}` and the `_subborrow_u{32, 64}` functions.
+            // Computes a + b or a - b with input and output carry/borrow. The input carry/borrow is an 8-bit
+            // value, which is interpreted as 1 if it is non-zero. The output carry/borrow is an 8-bit value that will be 0 or 1.
             // https://www.intel.com/content/www/us/en/docs/cpp-compiler/developer-guide-reference/2021-8/addcarry-u32-addcarry-u64.html
-            "addcarry.32" | "addcarry.64" => {
-                if unprefixed_name == "addcarry.64" && this.tcx.sess.target.arch != "x86_64" {
-                    return Ok(EmulateItemResult::NotSupported);
+            // https://www.intel.com/content/www/us/en/docs/cpp-compiler/developer-guide-reference/2021-8/subborrow-u32-subborrow-u64.html
+            "addcarry.32" | "addcarry.64" | "subborrow.32" | "subborrow.64" => {
+                if unprefixed_name.ends_with("64") && this.tcx.sess.target.arch != "x86_64" {
+                    return interp_ok(EmulateItemResult::NotSupported);
                 }
 
-                let [c_in, a, b] = this.check_shim(abi, Abi::Unadjusted, link_name, args)?;
-                let c_in = this.read_scalar(c_in)?.to_u8()? != 0;
-                let a = this.read_immediate(a)?;
-                let b = this.read_immediate(b)?;
+                let [cb_in, a, b] = this.check_shim(abi, Abi::Unadjusted, link_name, args)?;
 
-                let (sum, overflow1) =
-                    this.binary_op(mir::BinOp::AddWithOverflow, &a, &b)?.to_pair(this);
-                let (sum, overflow2) = this
-                    .binary_op(
-                        mir::BinOp::AddWithOverflow,
-                        &sum,
-                        &ImmTy::from_uint(c_in, a.layout),
-                    )?
-                    .to_pair(this);
-                let c_out = overflow1.to_scalar().to_bool()? | overflow2.to_scalar().to_bool()?;
+                let op = if unprefixed_name.starts_with("add") {
+                    mir::BinOp::AddWithOverflow
+                } else {
+                    mir::BinOp::SubWithOverflow
+                };
 
-                this.write_scalar(Scalar::from_u8(c_out.into()), &this.project_field(dest, 0)?)?;
+                let (sum, cb_out) = carrying_add(this, cb_in, a, b, op)?;
+                this.write_scalar(cb_out, &this.project_field(dest, 0)?)?;
                 this.write_immediate(*sum, &this.project_field(dest, 1)?)?;
             }
-            // Used to implement the `_subborrow_u32` and `_subborrow_u64` functions.
-            // Computes a - b with input and output borrow. The input borrow is an 8-bit
-            // value, which is interpreted as 1 if it is non-zero. The output borrow is
-            // an 8-bit value that will be 0 or 1.
-            // https://www.intel.com/content/www/us/en/docs/cpp-compiler/developer-guide-reference/2021-8/subborrow-u32-subborrow-u64.html
-            "subborrow.32" | "subborrow.64" => {
-                if unprefixed_name == "subborrow.64" && this.tcx.sess.target.arch != "x86_64" {
-                    return Ok(EmulateItemResult::NotSupported);
+
+            // Used to implement the `_addcarryx_u{32, 64}` functions. They are semantically identical with the `_addcarry_u{32, 64}` functions,
+            // except for a slightly different type signature and the requirement for the "adx" target feature.
+            // https://www.intel.com/content/www/us/en/docs/cpp-compiler/developer-guide-reference/2021-8/addcarryx-u32-addcarryx-u64.html
+            "addcarryx.u32" | "addcarryx.u64" => {
+                this.expect_target_feature_for_intrinsic(link_name, "adx")?;
+
+                let is_u64 = unprefixed_name.ends_with("64");
+                if is_u64 && this.tcx.sess.target.arch != "x86_64" {
+                    return interp_ok(EmulateItemResult::NotSupported);
                 }
 
-                let [b_in, a, b] = this.check_shim(abi, Abi::Unadjusted, link_name, args)?;
-                let b_in = this.read_scalar(b_in)?.to_u8()? != 0;
-                let a = this.read_immediate(a)?;
-                let b = this.read_immediate(b)?;
+                let [c_in, a, b, out] = this.check_shim(abi, Abi::Unadjusted, link_name, args)?;
+                let out = this.deref_pointer_as(
+                    out,
+                    if is_u64 { this.machine.layouts.u64 } else { this.machine.layouts.u32 },
+                )?;
 
-                let (sub, overflow1) = this.binary_op(mir::BinOp::SubWithOverflow, &a, &b)?.to_pair(this);
-                let (sub, overflow2) = this
-                    .binary_op(mir::BinOp::SubWithOverflow, &sub, &ImmTy::from_uint(b_in, a.layout))?
-                    .to_pair(this);
-                let b_out = overflow1.to_scalar().to_bool()? | overflow2.to_scalar().to_bool()?;
-
-                this.write_scalar(Scalar::from_u8(b_out.into()), &this.project_field(dest, 0)?)?;
-                this.write_immediate(*sub, &this.project_field(dest, 1)?)?;
+                let (sum, c_out) = carrying_add(this, c_in, a, b, mir::BinOp::AddWithOverflow)?;
+                this.write_scalar(c_out, dest)?;
+                this.write_immediate(*sum, &out)?;
             }
 
             // Used to implement the `_mm_pause` function.
@@ -102,6 +95,30 @@ pub(super) trait EvalContextExt<'mir, 'tcx: 'mir>:
                 }
             }
 
+            "pclmulqdq" => {
+                let [left, right, imm] =
+                    this.check_shim(abi, Abi::C { unwind: false }, link_name, args)?;
+
+                pclmulqdq(this, left, right, imm, dest)?;
+            }
+
+            name if name.starts_with("bmi.") => {
+                return bmi::EvalContextExt::emulate_x86_bmi_intrinsic(
+                    this, link_name, abi, args, dest,
+                );
+            }
+            // The GFNI extension does not get its own namespace.
+            // Check for instruction names instead.
+            name if name.starts_with("vgf2p8affine") || name.starts_with("vgf2p8mulb") => {
+                return gfni::EvalContextExt::emulate_x86_gfni_intrinsic(
+                    this, link_name, abi, args, dest,
+                );
+            }
+            name if name.starts_with("sha") => {
+                return sha::EvalContextExt::emulate_x86_sha_intrinsic(
+                    this, link_name, abi, args, dest,
+                );
+            }
             name if name.starts_with("sse.") => {
                 return sse::EvalContextExt::emulate_x86_sse_intrinsic(
                     this, link_name, abi, args, dest,
@@ -127,6 +144,11 @@ pub(super) trait EvalContextExt<'mir, 'tcx: 'mir>:
                     this, link_name, abi, args, dest,
                 );
             }
+            name if name.starts_with("sse42.") => {
+                return sse42::EvalContextExt::emulate_x86_sse42_intrinsic(
+                    this, link_name, abi, args, dest,
+                );
+            }
             name if name.starts_with("aesni.") => {
                 return aesni::EvalContextExt::emulate_x86_aesni_intrinsic(
                     this, link_name, abi, args, dest,
@@ -143,16 +165,14 @@ pub(super) trait EvalContextExt<'mir, 'tcx: 'mir>:
                 );
             }
 
-            _ => return Ok(EmulateItemResult::NotSupported),
+            _ => return interp_ok(EmulateItemResult::NotSupported),
         }
-        Ok(EmulateItemResult::NeedsReturn)
+        interp_ok(EmulateItemResult::NeedsReturn)
     }
 }
 
 #[derive(Copy, Clone)]
 enum FloatBinOp {
-    /// Arithmetic operation
-    Arith(mir::BinOp),
     /// Comparison
     ///
     /// The semantics of this operator is a case distinction: we compare the two operands,
@@ -195,7 +215,7 @@ impl FloatBinOp {
     /// Convert from the `imm` argument used to specify the comparison
     /// operation in intrinsics such as `llvm.x86.sse.cmp.ss`.
     fn cmp_from_imm<'tcx>(
-        this: &crate::MiriInterpCx<'_, 'tcx>,
+        this: &crate::MiriInterpCx<'tcx>,
         imm: i8,
         intrinsic: Symbol,
     ) -> InterpResult<'tcx, Self> {
@@ -232,23 +252,18 @@ impl FloatBinOp {
             this.expect_target_feature_for_intrinsic(intrinsic, "avx")?;
             unord = !unord;
         }
-        Ok(Self::Cmp { gt, lt, eq, unord })
+        interp_ok(Self::Cmp { gt, lt, eq, unord })
     }
 }
 
 /// Performs `which` scalar operation on `left` and `right` and returns
 /// the result.
 fn bin_op_float<'tcx, F: rustc_apfloat::Float>(
-    this: &crate::MiriInterpCx<'_, 'tcx>,
     which: FloatBinOp,
-    left: &ImmTy<'tcx, Provenance>,
-    right: &ImmTy<'tcx, Provenance>,
-) -> InterpResult<'tcx, Scalar<Provenance>> {
+    left: &ImmTy<'tcx>,
+    right: &ImmTy<'tcx>,
+) -> InterpResult<'tcx, Scalar> {
     match which {
-        FloatBinOp::Arith(which) => {
-            let res = this.binary_op(which, left, right)?;
-            Ok(res.to_scalar())
-        }
         FloatBinOp::Cmp { gt, lt, eq, unord } => {
             let left = left.to_scalar().to_float::<F>()?;
             let right = right.to_scalar().to_float::<F>()?;
@@ -259,7 +274,7 @@ fn bin_op_float<'tcx, F: rustc_apfloat::Float>(
                 Some(std::cmp::Ordering::Equal) => eq,
                 Some(std::cmp::Ordering::Greater) => gt,
             };
-            Ok(bool_to_simd_element(res, Size::from_bits(F::BITS)))
+            interp_ok(bool_to_simd_element(res, Size::from_bits(F::BITS)))
         }
         FloatBinOp::Min => {
             let left_scalar = left.to_scalar();
@@ -273,9 +288,9 @@ fn bin_op_float<'tcx, F: rustc_apfloat::Float>(
                 || right.is_nan()
                 || left >= right
             {
-                Ok(right_scalar)
+                interp_ok(right_scalar)
             } else {
-                Ok(left_scalar)
+                interp_ok(left_scalar)
             }
         }
         FloatBinOp::Max => {
@@ -290,9 +305,9 @@ fn bin_op_float<'tcx, F: rustc_apfloat::Float>(
                 || right.is_nan()
                 || left <= right
             {
-                Ok(right_scalar)
+                interp_ok(right_scalar)
             } else {
-                Ok(left_scalar)
+                interp_ok(left_scalar)
             }
         }
     }
@@ -301,21 +316,20 @@ fn bin_op_float<'tcx, F: rustc_apfloat::Float>(
 /// Performs `which` operation on the first component of `left` and `right`
 /// and copies the other components from `left`. The result is stored in `dest`.
 fn bin_op_simd_float_first<'tcx, F: rustc_apfloat::Float>(
-    this: &mut crate::MiriInterpCx<'_, 'tcx>,
+    this: &mut crate::MiriInterpCx<'tcx>,
     which: FloatBinOp,
-    left: &OpTy<'tcx, Provenance>,
-    right: &OpTy<'tcx, Provenance>,
-    dest: &MPlaceTy<'tcx, Provenance>,
+    left: &OpTy<'tcx>,
+    right: &OpTy<'tcx>,
+    dest: &MPlaceTy<'tcx>,
 ) -> InterpResult<'tcx, ()> {
-    let (left, left_len) = this.operand_to_simd(left)?;
-    let (right, right_len) = this.operand_to_simd(right)?;
-    let (dest, dest_len) = this.mplace_to_simd(dest)?;
+    let (left, left_len) = this.project_to_simd(left)?;
+    let (right, right_len) = this.project_to_simd(right)?;
+    let (dest, dest_len) = this.project_to_simd(dest)?;
 
     assert_eq!(dest_len, left_len);
     assert_eq!(dest_len, right_len);
 
     let res0 = bin_op_float::<F>(
-        this,
         which,
         &this.read_immediate(&this.project_index(&left, 0)?)?,
         &this.read_immediate(&this.project_index(&right, 0)?)?,
@@ -326,21 +340,21 @@ fn bin_op_simd_float_first<'tcx, F: rustc_apfloat::Float>(
         this.copy_op(&this.project_index(&left, i)?, &this.project_index(&dest, i)?)?;
     }
 
-    Ok(())
+    interp_ok(())
 }
 
 /// Performs `which` operation on each component of `left` and
 /// `right`, storing the result is stored in `dest`.
 fn bin_op_simd_float_all<'tcx, F: rustc_apfloat::Float>(
-    this: &mut crate::MiriInterpCx<'_, 'tcx>,
+    this: &mut crate::MiriInterpCx<'tcx>,
     which: FloatBinOp,
-    left: &OpTy<'tcx, Provenance>,
-    right: &OpTy<'tcx, Provenance>,
-    dest: &MPlaceTy<'tcx, Provenance>,
+    left: &OpTy<'tcx>,
+    right: &OpTy<'tcx>,
+    dest: &MPlaceTy<'tcx>,
 ) -> InterpResult<'tcx, ()> {
-    let (left, left_len) = this.operand_to_simd(left)?;
-    let (right, right_len) = this.operand_to_simd(right)?;
-    let (dest, dest_len) = this.mplace_to_simd(dest)?;
+    let (left, left_len) = this.project_to_simd(left)?;
+    let (right, right_len) = this.project_to_simd(right)?;
+    let (dest, dest_len) = this.project_to_simd(dest)?;
 
     assert_eq!(dest_len, left_len);
     assert_eq!(dest_len, right_len);
@@ -350,20 +364,15 @@ fn bin_op_simd_float_all<'tcx, F: rustc_apfloat::Float>(
         let right = this.read_immediate(&this.project_index(&right, i)?)?;
         let dest = this.project_index(&dest, i)?;
 
-        let res = bin_op_float::<F>(this, which, &left, &right)?;
+        let res = bin_op_float::<F>(which, &left, &right)?;
         this.write_scalar(res, &dest)?;
     }
 
-    Ok(())
+    interp_ok(())
 }
 
 #[derive(Copy, Clone)]
 enum FloatUnaryOp {
-    /// sqrt(x)
-    ///
-    /// <https://www.felixcloutier.com/x86/sqrtss>
-    /// <https://www.felixcloutier.com/x86/sqrtps>
-    Sqrt,
     /// Approximation of 1/x
     ///
     /// <https://www.felixcloutier.com/x86/rcpss>
@@ -379,23 +388,18 @@ enum FloatUnaryOp {
 /// Performs `which` scalar operation on `op` and returns the result.
 #[allow(clippy::arithmetic_side_effects)] // floating point operations without side effects
 fn unary_op_f32<'tcx>(
-    this: &mut crate::MiriInterpCx<'_, 'tcx>,
+    this: &mut crate::MiriInterpCx<'tcx>,
     which: FloatUnaryOp,
-    op: &ImmTy<'tcx, Provenance>,
-) -> InterpResult<'tcx, Scalar<Provenance>> {
+    op: &ImmTy<'tcx>,
+) -> InterpResult<'tcx, Scalar> {
     match which {
-        FloatUnaryOp::Sqrt => {
-            let op = op.to_scalar();
-            // FIXME using host floats
-            Ok(Scalar::from_u32(f32::from_bits(op.to_u32()?).sqrt().to_bits()))
-        }
         FloatUnaryOp::Rcp => {
             let op = op.to_scalar().to_f32()?;
             let div = (Single::from_u128(1).value / op).value;
             // Apply a relative error with a magnitude on the order of 2^-12 to simulate the
             // inaccuracy of RCP.
             let res = apply_random_float_error(this, div, -12);
-            Ok(Scalar::from_f32(res))
+            interp_ok(Scalar::from_f32(res))
         }
         FloatUnaryOp::Rsqrt => {
             let op = op.to_scalar().to_u32()?;
@@ -405,7 +409,7 @@ fn unary_op_f32<'tcx>(
             // Apply a relative error with a magnitude on the order of 2^-12 to simulate the
             // inaccuracy of RSQRT.
             let res = apply_random_float_error(this, rsqrt, -12);
-            Ok(Scalar::from_f32(res))
+            interp_ok(Scalar::from_f32(res))
         }
     }
 }
@@ -413,14 +417,13 @@ fn unary_op_f32<'tcx>(
 /// Disturbes a floating-point result by a relative error on the order of (-2^scale, 2^scale).
 #[allow(clippy::arithmetic_side_effects)] // floating point arithmetic cannot panic
 fn apply_random_float_error<F: rustc_apfloat::Float>(
-    this: &mut crate::MiriInterpCx<'_, '_>,
+    this: &mut crate::MiriInterpCx<'_>,
     val: F,
     err_scale: i32,
 ) -> F {
     let rng = this.machine.rng.get_mut();
     // generates rand(0, 2^64) * 2^(scale - 64) = rand(0, 1) * 2^scale
-    let err =
-        F::from_u128(rng.gen::<u64>().into()).value.scalbn(err_scale.checked_sub(64).unwrap());
+    let err = F::from_u128(rng.gen::<u64>().into()).value.scalbn(err_scale.strict_sub(64));
     // give it a random sign
     let err = if rng.gen::<bool>() { -err } else { err };
     // multiple the value with (1+err)
@@ -430,13 +433,13 @@ fn apply_random_float_error<F: rustc_apfloat::Float>(
 /// Performs `which` operation on the first component of `op` and copies
 /// the other components. The result is stored in `dest`.
 fn unary_op_ss<'tcx>(
-    this: &mut crate::MiriInterpCx<'_, 'tcx>,
+    this: &mut crate::MiriInterpCx<'tcx>,
     which: FloatUnaryOp,
-    op: &OpTy<'tcx, Provenance>,
-    dest: &MPlaceTy<'tcx, Provenance>,
+    op: &OpTy<'tcx>,
+    dest: &MPlaceTy<'tcx>,
 ) -> InterpResult<'tcx, ()> {
-    let (op, op_len) = this.operand_to_simd(op)?;
-    let (dest, dest_len) = this.mplace_to_simd(dest)?;
+    let (op, op_len) = this.project_to_simd(op)?;
+    let (dest, dest_len) = this.project_to_simd(dest)?;
 
     assert_eq!(dest_len, op_len);
 
@@ -447,19 +450,19 @@ fn unary_op_ss<'tcx>(
         this.copy_op(&this.project_index(&op, i)?, &this.project_index(&dest, i)?)?;
     }
 
-    Ok(())
+    interp_ok(())
 }
 
 /// Performs `which` operation on each component of `op`, storing the
 /// result is stored in `dest`.
 fn unary_op_ps<'tcx>(
-    this: &mut crate::MiriInterpCx<'_, 'tcx>,
+    this: &mut crate::MiriInterpCx<'tcx>,
     which: FloatUnaryOp,
-    op: &OpTy<'tcx, Provenance>,
-    dest: &MPlaceTy<'tcx, Provenance>,
+    op: &OpTy<'tcx>,
+    dest: &MPlaceTy<'tcx>,
 ) -> InterpResult<'tcx, ()> {
-    let (op, op_len) = this.operand_to_simd(op)?;
-    let (dest, dest_len) = this.mplace_to_simd(dest)?;
+    let (op, op_len) = this.project_to_simd(op)?;
+    let (dest, dest_len) = this.project_to_simd(dest)?;
 
     assert_eq!(dest_len, op_len);
 
@@ -471,7 +474,7 @@ fn unary_op_ps<'tcx>(
         this.write_scalar(res, &dest)?;
     }
 
-    Ok(())
+    interp_ok(())
 }
 
 enum ShiftOp {
@@ -490,14 +493,14 @@ enum ShiftOp {
 /// For arithmetic right-shifts, when right is larger than BITS - 1, the sign
 /// bit is copied to all bits.
 fn shift_simd_by_scalar<'tcx>(
-    this: &mut crate::MiriInterpCx<'_, 'tcx>,
-    left: &OpTy<'tcx, Provenance>,
-    right: &OpTy<'tcx, Provenance>,
+    this: &mut crate::MiriInterpCx<'tcx>,
+    left: &OpTy<'tcx>,
+    right: &OpTy<'tcx>,
     which: ShiftOp,
-    dest: &MPlaceTy<'tcx, Provenance>,
+    dest: &MPlaceTy<'tcx>,
 ) -> InterpResult<'tcx, ()> {
-    let (left, left_len) = this.operand_to_simd(left)?;
-    let (dest, dest_len) = this.mplace_to_simd(dest)?;
+    let (left, left_len) = this.project_to_simd(left)?;
+    let (dest, dest_len) = this.project_to_simd(dest)?;
 
     assert_eq!(dest_len, left_len);
     // `right` may have a different length, and we only care about its
@@ -537,7 +540,7 @@ fn shift_simd_by_scalar<'tcx>(
         this.write_scalar(res, &dest)?;
     }
 
-    Ok(())
+    interp_ok(())
 }
 
 /// Shifts each element of `left` by the corresponding element of `right`.
@@ -546,15 +549,15 @@ fn shift_simd_by_scalar<'tcx>(
 /// For arithmetic right-shifts, when right is larger than BITS - 1, the sign
 /// bit is copied to all bits.
 fn shift_simd_by_simd<'tcx>(
-    this: &mut crate::MiriInterpCx<'_, 'tcx>,
-    left: &OpTy<'tcx, Provenance>,
-    right: &OpTy<'tcx, Provenance>,
+    this: &mut crate::MiriInterpCx<'tcx>,
+    left: &OpTy<'tcx>,
+    right: &OpTy<'tcx>,
     which: ShiftOp,
-    dest: &MPlaceTy<'tcx, Provenance>,
+    dest: &MPlaceTy<'tcx>,
 ) -> InterpResult<'tcx, ()> {
-    let (left, left_len) = this.operand_to_simd(left)?;
-    let (right, right_len) = this.operand_to_simd(right)?;
-    let (dest, dest_len) = this.mplace_to_simd(dest)?;
+    let (left, left_len) = this.project_to_simd(left)?;
+    let (right, right_len) = this.project_to_simd(right)?;
+    let (dest, dest_len) = this.project_to_simd(dest)?;
 
     assert_eq!(dest_len, left_len);
     assert_eq!(dest_len, right_len);
@@ -592,14 +595,14 @@ fn shift_simd_by_simd<'tcx>(
         this.write_scalar(res, &dest)?;
     }
 
-    Ok(())
+    interp_ok(())
 }
 
 /// Takes a 128-bit vector, transmutes it to `[u64; 2]` and extracts
 /// the first value.
 fn extract_first_u64<'tcx>(
-    this: &crate::MiriInterpCx<'_, 'tcx>,
-    op: &OpTy<'tcx, Provenance>,
+    this: &crate::MiriInterpCx<'tcx>,
+    op: &OpTy<'tcx>,
 ) -> InterpResult<'tcx, u64> {
     // Transmute vector to `[u64; 2]`
     let array_layout = this.layout_of(Ty::new_array(this.tcx.tcx, this.tcx.types.u64, 2))?;
@@ -612,15 +615,15 @@ fn extract_first_u64<'tcx>(
 // Rounds the first element of `right` according to `rounding`
 // and copies the remaining elements from `left`.
 fn round_first<'tcx, F: rustc_apfloat::Float>(
-    this: &mut crate::MiriInterpCx<'_, 'tcx>,
-    left: &OpTy<'tcx, Provenance>,
-    right: &OpTy<'tcx, Provenance>,
-    rounding: &OpTy<'tcx, Provenance>,
-    dest: &MPlaceTy<'tcx, Provenance>,
+    this: &mut crate::MiriInterpCx<'tcx>,
+    left: &OpTy<'tcx>,
+    right: &OpTy<'tcx>,
+    rounding: &OpTy<'tcx>,
+    dest: &MPlaceTy<'tcx>,
 ) -> InterpResult<'tcx, ()> {
-    let (left, left_len) = this.operand_to_simd(left)?;
-    let (right, right_len) = this.operand_to_simd(right)?;
-    let (dest, dest_len) = this.mplace_to_simd(dest)?;
+    let (left, left_len) = this.project_to_simd(left)?;
+    let (right, right_len) = this.project_to_simd(right)?;
+    let (dest, dest_len) = this.project_to_simd(dest)?;
 
     assert_eq!(dest_len, left_len);
     assert_eq!(dest_len, right_len);
@@ -638,18 +641,18 @@ fn round_first<'tcx, F: rustc_apfloat::Float>(
         this.copy_op(&this.project_index(&left, i)?, &this.project_index(&dest, i)?)?;
     }
 
-    Ok(())
+    interp_ok(())
 }
 
 // Rounds all elements of `op` according to `rounding`.
 fn round_all<'tcx, F: rustc_apfloat::Float>(
-    this: &mut crate::MiriInterpCx<'_, 'tcx>,
-    op: &OpTy<'tcx, Provenance>,
-    rounding: &OpTy<'tcx, Provenance>,
-    dest: &MPlaceTy<'tcx, Provenance>,
+    this: &mut crate::MiriInterpCx<'tcx>,
+    op: &OpTy<'tcx>,
+    rounding: &OpTy<'tcx>,
+    dest: &MPlaceTy<'tcx>,
 ) -> InterpResult<'tcx, ()> {
-    let (op, op_len) = this.operand_to_simd(op)?;
-    let (dest, dest_len) = this.mplace_to_simd(dest)?;
+    let (op, op_len) = this.project_to_simd(op)?;
+    let (dest, dest_len) = this.project_to_simd(dest)?;
 
     assert_eq!(dest_len, op_len);
 
@@ -664,7 +667,7 @@ fn round_all<'tcx, F: rustc_apfloat::Float>(
         )?;
     }
 
-    Ok(())
+    interp_ok(())
 }
 
 /// Gets equivalent `rustc_apfloat::Round` from rounding mode immediate of
@@ -676,14 +679,14 @@ fn rounding_from_imm<'tcx>(rounding: i32) -> InterpResult<'tcx, rustc_apfloat::R
     match rounding & !0b1000 {
         // When the third bit is 0, the rounding mode is determined by the
         // first two bits.
-        0b000 => Ok(rustc_apfloat::Round::NearestTiesToEven),
-        0b001 => Ok(rustc_apfloat::Round::TowardNegative),
-        0b010 => Ok(rustc_apfloat::Round::TowardPositive),
-        0b011 => Ok(rustc_apfloat::Round::TowardZero),
+        0b000 => interp_ok(rustc_apfloat::Round::NearestTiesToEven),
+        0b001 => interp_ok(rustc_apfloat::Round::TowardNegative),
+        0b010 => interp_ok(rustc_apfloat::Round::TowardPositive),
+        0b011 => interp_ok(rustc_apfloat::Round::TowardZero),
         // When the third bit is 1, the rounding mode is determined by the
         // SSE status register. Since we do not support modifying it from
         // Miri (or Rust), we assume it to be at its default mode (round-to-nearest).
-        0b100..=0b111 => Ok(rustc_apfloat::Round::NearestTiesToEven),
+        0b100..=0b111 => interp_ok(rustc_apfloat::Round::NearestTiesToEven),
         rounding => panic!("invalid rounding mode 0x{rounding:02x}"),
     }
 }
@@ -695,13 +698,13 @@ fn rounding_from_imm<'tcx>(rounding: i32) -> InterpResult<'tcx, rustc_apfloat::R
 /// If `op` has more elements than `dest`, extra elements are ignored. If `op`
 /// has less elements than `dest`, the rest is filled with zeros.
 fn convert_float_to_int<'tcx>(
-    this: &mut crate::MiriInterpCx<'_, 'tcx>,
-    op: &OpTy<'tcx, Provenance>,
+    this: &mut crate::MiriInterpCx<'tcx>,
+    op: &OpTy<'tcx>,
     rnd: rustc_apfloat::Round,
-    dest: &MPlaceTy<'tcx, Provenance>,
+    dest: &MPlaceTy<'tcx>,
 ) -> InterpResult<'tcx, ()> {
-    let (op, op_len) = this.operand_to_simd(op)?;
-    let (dest, dest_len) = this.mplace_to_simd(dest)?;
+    let (op, op_len) = this.project_to_simd(op)?;
+    let (dest, dest_len) = this.project_to_simd(dest)?;
 
     // Output must be *signed* integers.
     assert!(matches!(dest.layout.field(this, 0).ty.kind(), ty::Int(_)));
@@ -722,7 +725,7 @@ fn convert_float_to_int<'tcx>(
         this.write_scalar(Scalar::from_int(0, dest.layout.size), &dest)?;
     }
 
-    Ok(())
+    interp_ok(())
 }
 
 /// Calculates absolute value of integers in `op` and stores the result in `dest`.
@@ -730,12 +733,12 @@ fn convert_float_to_int<'tcx>(
 /// In case of overflow (when the operand is the minimum value), the operation
 /// will wrap around.
 fn int_abs<'tcx>(
-    this: &mut crate::MiriInterpCx<'_, 'tcx>,
-    op: &OpTy<'tcx, Provenance>,
-    dest: &MPlaceTy<'tcx, Provenance>,
+    this: &mut crate::MiriInterpCx<'tcx>,
+    op: &OpTy<'tcx>,
+    dest: &MPlaceTy<'tcx>,
 ) -> InterpResult<'tcx, ()> {
-    let (op, op_len) = this.operand_to_simd(op)?;
-    let (dest, dest_len) = this.mplace_to_simd(dest)?;
+    let (op, op_len) = this.project_to_simd(op)?;
+    let (dest, dest_len) = this.project_to_simd(dest)?;
 
     assert_eq!(op_len, dest_len);
 
@@ -752,7 +755,7 @@ fn int_abs<'tcx>(
         this.write_immediate(*res, &dest)?;
     }
 
-    Ok(())
+    interp_ok(())
 }
 
 /// Splits `op` (which must be a SIMD vector) into 128-bit chunks.
@@ -763,7 +766,7 @@ fn int_abs<'tcx>(
 /// * The third element is the `op` vector split into chunks, i.e, it's
 ///   type is `[[T; M]; N]` where `T` is the element type of `op`.
 fn split_simd_to_128bit_chunks<'tcx, P: Projectable<'tcx, Provenance>>(
-    this: &mut crate::MiriInterpCx<'_, 'tcx>,
+    this: &mut crate::MiriInterpCx<'tcx>,
     op: &P,
 ) -> InterpResult<'tcx, (u64, u64, P)> {
     let simd_layout = op.layout();
@@ -771,7 +774,7 @@ fn split_simd_to_128bit_chunks<'tcx, P: Projectable<'tcx, Provenance>>(
 
     assert_eq!(simd_layout.size.bits() % 128, 0);
     let num_chunks = simd_layout.size.bits() / 128;
-    let items_per_chunk = simd_len.checked_div(num_chunks).unwrap();
+    let items_per_chunk = simd_len.strict_div(num_chunks);
 
     // Transmute to `[[T; items_per_chunk]; num_chunks]`
     let chunked_layout = this
@@ -783,7 +786,7 @@ fn split_simd_to_128bit_chunks<'tcx, P: Projectable<'tcx, Provenance>>(
         .unwrap();
     let chunked_op = op.transmute(chunked_layout, this)?;
 
-    Ok((num_chunks, items_per_chunk, chunked_op))
+    interp_ok((num_chunks, items_per_chunk, chunked_op))
 }
 
 /// Horizontally performs `which` operation on adjacent values of
@@ -796,12 +799,12 @@ fn split_simd_to_128bit_chunks<'tcx, P: Projectable<'tcx, Provenance>>(
 /// the is i-th 128-bit chunk of `dest` is calculated with the i-th
 /// 128-bit chunks of `left` and `right`).
 fn horizontal_bin_op<'tcx>(
-    this: &mut crate::MiriInterpCx<'_, 'tcx>,
+    this: &mut crate::MiriInterpCx<'tcx>,
     which: mir::BinOp,
     saturating: bool,
-    left: &OpTy<'tcx, Provenance>,
-    right: &OpTy<'tcx, Provenance>,
-    dest: &MPlaceTy<'tcx, Provenance>,
+    left: &OpTy<'tcx>,
+    right: &OpTy<'tcx>,
+    dest: &MPlaceTy<'tcx>,
 ) -> InterpResult<'tcx, ()> {
     assert_eq!(left.layout, dest.layout);
     assert_eq!(right.layout, dest.layout);
@@ -819,13 +822,11 @@ fn horizontal_bin_op<'tcx>(
         for j in 0..items_per_chunk {
             // `j` is the index in `dest`
             // `k` is the index of the 2-item chunk in `src`
-            let (k, src) =
-                if j < middle { (j, &left) } else { (j.checked_sub(middle).unwrap(), &right) };
+            let (k, src) = if j < middle { (j, &left) } else { (j.strict_sub(middle), &right) };
             // `base_i` is the index of the first item of the 2-item chunk in `src`
-            let base_i = k.checked_mul(2).unwrap();
+            let base_i = k.strict_mul(2);
             let lhs = this.read_immediate(&this.project_index(src, base_i)?)?;
-            let rhs =
-                this.read_immediate(&this.project_index(src, base_i.checked_add(1).unwrap())?)?;
+            let rhs = this.read_immediate(&this.project_index(src, base_i.strict_add(1))?)?;
 
             let res = if saturating {
                 Immediate::from(this.saturating_arith(which, &lhs, &rhs)?)
@@ -837,7 +838,7 @@ fn horizontal_bin_op<'tcx>(
         }
     }
 
-    Ok(())
+    interp_ok(())
 }
 
 /// Conditionally multiplies the packed floating-point elements in
@@ -849,11 +850,11 @@ fn horizontal_bin_op<'tcx>(
 /// the is i-th 128-bit chunk of `dest` is calculated with the i-th
 /// 128-bit blocks of `left` and `right`).
 fn conditional_dot_product<'tcx>(
-    this: &mut crate::MiriInterpCx<'_, 'tcx>,
-    left: &OpTy<'tcx, Provenance>,
-    right: &OpTy<'tcx, Provenance>,
-    imm: &OpTy<'tcx, Provenance>,
-    dest: &MPlaceTy<'tcx, Provenance>,
+    this: &mut crate::MiriInterpCx<'tcx>,
+    left: &OpTy<'tcx>,
+    right: &OpTy<'tcx>,
+    imm: &OpTy<'tcx>,
+    dest: &MPlaceTy<'tcx>,
 ) -> InterpResult<'tcx, ()> {
     assert_eq!(left.layout, dest.layout);
     assert_eq!(right.layout, dest.layout);
@@ -878,7 +879,7 @@ fn conditional_dot_product<'tcx>(
         // for the initial value because the representation of 0.0 is all zero bits.
         let mut sum = ImmTy::from_int(0u8, element_layout);
         for j in 0..items_per_chunk {
-            if imm & (1 << j.checked_add(4).unwrap()) != 0 {
+            if imm & (1 << j.strict_add(4)) != 0 {
                 let left = this.read_immediate(&this.project_index(&left, j)?)?;
                 let right = this.read_immediate(&this.project_index(&right, j)?)?;
 
@@ -899,7 +900,7 @@ fn conditional_dot_product<'tcx>(
         }
     }
 
-    Ok(())
+    interp_ok(())
 }
 
 /// Calculates two booleans.
@@ -907,14 +908,14 @@ fn conditional_dot_product<'tcx>(
 /// The first is true when all the bits of `op & mask` are zero.
 /// The second is true when `(op & mask) == mask`
 fn test_bits_masked<'tcx>(
-    this: &crate::MiriInterpCx<'_, 'tcx>,
-    op: &OpTy<'tcx, Provenance>,
-    mask: &OpTy<'tcx, Provenance>,
+    this: &crate::MiriInterpCx<'tcx>,
+    op: &OpTy<'tcx>,
+    mask: &OpTy<'tcx>,
 ) -> InterpResult<'tcx, (bool, bool)> {
     assert_eq!(op.layout, mask.layout);
 
-    let (op, op_len) = this.operand_to_simd(op)?;
-    let (mask, mask_len) = this.operand_to_simd(mask)?;
+    let (op, op_len) = this.project_to_simd(op)?;
+    let (mask, mask_len) = this.project_to_simd(mask)?;
 
     assert_eq!(op_len, mask_len);
 
@@ -930,7 +931,7 @@ fn test_bits_masked<'tcx>(
         masked_set &= (op & mask) == mask;
     }
 
-    Ok((all_zero, masked_set))
+    interp_ok((all_zero, masked_set))
 }
 
 /// Calculates two booleans.
@@ -938,18 +939,18 @@ fn test_bits_masked<'tcx>(
 /// The first is true when the highest bit of each element of `op & mask` is zero.
 /// The second is true when the highest bit of each element of `!op & mask` is zero.
 fn test_high_bits_masked<'tcx>(
-    this: &crate::MiriInterpCx<'_, 'tcx>,
-    op: &OpTy<'tcx, Provenance>,
-    mask: &OpTy<'tcx, Provenance>,
+    this: &crate::MiriInterpCx<'tcx>,
+    op: &OpTy<'tcx>,
+    mask: &OpTy<'tcx>,
 ) -> InterpResult<'tcx, (bool, bool)> {
     assert_eq!(op.layout, mask.layout);
 
-    let (op, op_len) = this.operand_to_simd(op)?;
-    let (mask, mask_len) = this.operand_to_simd(mask)?;
+    let (op, op_len) = this.project_to_simd(op)?;
+    let (mask, mask_len) = this.project_to_simd(mask)?;
 
     assert_eq!(op_len, mask_len);
 
-    let high_bit_offset = op.layout.field(this, 0).size.bits().checked_sub(1).unwrap();
+    let high_bit_offset = op.layout.field(this, 0).size.bits().strict_sub(1);
 
     let mut direct = true;
     let mut negated = true;
@@ -963,24 +964,24 @@ fn test_high_bits_masked<'tcx>(
         negated &= (!op & mask) >> high_bit_offset == 0;
     }
 
-    Ok((direct, negated))
+    interp_ok((direct, negated))
 }
 
 /// Conditionally loads from `ptr` according the high bit of each
 /// element of `mask`. `ptr` does not need to be aligned.
 fn mask_load<'tcx>(
-    this: &mut crate::MiriInterpCx<'_, 'tcx>,
-    ptr: &OpTy<'tcx, Provenance>,
-    mask: &OpTy<'tcx, Provenance>,
-    dest: &MPlaceTy<'tcx, Provenance>,
+    this: &mut crate::MiriInterpCx<'tcx>,
+    ptr: &OpTy<'tcx>,
+    mask: &OpTy<'tcx>,
+    dest: &MPlaceTy<'tcx>,
 ) -> InterpResult<'tcx, ()> {
-    let (mask, mask_len) = this.operand_to_simd(mask)?;
-    let (dest, dest_len) = this.mplace_to_simd(dest)?;
+    let (mask, mask_len) = this.project_to_simd(mask)?;
+    let (dest, dest_len) = this.project_to_simd(dest)?;
 
     assert_eq!(dest_len, mask_len);
 
     let mask_item_size = mask.layout.field(this, 0).size;
-    let high_bit_offset = mask_item_size.bits().checked_sub(1).unwrap();
+    let high_bit_offset = mask_item_size.bits().strict_sub(1);
 
     let ptr = this.read_pointer(ptr)?;
     for i in 0..dest_len {
@@ -996,24 +997,24 @@ fn mask_load<'tcx>(
         }
     }
 
-    Ok(())
+    interp_ok(())
 }
 
 /// Conditionally stores into `ptr` according the high bit of each
 /// element of `mask`. `ptr` does not need to be aligned.
 fn mask_store<'tcx>(
-    this: &mut crate::MiriInterpCx<'_, 'tcx>,
-    ptr: &OpTy<'tcx, Provenance>,
-    mask: &OpTy<'tcx, Provenance>,
-    value: &OpTy<'tcx, Provenance>,
+    this: &mut crate::MiriInterpCx<'tcx>,
+    ptr: &OpTy<'tcx>,
+    mask: &OpTy<'tcx>,
+    value: &OpTy<'tcx>,
 ) -> InterpResult<'tcx, ()> {
-    let (mask, mask_len) = this.operand_to_simd(mask)?;
-    let (value, value_len) = this.operand_to_simd(value)?;
+    let (mask, mask_len) = this.project_to_simd(mask)?;
+    let (value, value_len) = this.project_to_simd(value)?;
 
     assert_eq!(value_len, mask_len);
 
     let mask_item_size = mask.layout.field(this, 0).size;
-    let high_bit_offset = mask_item_size.bits().checked_sub(1).unwrap();
+    let high_bit_offset = mask_item_size.bits().strict_sub(1);
 
     let ptr = this.read_pointer(ptr)?;
     for i in 0..value_len {
@@ -1021,13 +1022,16 @@ fn mask_store<'tcx>(
         let value = this.project_index(&value, i)?;
 
         if this.read_scalar(&mask)?.to_uint(mask_item_size)? >> high_bit_offset != 0 {
+            // *Non-inbounds* pointer arithmetic to compute the destination.
+            // (That's why we can't use a place projection.)
             let ptr = ptr.wrapping_offset(value.layout.size * i, &this.tcx);
-            // Unaligned copy, which is what we want.
-            this.mem_copy(value.ptr(), ptr, value.layout.size, /*nonoverlapping*/ true)?;
+            // Deref the pointer *unaligned*, and do the copy.
+            let dest = this.ptr_to_mplace_unaligned(ptr, value.layout);
+            this.copy_op(&value, &dest)?;
         }
     }
 
-    Ok(())
+    interp_ok(())
 }
 
 /// Compute the sum of absolute differences of quadruplets of unsigned
@@ -1042,11 +1046,11 @@ fn mask_store<'tcx>(
 /// the is i-th 128-bit chunk of `dest` is calculated with the i-th
 /// 128-bit chunks of `left` and `right`).
 fn mpsadbw<'tcx>(
-    this: &mut crate::MiriInterpCx<'_, 'tcx>,
-    left: &OpTy<'tcx, Provenance>,
-    right: &OpTy<'tcx, Provenance>,
-    imm: &OpTy<'tcx, Provenance>,
-    dest: &MPlaceTy<'tcx, Provenance>,
+    this: &mut crate::MiriInterpCx<'tcx>,
+    left: &OpTy<'tcx>,
+    right: &OpTy<'tcx>,
+    imm: &OpTy<'tcx>,
+    dest: &MPlaceTy<'tcx>,
 ) -> InterpResult<'tcx, ()> {
     assert_eq!(left.layout, right.layout);
     assert_eq!(left.layout.size, dest.layout.size);
@@ -1055,15 +1059,15 @@ fn mpsadbw<'tcx>(
     let (_, _, right) = split_simd_to_128bit_chunks(this, right)?;
     let (_, dest_items_per_chunk, dest) = split_simd_to_128bit_chunks(this, dest)?;
 
-    assert_eq!(op_items_per_chunk, dest_items_per_chunk.checked_mul(2).unwrap());
+    assert_eq!(op_items_per_chunk, dest_items_per_chunk.strict_mul(2));
 
     let imm = this.read_scalar(imm)?.to_uint(imm.layout.size)?;
     // Bit 2 of `imm` specifies the offset for indices of `left`.
     // The offset is 0 when the bit is 0 or 4 when the bit is 1.
-    let left_offset = u64::try_from((imm >> 2) & 1).unwrap().checked_mul(4).unwrap();
+    let left_offset = u64::try_from((imm >> 2) & 1).unwrap().strict_mul(4);
     // Bits 0..=1 of `imm` specify the offset for indices of
     // `right` in blocks of 4 elements.
-    let right_offset = u64::try_from(imm & 0b11).unwrap().checked_mul(4).unwrap();
+    let right_offset = u64::try_from(imm & 0b11).unwrap().strict_mul(4);
 
     for i in 0..num_chunks {
         let left = this.project_index(&left, i)?;
@@ -1071,24 +1075,22 @@ fn mpsadbw<'tcx>(
         let dest = this.project_index(&dest, i)?;
 
         for j in 0..dest_items_per_chunk {
-            let left_offset = left_offset.checked_add(j).unwrap();
+            let left_offset = left_offset.strict_add(j);
             let mut res: u16 = 0;
             for k in 0..4 {
                 let left = this
-                    .read_scalar(&this.project_index(&left, left_offset.checked_add(k).unwrap())?)?
+                    .read_scalar(&this.project_index(&left, left_offset.strict_add(k))?)?
                     .to_u8()?;
                 let right = this
-                    .read_scalar(
-                        &this.project_index(&right, right_offset.checked_add(k).unwrap())?,
-                    )?
+                    .read_scalar(&this.project_index(&right, right_offset.strict_add(k))?)?
                     .to_u8()?;
-                res = res.checked_add(left.abs_diff(right).into()).unwrap();
+                res = res.strict_add(left.abs_diff(right).into());
             }
             this.write_scalar(Scalar::from_u16(res), &this.project_index(&dest, j)?)?;
         }
     }
 
-    Ok(())
+    interp_ok(())
 }
 
 /// Multiplies packed 16-bit signed integer values, truncates the 32-bit
@@ -1099,14 +1101,14 @@ fn mpsadbw<'tcx>(
 /// <https://www.intel.com/content/www/us/en/docs/intrinsics-guide/index.html#text=_mm_mulhrs_epi16>
 /// <https://www.intel.com/content/www/us/en/docs/intrinsics-guide/index.html#text=_mm256_mulhrs_epi16>
 fn pmulhrsw<'tcx>(
-    this: &mut crate::MiriInterpCx<'_, 'tcx>,
-    left: &OpTy<'tcx, Provenance>,
-    right: &OpTy<'tcx, Provenance>,
-    dest: &MPlaceTy<'tcx, Provenance>,
+    this: &mut crate::MiriInterpCx<'tcx>,
+    left: &OpTy<'tcx>,
+    right: &OpTy<'tcx>,
+    dest: &MPlaceTy<'tcx>,
 ) -> InterpResult<'tcx, ()> {
-    let (left, left_len) = this.operand_to_simd(left)?;
-    let (right, right_len) = this.operand_to_simd(right)?;
-    let (dest, dest_len) = this.mplace_to_simd(dest)?;
+    let (left, left_len) = this.project_to_simd(left)?;
+    let (right, right_len) = this.project_to_simd(right)?;
+    let (dest, dest_len) = this.project_to_simd(dest)?;
 
     assert_eq!(dest_len, left_len);
     assert_eq!(dest_len, right_len);
@@ -1116,8 +1118,7 @@ fn pmulhrsw<'tcx>(
         let right = this.read_scalar(&this.project_index(&right, i)?)?.to_i16()?;
         let dest = this.project_index(&dest, i)?;
 
-        let res =
-            (i32::from(left).checked_mul(right.into()).unwrap() >> 14).checked_add(1).unwrap() >> 1;
+        let res = (i32::from(left).strict_mul(right.into()) >> 14).strict_add(1) >> 1;
 
         // The result of this operation can overflow a signed 16-bit integer.
         // When `left` and `right` are -0x8000, the result is 0x8000.
@@ -1127,7 +1128,69 @@ fn pmulhrsw<'tcx>(
         this.write_scalar(Scalar::from_i16(res), &dest)?;
     }
 
-    Ok(())
+    interp_ok(())
+}
+
+/// Perform a carry-less multiplication of two 64-bit integers, selected from `left` and `right` according to `imm8`,
+/// and store the results in `dst`.
+///
+/// `left` and `right` are both vectors of type 2 x i64. Only bits 0 and 4 of `imm8` matter;
+/// they select the element of `left` and `right`, respectively.
+///
+/// <https://www.intel.com/content/www/us/en/docs/intrinsics-guide/index.html#text=_mm_clmulepi64_si128>
+fn pclmulqdq<'tcx>(
+    this: &mut MiriInterpCx<'tcx>,
+    left: &OpTy<'tcx>,
+    right: &OpTy<'tcx>,
+    imm8: &OpTy<'tcx>,
+    dest: &MPlaceTy<'tcx>,
+) -> InterpResult<'tcx, ()> {
+    assert_eq!(left.layout, right.layout);
+    assert_eq!(left.layout.size, dest.layout.size);
+
+    // Transmute to `[u64; 2]`
+
+    let array_layout = this.layout_of(Ty::new_array(this.tcx.tcx, this.tcx.types.u64, 2))?;
+    let left = left.transmute(array_layout, this)?;
+    let right = right.transmute(array_layout, this)?;
+    let dest = dest.transmute(array_layout, this)?;
+
+    let imm8 = this.read_scalar(imm8)?.to_u8()?;
+
+    // select the 64-bit integer from left that the user specified (low or high)
+    let index = if (imm8 & 0x01) == 0 { 0 } else { 1 };
+    let left = this.read_scalar(&this.project_index(&left, index)?)?.to_u64()?;
+
+    // select the 64-bit integer from right that the user specified (low or high)
+    let index = if (imm8 & 0x10) == 0 { 0 } else { 1 };
+    let right = this.read_scalar(&this.project_index(&right, index)?)?.to_u64()?;
+
+    // Perform carry-less multiplication
+    //
+    // This operation is like long multiplication, but ignores all carries.
+    // That idea corresponds to the xor operator, which is used in the implementation.
+    //
+    // Wikipedia has an example https://en.wikipedia.org/wiki/Carry-less_product#Example
+    let mut result: u128 = 0;
+
+    for i in 0..64 {
+        // if the i-th bit in right is set
+        if (right & (1 << i)) != 0 {
+            // xor result with `left` shifted to the left by i positions
+            result ^= u128::from(left) << i;
+        }
+    }
+
+    let result_low = (result & 0xFFFF_FFFF_FFFF_FFFF) as u64;
+    let result_high = (result >> 64) as u64;
+
+    let dest_low = this.project_index(&dest, 0)?;
+    this.write_scalar(Scalar::from_u64(result_low), &dest_low)?;
+
+    let dest_high = this.project_index(&dest, 1)?;
+    this.write_scalar(Scalar::from_u64(result_high), &dest_high)?;
+
+    interp_ok(())
 }
 
 /// Packs two N-bit integer vectors to a single N/2-bit integers.
@@ -1138,11 +1201,11 @@ fn pmulhrsw<'tcx>(
 /// the is i-th 128-bit chunk of `dest` is calculated with the i-th
 /// 128-bit chunks of `left` and `right`).
 fn pack_generic<'tcx>(
-    this: &mut crate::MiriInterpCx<'_, 'tcx>,
-    left: &OpTy<'tcx, Provenance>,
-    right: &OpTy<'tcx, Provenance>,
-    dest: &MPlaceTy<'tcx, Provenance>,
-    f: impl Fn(Scalar<Provenance>) -> InterpResult<'tcx, Scalar<Provenance>>,
+    this: &mut crate::MiriInterpCx<'tcx>,
+    left: &OpTy<'tcx>,
+    right: &OpTy<'tcx>,
+    dest: &MPlaceTy<'tcx>,
+    f: impl Fn(Scalar) -> InterpResult<'tcx, Scalar>,
 ) -> InterpResult<'tcx, ()> {
     assert_eq!(left.layout, right.layout);
     assert_eq!(left.layout.size, dest.layout.size);
@@ -1151,7 +1214,7 @@ fn pack_generic<'tcx>(
     let (_, _, right) = split_simd_to_128bit_chunks(this, right)?;
     let (_, dest_items_per_chunk, dest) = split_simd_to_128bit_chunks(this, dest)?;
 
-    assert_eq!(dest_items_per_chunk, op_items_per_chunk.checked_mul(2).unwrap());
+    assert_eq!(dest_items_per_chunk, op_items_per_chunk.strict_mul(2));
 
     for i in 0..num_chunks {
         let left = this.project_index(&left, i)?;
@@ -1162,8 +1225,7 @@ fn pack_generic<'tcx>(
             let left = this.read_scalar(&this.project_index(&left, j)?)?;
             let right = this.read_scalar(&this.project_index(&right, j)?)?;
             let left_dest = this.project_index(&dest, j)?;
-            let right_dest =
-                this.project_index(&dest, j.checked_add(op_items_per_chunk).unwrap())?;
+            let right_dest = this.project_index(&dest, j.strict_add(op_items_per_chunk))?;
 
             let left_res = f(left)?;
             let right_res = f(right)?;
@@ -1173,7 +1235,7 @@ fn pack_generic<'tcx>(
         }
     }
 
-    Ok(())
+    interp_ok(())
 }
 
 /// Converts two 16-bit integer vectors to a single 8-bit integer
@@ -1183,15 +1245,15 @@ fn pack_generic<'tcx>(
 /// the is i-th 128-bit chunk of `dest` is calculated with the i-th
 /// 128-bit chunks of `left` and `right`).
 fn packsswb<'tcx>(
-    this: &mut crate::MiriInterpCx<'_, 'tcx>,
-    left: &OpTy<'tcx, Provenance>,
-    right: &OpTy<'tcx, Provenance>,
-    dest: &MPlaceTy<'tcx, Provenance>,
+    this: &mut crate::MiriInterpCx<'tcx>,
+    left: &OpTy<'tcx>,
+    right: &OpTy<'tcx>,
+    dest: &MPlaceTy<'tcx>,
 ) -> InterpResult<'tcx, ()> {
     pack_generic(this, left, right, dest, |op| {
         let op = op.to_i16()?;
         let res = i8::try_from(op).unwrap_or(if op < 0 { i8::MIN } else { i8::MAX });
-        Ok(Scalar::from_i8(res))
+        interp_ok(Scalar::from_i8(res))
     })
 }
 
@@ -1202,15 +1264,15 @@ fn packsswb<'tcx>(
 /// the is i-th 128-bit chunk of `dest` is calculated with the i-th
 /// 128-bit chunks of `left` and `right`).
 fn packuswb<'tcx>(
-    this: &mut crate::MiriInterpCx<'_, 'tcx>,
-    left: &OpTy<'tcx, Provenance>,
-    right: &OpTy<'tcx, Provenance>,
-    dest: &MPlaceTy<'tcx, Provenance>,
+    this: &mut crate::MiriInterpCx<'tcx>,
+    left: &OpTy<'tcx>,
+    right: &OpTy<'tcx>,
+    dest: &MPlaceTy<'tcx>,
 ) -> InterpResult<'tcx, ()> {
     pack_generic(this, left, right, dest, |op| {
         let op = op.to_i16()?;
         let res = u8::try_from(op).unwrap_or(if op < 0 { 0 } else { u8::MAX });
-        Ok(Scalar::from_u8(res))
+        interp_ok(Scalar::from_u8(res))
     })
 }
 
@@ -1221,15 +1283,15 @@ fn packuswb<'tcx>(
 /// the is i-th 128-bit chunk of `dest` is calculated with the i-th
 /// 128-bit chunks of `left` and `right`).
 fn packssdw<'tcx>(
-    this: &mut crate::MiriInterpCx<'_, 'tcx>,
-    left: &OpTy<'tcx, Provenance>,
-    right: &OpTy<'tcx, Provenance>,
-    dest: &MPlaceTy<'tcx, Provenance>,
+    this: &mut crate::MiriInterpCx<'tcx>,
+    left: &OpTy<'tcx>,
+    right: &OpTy<'tcx>,
+    dest: &MPlaceTy<'tcx>,
 ) -> InterpResult<'tcx, ()> {
     pack_generic(this, left, right, dest, |op| {
         let op = op.to_i32()?;
         let res = i16::try_from(op).unwrap_or(if op < 0 { i16::MIN } else { i16::MAX });
-        Ok(Scalar::from_i16(res))
+        interp_ok(Scalar::from_i16(res))
     })
 }
 
@@ -1240,15 +1302,15 @@ fn packssdw<'tcx>(
 /// the is i-th 128-bit chunk of `dest` is calculated with the i-th
 /// 128-bit chunks of `left` and `right`).
 fn packusdw<'tcx>(
-    this: &mut crate::MiriInterpCx<'_, 'tcx>,
-    left: &OpTy<'tcx, Provenance>,
-    right: &OpTy<'tcx, Provenance>,
-    dest: &MPlaceTy<'tcx, Provenance>,
+    this: &mut crate::MiriInterpCx<'tcx>,
+    left: &OpTy<'tcx>,
+    right: &OpTy<'tcx>,
+    dest: &MPlaceTy<'tcx>,
 ) -> InterpResult<'tcx, ()> {
     pack_generic(this, left, right, dest, |op| {
         let op = op.to_i32()?;
         let res = u16::try_from(op).unwrap_or(if op < 0 { 0 } else { u16::MAX });
-        Ok(Scalar::from_u16(res))
+        interp_ok(Scalar::from_u16(res))
     })
 }
 
@@ -1257,14 +1319,14 @@ fn packusdw<'tcx>(
 /// is written to the corresponding output element.
 /// In other words, multiplies `left` with `right.signum()`.
 fn psign<'tcx>(
-    this: &mut crate::MiriInterpCx<'_, 'tcx>,
-    left: &OpTy<'tcx, Provenance>,
-    right: &OpTy<'tcx, Provenance>,
-    dest: &MPlaceTy<'tcx, Provenance>,
+    this: &mut crate::MiriInterpCx<'tcx>,
+    left: &OpTy<'tcx>,
+    right: &OpTy<'tcx>,
+    dest: &MPlaceTy<'tcx>,
 ) -> InterpResult<'tcx, ()> {
-    let (left, left_len) = this.operand_to_simd(left)?;
-    let (right, right_len) = this.operand_to_simd(right)?;
-    let (dest, dest_len) = this.mplace_to_simd(dest)?;
+    let (left, left_len) = this.project_to_simd(left)?;
+    let (right, right_len) = this.project_to_simd(right)?;
+    let (dest, dest_len) = this.project_to_simd(dest)?;
 
     assert_eq!(dest_len, left_len);
     assert_eq!(dest_len, right_len);
@@ -1280,5 +1342,29 @@ fn psign<'tcx>(
         this.write_immediate(*res, &dest)?;
     }
 
-    Ok(())
+    interp_ok(())
+}
+
+/// Calcultates either `a + b + cb_in` or `a - b - cb_in` depending on the value
+/// of `op` and returns both the sum and the overflow bit. `op` is expected to be
+/// either one of `mir::BinOp::AddWithOverflow` and `mir::BinOp::SubWithOverflow`.
+fn carrying_add<'tcx>(
+    this: &mut crate::MiriInterpCx<'tcx>,
+    cb_in: &OpTy<'tcx>,
+    a: &OpTy<'tcx>,
+    b: &OpTy<'tcx>,
+    op: mir::BinOp,
+) -> InterpResult<'tcx, (ImmTy<'tcx>, Scalar)> {
+    assert!(op == mir::BinOp::AddWithOverflow || op == mir::BinOp::SubWithOverflow);
+
+    let cb_in = this.read_scalar(cb_in)?.to_u8()? != 0;
+    let a = this.read_immediate(a)?;
+    let b = this.read_immediate(b)?;
+
+    let (sum, overflow1) = this.binary_op(op, &a, &b)?.to_pair(this);
+    let (sum, overflow2) =
+        this.binary_op(op, &sum, &ImmTy::from_uint(cb_in, a.layout))?.to_pair(this);
+    let cb_out = overflow1.to_scalar().to_bool()? | overflow2.to_scalar().to_bool()?;
+
+    interp_ok((sum, Scalar::from_u8(cb_out.into())))
 }

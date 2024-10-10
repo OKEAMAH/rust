@@ -1,13 +1,13 @@
-use crate::spec::{base, Cc, LinkerFlavor, Lld, Target, TargetOptions};
+use crate::spec::{Cc, LinkerFlavor, Lld, Target, TargetOptions, base};
 
-pub fn target() -> Target {
+pub(crate) fn target() -> Target {
     Target {
         llvm_target: "x86_64-pc-unknown".into(),
         metadata: crate::spec::TargetMetadata {
-            description: None,
-            tier: None,
-            host_tools: None,
-            std: None,
+            description: Some("x86 64-bit QNX Neutrino 7.1 RTOS".into()),
+            tier: Some(3),
+            host_tools: Some(false),
+            std: Some(true),
         },
         pointer_width: 64,
         data_layout:
@@ -17,10 +17,9 @@ pub fn target() -> Target {
             cpu: "x86-64".into(),
             plt_by_default: false,
             max_atomic_width: Some(64),
-            pre_link_args: TargetOptions::link_args(
-                LinkerFlavor::Gnu(Cc::Yes, Lld::No),
-                &["-Vgcc_ntox86_64_cxx"],
-            ),
+            pre_link_args: TargetOptions::link_args(LinkerFlavor::Gnu(Cc::Yes, Lld::No), &[
+                "-Vgcc_ntox86_64_cxx",
+            ]),
             env: "nto71".into(),
             ..base::nto_qnx::opts()
         },

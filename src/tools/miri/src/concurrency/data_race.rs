@@ -40,26 +40,22 @@
 //! code some atomic operations may increment the timestamp when not necessary but this has no effect
 //! on the data-race detection code.
 
-use std::{
-    cell::{Cell, Ref, RefCell, RefMut},
-    fmt::Debug,
-    mem,
-};
+use std::cell::{Cell, Ref, RefCell, RefMut};
+use std::fmt::Debug;
+use std::mem;
 
 use rustc_ast::Mutability;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_index::{Idx, IndexVec};
-use rustc_middle::{mir, ty::Ty};
+use rustc_middle::mir;
+use rustc_middle::ty::Ty;
 use rustc_span::Span;
 use rustc_target::abi::{Align, HasDataLayout, Size};
 
+use super::vector_clock::{VClock, VTimestamp, VectorIdx};
+use super::weak_memory::EvalContextExt as _;
 use crate::diagnostics::RacingOp;
 use crate::*;
-
-use super::{
-    vector_clock::{VClock, VTimestamp, VectorIdx},
-    weak_memory::EvalContextExt as _,
-};
 
 pub type AllocState = VClockAlloc;
 
@@ -190,7 +186,8 @@ struct AtomicMemoryCellClocks {
     /// The size of accesses to this atomic location.
     /// We use this to detect non-synchronized mixed-size accesses. Since all accesses must be
     /// aligned to their size, this is sufficient to detect imperfectly overlapping accesses.
-    size: Size,
+    /// `None` indicates that we saw multiple different sizes, which is okay as long as all accesses are reads.
+    size: Option<Size>,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -264,6 +261,14 @@ impl AccessType {
         let mut msg = String::new();
 
         if let Some(size) = size {
+            if size == Size::ZERO {
+                // In this case there were multiple read accesss with different sizes and then a write.
+                // We will be reporting *one* of the other reads, but we don't have enough information
+                // to determine which one had which size.
+                assert!(self == AccessType::AtomicLoad);
+                assert!(ty.is_none());
+                return format!("multiple differently-sized atomic loads, including one load");
+            }
             msg.push_str(&format!("{}-byte {}", size.bytes(), msg))
         }
 
@@ -304,8 +309,7 @@ impl AccessType {
     }
 }
 
-/// Memory Cell vector clock metadata
-/// for data-race detection.
+/// Per-byte vector clock metadata for data-race detection.
 #[derive(Clone, PartialEq, Eq, Debug)]
 struct MemoryCellClocks {
     /// The vector-clock timestamp and the thread that did the last non-atomic write. We don't need
@@ -324,8 +328,8 @@ struct MemoryCellClocks {
     read: VClock,
 
     /// Atomic access, acquire, release sequence tracking clocks.
-    /// For non-atomic memory in the common case this
-    /// value is set to None.
+    /// For non-atomic memory this value is set to None.
+    /// For atomic memory, each byte carries this information.
     atomic_ops: Option<Box<AtomicMemoryCellClocks>>,
 }
 
@@ -335,7 +339,7 @@ impl AtomicMemoryCellClocks {
             read_vector: Default::default(),
             write_vector: Default::default(),
             sync_vector: Default::default(),
-            size,
+            size: Some(size),
         }
     }
 }
@@ -382,17 +386,23 @@ impl MemoryCellClocks {
         &mut self,
         thread_clocks: &ThreadClockSet,
         size: Size,
+        write: bool,
     ) -> Result<&mut AtomicMemoryCellClocks, DataRace> {
         match self.atomic_ops {
             Some(ref mut atomic) => {
                 // We are good if the size is the same or all atomic accesses are before our current time.
-                if atomic.size == size {
+                if atomic.size == Some(size) {
                     Ok(atomic)
                 } else if atomic.read_vector <= thread_clocks.clock
                     && atomic.write_vector <= thread_clocks.clock
                 {
-                    // This is now the new size that must be used for accesses here.
-                    atomic.size = size;
+                    // We are fully ordered after all previous accesses, so we can change the size.
+                    atomic.size = Some(size);
+                    Ok(atomic)
+                } else if !write && atomic.write_vector <= thread_clocks.clock {
+                    // This is a read, and it is ordered after the last write. It's okay for the
+                    // sizes to mismatch, as long as no writes with a different size occur later.
+                    atomic.size = None;
                     Ok(atomic)
                 } else {
                     Err(DataRace)
@@ -498,7 +508,7 @@ impl MemoryCellClocks {
         Ok(())
     }
 
-    /// Detect data-races with an atomic read, caused by a non-atomic access that does
+    /// Detect data-races with an atomic read, caused by a non-atomic write that does
     /// not happen-before the atomic-read.
     fn atomic_read_detect(
         &mut self,
@@ -507,14 +517,10 @@ impl MemoryCellClocks {
         access_size: Size,
     ) -> Result<(), DataRace> {
         trace!("Atomic read with vectors: {:#?} :: {:#?}", self, thread_clocks);
-        let atomic = self.atomic_access(thread_clocks, access_size)?;
+        let atomic = self.atomic_access(thread_clocks, access_size, /*write*/ false)?;
         atomic.read_vector.set_at_index(&thread_clocks.clock, index);
-        // Make sure the last non-atomic write and all non-atomic reads were before this access.
-        if self.write_was_before(&thread_clocks.clock) && self.read <= thread_clocks.clock {
-            Ok(())
-        } else {
-            Err(DataRace)
-        }
+        // Make sure the last non-atomic write was before this access.
+        if self.write_was_before(&thread_clocks.clock) { Ok(()) } else { Err(DataRace) }
     }
 
     /// Detect data-races with an atomic write, either with a non-atomic read or with
@@ -526,7 +532,7 @@ impl MemoryCellClocks {
         access_size: Size,
     ) -> Result<(), DataRace> {
         trace!("Atomic write with vectors: {:#?} :: {:#?}", self, thread_clocks);
-        let atomic = self.atomic_access(thread_clocks, access_size)?;
+        let atomic = self.atomic_access(thread_clocks, access_size, /*write*/ true)?;
         atomic.write_vector.set_at_index(&thread_clocks.clock, index);
         // Make sure the last non-atomic write and all non-atomic reads were before this access.
         if self.write_was_before(&thread_clocks.clock) && self.read <= thread_clocks.clock {
@@ -551,11 +557,9 @@ impl MemoryCellClocks {
         }
         thread_clocks.clock.index_mut(index).set_read_type(read_type);
         if self.write_was_before(&thread_clocks.clock) {
+            // We must be ordered-after all atomic writes.
             let race_free = if let Some(atomic) = self.atomic() {
-                // We must be ordered-after all atomic accesses, reads and writes.
-                // This ensures we don't mix atomic and non-atomic accesses.
                 atomic.write_vector <= thread_clocks.clock
-                    && atomic.read_vector <= thread_clocks.clock
             } else {
                 true
             };
@@ -601,14 +605,14 @@ impl MemoryCellClocks {
 }
 
 /// Evaluation context extensions.
-impl<'mir, 'tcx: 'mir> EvalContextExt<'mir, 'tcx> for MiriInterpCx<'mir, 'tcx> {}
-pub trait EvalContextExt<'mir, 'tcx: 'mir>: MiriInterpCxExt<'mir, 'tcx> {
+impl<'tcx> EvalContextExt<'tcx> for MiriInterpCx<'tcx> {}
+pub trait EvalContextExt<'tcx>: MiriInterpCxExt<'tcx> {
     /// Perform an atomic read operation at the memory location.
     fn read_scalar_atomic(
         &self,
-        place: &MPlaceTy<'tcx, Provenance>,
+        place: &MPlaceTy<'tcx>,
         atomic: AtomicReadOrd,
-    ) -> InterpResult<'tcx, Scalar<Provenance>> {
+    ) -> InterpResult<'tcx, Scalar> {
         let this = self.eval_context_ref();
         this.atomic_access_check(place, AtomicAccessType::Load(atomic))?;
         // This will read from the last store in the modification order of this location. In case
@@ -617,40 +621,41 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: MiriInterpCxExt<'mir, 'tcx> {
         // the *value* (including the associated provenance if this is an AtomicPtr) at this location.
         // Only metadata on the location itself is used.
         let scalar = this.allow_data_races_ref(move |this| this.read_scalar(place))?;
-        this.buffered_atomic_read(place, atomic, scalar, || {
+        let buffered_scalar = this.buffered_atomic_read(place, atomic, scalar, || {
             this.validate_atomic_load(place, atomic)
-        })
+        })?;
+        interp_ok(buffered_scalar.ok_or_else(|| err_ub!(InvalidUninitBytes(None)))?)
     }
 
     /// Perform an atomic write operation at the memory location.
     fn write_scalar_atomic(
         &mut self,
-        val: Scalar<Provenance>,
-        dest: &MPlaceTy<'tcx, Provenance>,
+        val: Scalar,
+        dest: &MPlaceTy<'tcx>,
         atomic: AtomicWriteOrd,
     ) -> InterpResult<'tcx> {
         let this = self.eval_context_mut();
         this.atomic_access_check(dest, AtomicAccessType::Store)?;
 
+        // Read the previous value so we can put it in the store buffer later.
+        // The program didn't actually do a read, so suppress the memory access hooks.
+        // This is also a very special exception where we just ignore an error -- if this read
+        // was UB e.g. because the memory is uninitialized, we don't want to know!
+        let old_val = this.run_for_validation(|this| this.read_scalar(dest)).discard_err();
         this.allow_data_races_mut(move |this| this.write_scalar(val, dest))?;
         this.validate_atomic_store(dest, atomic)?;
-        // FIXME: it's not possible to get the value before write_scalar. A read_scalar will cause
-        // side effects from a read the program did not perform. So we have to initialise
-        // the store buffer with the value currently being written
-        // ONCE this is fixed please remove the hack in buffered_atomic_write() in weak_memory.rs
-        // https://github.com/rust-lang/miri/issues/2164
-        this.buffered_atomic_write(val, dest, atomic, val)
+        this.buffered_atomic_write(val, dest, atomic, old_val)
     }
 
     /// Perform an atomic RMW operation on a memory location.
     fn atomic_rmw_op_immediate(
         &mut self,
-        place: &MPlaceTy<'tcx, Provenance>,
-        rhs: &ImmTy<'tcx, Provenance>,
+        place: &MPlaceTy<'tcx>,
+        rhs: &ImmTy<'tcx>,
         op: mir::BinOp,
         not: bool,
         atomic: AtomicRwOrd,
-    ) -> InterpResult<'tcx, ImmTy<'tcx, Provenance>> {
+    ) -> InterpResult<'tcx, ImmTy<'tcx>> {
         let this = self.eval_context_mut();
         this.atomic_access_check(place, AtomicAccessType::Rmw)?;
 
@@ -663,17 +668,17 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: MiriInterpCxExt<'mir, 'tcx> {
         this.validate_atomic_rmw(place, atomic)?;
 
         this.buffered_atomic_rmw(val.to_scalar(), place, atomic, old.to_scalar())?;
-        Ok(old)
+        interp_ok(old)
     }
 
     /// Perform an atomic exchange with a memory place and a new
     /// scalar value, the old value is returned.
     fn atomic_exchange_scalar(
         &mut self,
-        place: &MPlaceTy<'tcx, Provenance>,
-        new: Scalar<Provenance>,
+        place: &MPlaceTy<'tcx>,
+        new: Scalar,
         atomic: AtomicRwOrd,
-    ) -> InterpResult<'tcx, Scalar<Provenance>> {
+    ) -> InterpResult<'tcx, Scalar> {
         let this = self.eval_context_mut();
         this.atomic_access_check(place, AtomicAccessType::Rmw)?;
 
@@ -683,18 +688,18 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: MiriInterpCxExt<'mir, 'tcx> {
         this.validate_atomic_rmw(place, atomic)?;
 
         this.buffered_atomic_rmw(new, place, atomic, old)?;
-        Ok(old)
+        interp_ok(old)
     }
 
     /// Perform an conditional atomic exchange with a memory place and a new
     /// scalar value, the old value is returned.
     fn atomic_min_max_scalar(
         &mut self,
-        place: &MPlaceTy<'tcx, Provenance>,
-        rhs: ImmTy<'tcx, Provenance>,
+        place: &MPlaceTy<'tcx>,
+        rhs: ImmTy<'tcx>,
         min: bool,
         atomic: AtomicRwOrd,
-    ) -> InterpResult<'tcx, ImmTy<'tcx, Provenance>> {
+    ) -> InterpResult<'tcx, ImmTy<'tcx>> {
         let this = self.eval_context_mut();
         this.atomic_access_check(place, AtomicAccessType::Rmw)?;
 
@@ -715,7 +720,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: MiriInterpCxExt<'mir, 'tcx> {
         this.buffered_atomic_rmw(new_val.to_scalar(), place, atomic, old.to_scalar())?;
 
         // Return the old value.
-        Ok(old)
+        interp_ok(old)
     }
 
     /// Perform an atomic compare and exchange at a given memory location.
@@ -726,9 +731,9 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: MiriInterpCxExt<'mir, 'tcx> {
     /// identical.
     fn atomic_compare_exchange_scalar(
         &mut self,
-        place: &MPlaceTy<'tcx, Provenance>,
-        expect_old: &ImmTy<'tcx, Provenance>,
-        new: Scalar<Provenance>,
+        place: &MPlaceTy<'tcx>,
+        expect_old: &ImmTy<'tcx>,
+        new: Scalar,
         success: AtomicRwOrd,
         fail: AtomicReadOrd,
         can_fail_spuriously: bool,
@@ -768,11 +773,11 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: MiriInterpCxExt<'mir, 'tcx> {
             // in the modification order.
             // Since `old` is only a value and not the store element, we need to separately
             // find it in our store buffer and perform load_impl on it.
-            this.perform_read_on_buffered_latest(place, fail, old.to_scalar())?;
+            this.perform_read_on_buffered_latest(place, fail)?;
         }
 
         // Return the old value.
-        Ok(res)
+        interp_ok(res)
     }
 
     /// Update the data-race detector for an atomic fence on the current thread.
@@ -804,11 +809,11 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: MiriInterpCxExt<'mir, 'tcx> {
                     }
 
                     // Increment timestamp in case of release semantics.
-                    Ok(atomic != AtomicFenceOrd::Acquire)
+                    interp_ok(atomic != AtomicFenceOrd::Acquire)
                 },
             )
         } else {
-            Ok(())
+            interp_ok(())
         }
     }
 
@@ -820,6 +825,26 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: MiriInterpCxExt<'mir, 'tcx> {
         if let Some(data_race) = &this.machine.data_race {
             let old = data_race.ongoing_action_data_race_free.replace(true);
             assert!(!old, "cannot nest allow_data_races");
+        }
+    }
+
+    /// Returns the `release` clock of the current thread.
+    /// Other threads can acquire this clock in the future to establish synchronization
+    /// with this program point.
+    fn release_clock<'a>(&'a self) -> Option<Ref<'a, VClock>>
+    where
+        'tcx: 'a,
+    {
+        let this = self.eval_context_ref();
+        Some(this.machine.data_race.as_ref()?.release_clock(&this.machine.threads))
+    }
+
+    /// Acquire the given clock into the current thread, establishing synchronization with
+    /// the moment when that clock snapshot was taken via `release_clock`.
+    fn acquire_clock(&self, clock: &VClock) {
+        let this = self.eval_context_ref();
+        if let Some(data_race) = &this.machine.data_race {
+            data_race.acquire_clock(clock, &this.machine.threads);
         }
     }
 }
@@ -841,7 +866,7 @@ impl VClockAlloc {
     /// Create a new data-race detector for newly allocated memory.
     pub fn new_allocation(
         global: &GlobalState,
-        thread_mgr: &ThreadManager<'_, '_>,
+        thread_mgr: &ThreadManager<'_>,
         len: Size,
         kind: MemoryKind,
         current_span: Span,
@@ -924,20 +949,18 @@ impl VClockAlloc {
     #[inline(never)]
     fn report_data_race<'tcx>(
         global: &GlobalState,
-        thread_mgr: &ThreadManager<'_, '_>,
+        thread_mgr: &ThreadManager<'_>,
         mem_clocks: &MemoryCellClocks,
         access: AccessType,
         access_size: Size,
-        ptr_dbg: Pointer<AllocId>,
+        ptr_dbg: interpret::Pointer<AllocId>,
         ty: Option<Ty<'_>>,
     ) -> InterpResult<'tcx> {
         let (active_index, active_clocks) = global.active_thread_state(thread_mgr);
         let mut other_size = None; // if `Some`, this was a size-mismatch race
         let write_clock;
         let (other_access, other_thread, other_clock) =
-            // First check the atomic-nonatomic cases. If it looks like multiple
-            // cases apply, this one should take precedence, else it might look like
-            // we are reporting races between two non-atomic reads.
+            // First check the atomic-nonatomic cases.
             if !access.is_atomic() &&
                 let Some(atomic) = mem_clocks.atomic() &&
                 let Some(idx) = Self::find_gt_index(&atomic.write_vector, &active_clocks.clock)
@@ -955,10 +978,10 @@ impl VClockAlloc {
             } else if let Some(idx) = Self::find_gt_index(&mem_clocks.read, &active_clocks.clock) {
                 (AccessType::NaRead(mem_clocks.read[idx].read_type()), idx, &mem_clocks.read)
             // Finally, mixed-size races.
-            } else if access.is_atomic() && let Some(atomic) = mem_clocks.atomic() && atomic.size != access_size {
+            } else if access.is_atomic() && let Some(atomic) = mem_clocks.atomic() && atomic.size != Some(access_size) {
                 // This is only a race if we are not synchronized with all atomic accesses, so find
                 // the one we are not synchronized with.
-                other_size = Some(atomic.size);
+                other_size = Some(atomic.size.unwrap_or(Size::ZERO));
                 if let Some(idx) = Self::find_gt_index(&atomic.write_vector, &active_clocks.clock)
                     {
                         (AccessType::AtomicStore, idx, &atomic.write_vector)
@@ -985,10 +1008,7 @@ impl VClockAlloc {
             assert!(!involves_non_atomic);
             Some("overlapping unsynchronized atomic accesses must use the same access size")
         } else if access.is_read() && other_access.is_read() {
-            assert!(involves_non_atomic);
-            Some(
-                "overlapping atomic and non-atomic accesses must be synchronized, even if both are read-only",
-            )
+            panic!("there should be no same-size read-read races")
         } else {
             None
         };
@@ -1022,36 +1042,35 @@ impl VClockAlloc {
         access_range: AllocRange,
         read_type: NaReadType,
         ty: Option<Ty<'_>>,
-        machine: &MiriMachine<'_, '_>,
+        machine: &MiriMachine<'_>,
     ) -> InterpResult<'tcx> {
         let current_span = machine.current_span();
         let global = machine.data_race.as_ref().unwrap();
-        if global.race_detecting() {
-            let (index, mut thread_clocks) = global.active_thread_state_mut(&machine.threads);
-            let mut alloc_ranges = self.alloc_ranges.borrow_mut();
-            for (mem_clocks_range, mem_clocks) in
-                alloc_ranges.iter_mut(access_range.start, access_range.size)
-            {
-                if let Err(DataRace) =
-                    mem_clocks.read_race_detect(&mut thread_clocks, index, read_type, current_span)
-                {
-                    drop(thread_clocks);
-                    // Report data-race.
-                    return Self::report_data_race(
-                        global,
-                        &machine.threads,
-                        mem_clocks,
-                        AccessType::NaRead(read_type),
-                        access_range.size,
-                        Pointer::new(alloc_id, Size::from_bytes(mem_clocks_range.start)),
-                        ty,
-                    );
-                }
-            }
-            Ok(())
-        } else {
-            Ok(())
+        if !global.race_detecting() {
+            return interp_ok(());
         }
+        let (index, mut thread_clocks) = global.active_thread_state_mut(&machine.threads);
+        let mut alloc_ranges = self.alloc_ranges.borrow_mut();
+        for (mem_clocks_range, mem_clocks) in
+            alloc_ranges.iter_mut(access_range.start, access_range.size)
+        {
+            if let Err(DataRace) =
+                mem_clocks.read_race_detect(&mut thread_clocks, index, read_type, current_span)
+            {
+                drop(thread_clocks);
+                // Report data-race.
+                return Self::report_data_race(
+                    global,
+                    &machine.threads,
+                    mem_clocks,
+                    AccessType::NaRead(read_type),
+                    access_range.size,
+                    interpret::Pointer::new(alloc_id, Size::from_bytes(mem_clocks_range.start)),
+                    ty,
+                );
+            }
+        }
+        interp_ok(())
     }
 
     /// Detect data-races for an unsynchronized write operation. It will not perform
@@ -1065,52 +1084,148 @@ impl VClockAlloc {
         access_range: AllocRange,
         write_type: NaWriteType,
         ty: Option<Ty<'_>>,
-        machine: &mut MiriMachine<'_, '_>,
+        machine: &mut MiriMachine<'_>,
     ) -> InterpResult<'tcx> {
         let current_span = machine.current_span();
         let global = machine.data_race.as_mut().unwrap();
-        if global.race_detecting() {
-            let (index, mut thread_clocks) = global.active_thread_state_mut(&machine.threads);
-            for (mem_clocks_range, mem_clocks) in
-                self.alloc_ranges.get_mut().iter_mut(access_range.start, access_range.size)
+        if !global.race_detecting() {
+            return interp_ok(());
+        }
+        let (index, mut thread_clocks) = global.active_thread_state_mut(&machine.threads);
+        for (mem_clocks_range, mem_clocks) in
+            self.alloc_ranges.get_mut().iter_mut(access_range.start, access_range.size)
+        {
+            if let Err(DataRace) =
+                mem_clocks.write_race_detect(&mut thread_clocks, index, write_type, current_span)
             {
-                if let Err(DataRace) = mem_clocks.write_race_detect(
-                    &mut thread_clocks,
-                    index,
-                    write_type,
-                    current_span,
-                ) {
-                    drop(thread_clocks);
-                    // Report data-race
-                    return Self::report_data_race(
-                        global,
-                        &machine.threads,
-                        mem_clocks,
-                        AccessType::NaWrite(write_type),
-                        access_range.size,
-                        Pointer::new(alloc_id, Size::from_bytes(mem_clocks_range.start)),
-                        ty,
-                    );
-                }
+                drop(thread_clocks);
+                // Report data-race
+                return Self::report_data_race(
+                    global,
+                    &machine.threads,
+                    mem_clocks,
+                    AccessType::NaWrite(write_type),
+                    access_range.size,
+                    interpret::Pointer::new(alloc_id, Size::from_bytes(mem_clocks_range.start)),
+                    ty,
+                );
             }
-            Ok(())
+        }
+        interp_ok(())
+    }
+}
+
+/// Vector clock state for a stack frame (tracking the local variables
+/// that do not have an allocation yet).
+#[derive(Debug, Default)]
+pub struct FrameState {
+    local_clocks: RefCell<FxHashMap<mir::Local, LocalClocks>>,
+}
+
+/// Stripped-down version of [`MemoryCellClocks`] for the clocks we need to keep track
+/// of in a local that does not yet have addressable memory -- and hence can only
+/// be accessed from the thread its stack frame belongs to, and cannot be access atomically.
+#[derive(Debug)]
+struct LocalClocks {
+    write: VTimestamp,
+    write_type: NaWriteType,
+    read: VTimestamp,
+}
+
+impl Default for LocalClocks {
+    fn default() -> Self {
+        Self { write: VTimestamp::ZERO, write_type: NaWriteType::Allocate, read: VTimestamp::ZERO }
+    }
+}
+
+impl FrameState {
+    pub fn local_write(&self, local: mir::Local, storage_live: bool, machine: &MiriMachine<'_>) {
+        let current_span = machine.current_span();
+        let global = machine.data_race.as_ref().unwrap();
+        if !global.race_detecting() {
+            return;
+        }
+        let (index, mut thread_clocks) = global.active_thread_state_mut(&machine.threads);
+        // This should do the same things as `MemoryCellClocks::write_race_detect`.
+        if !current_span.is_dummy() {
+            thread_clocks.clock.index_mut(index).span = current_span;
+        }
+        let mut clocks = self.local_clocks.borrow_mut();
+        if storage_live {
+            let new_clocks = LocalClocks {
+                write: thread_clocks.clock[index],
+                write_type: NaWriteType::Allocate,
+                read: VTimestamp::ZERO,
+            };
+            // There might already be an entry in the map for this, if the local was previously
+            // live already.
+            clocks.insert(local, new_clocks);
         } else {
-            Ok(())
+            // This can fail to exist if `race_detecting` was false when the allocation
+            // occurred, in which case we can backdate this to the beginning of time.
+            let clocks = clocks.entry(local).or_default();
+            clocks.write = thread_clocks.clock[index];
+            clocks.write_type = NaWriteType::Write;
+        }
+    }
+
+    pub fn local_read(&self, local: mir::Local, machine: &MiriMachine<'_>) {
+        let current_span = machine.current_span();
+        let global = machine.data_race.as_ref().unwrap();
+        if !global.race_detecting() {
+            return;
+        }
+        let (index, mut thread_clocks) = global.active_thread_state_mut(&machine.threads);
+        // This should do the same things as `MemoryCellClocks::read_race_detect`.
+        if !current_span.is_dummy() {
+            thread_clocks.clock.index_mut(index).span = current_span;
+        }
+        thread_clocks.clock.index_mut(index).set_read_type(NaReadType::Read);
+        // This can fail to exist if `race_detecting` was false when the allocation
+        // occurred, in which case we can backdate this to the beginning of time.
+        let mut clocks = self.local_clocks.borrow_mut();
+        let clocks = clocks.entry(local).or_default();
+        clocks.read = thread_clocks.clock[index];
+    }
+
+    pub fn local_moved_to_memory(
+        &self,
+        local: mir::Local,
+        alloc: &mut VClockAlloc,
+        machine: &MiriMachine<'_>,
+    ) {
+        let global = machine.data_race.as_ref().unwrap();
+        if !global.race_detecting() {
+            return;
+        }
+        let (index, _thread_clocks) = global.active_thread_state_mut(&machine.threads);
+        // Get the time the last write actually happened. This can fail to exist if
+        // `race_detecting` was false when the write occurred, in that case we can backdate this
+        // to the beginning of time.
+        let local_clocks = self.local_clocks.borrow_mut().remove(&local).unwrap_or_default();
+        for (_mem_clocks_range, mem_clocks) in alloc.alloc_ranges.get_mut().iter_mut_all() {
+            // The initialization write for this already happened, just at the wrong timestamp.
+            // Check that the thread index matches what we expect.
+            assert_eq!(mem_clocks.write.0, index);
+            // Convert the local's clocks into memory clocks.
+            mem_clocks.write = (index, local_clocks.write);
+            mem_clocks.write_type = local_clocks.write_type;
+            mem_clocks.read = VClock::new_with_index(index, local_clocks.read);
         }
     }
 }
 
-impl<'mir, 'tcx: 'mir> EvalContextPrivExt<'mir, 'tcx> for MiriInterpCx<'mir, 'tcx> {}
-trait EvalContextPrivExt<'mir, 'tcx: 'mir>: MiriInterpCxExt<'mir, 'tcx> {
+impl<'tcx> EvalContextPrivExt<'tcx> for MiriInterpCx<'tcx> {}
+trait EvalContextPrivExt<'tcx>: MiriInterpCxExt<'tcx> {
     /// Temporarily allow data-races to occur. This should only be used in
     /// one of these cases:
     /// - One of the appropriate `validate_atomic` functions will be called to
-    /// to treat a memory access as atomic.
+    ///   treat a memory access as atomic.
     /// - The memory being accessed should be treated as internal state, that
-    /// cannot be accessed by the interpreted program.
+    ///   cannot be accessed by the interpreted program.
     /// - Execution of the interpreted program execution has halted.
     #[inline]
-    fn allow_data_races_ref<R>(&self, op: impl FnOnce(&MiriInterpCx<'mir, 'tcx>) -> R) -> R {
+    fn allow_data_races_ref<R>(&self, op: impl FnOnce(&MiriInterpCx<'tcx>) -> R) -> R {
         let this = self.eval_context_ref();
         if let Some(data_race) = &this.machine.data_race {
             let old = data_race.ongoing_action_data_race_free.replace(true);
@@ -1127,10 +1242,7 @@ trait EvalContextPrivExt<'mir, 'tcx: 'mir>: MiriInterpCxExt<'mir, 'tcx> {
     /// so should only be used for atomic operations or internal state that the program cannot
     /// access.
     #[inline]
-    fn allow_data_races_mut<R>(
-        &mut self,
-        op: impl FnOnce(&mut MiriInterpCx<'mir, 'tcx>) -> R,
-    ) -> R {
+    fn allow_data_races_mut<R>(&mut self, op: impl FnOnce(&mut MiriInterpCx<'tcx>) -> R) -> R {
         let this = self.eval_context_mut();
         if let Some(data_race) = &this.machine.data_race {
             let old = data_race.ongoing_action_data_race_free.replace(true);
@@ -1146,7 +1258,7 @@ trait EvalContextPrivExt<'mir, 'tcx: 'mir>: MiriInterpCxExt<'mir, 'tcx> {
     /// Checks that an atomic access is legal at the given place.
     fn atomic_access_check(
         &self,
-        place: &MPlaceTy<'tcx, Provenance>,
+        place: &MPlaceTy<'tcx>,
         access_type: AtomicAccessType,
     ) -> InterpResult<'tcx> {
         let this = self.eval_context_ref();
@@ -1163,7 +1275,7 @@ trait EvalContextPrivExt<'mir, 'tcx: 'mir>: MiriInterpCxExt<'mir, 'tcx> {
         // We avoid `get_ptr_alloc` since we do *not* want to run the access hooks -- the actual
         // access will happen later.
         let (alloc_id, _offset, _prov) = this
-            .ptr_try_get_alloc_id(place.ptr())
+            .ptr_try_get_alloc_id(place.ptr(), 0)
             .expect("there are no zero-sized atomic accesses");
         if this.get_alloc_mutability(alloc_id)? == Mutability::Not {
             // See if this is fine.
@@ -1195,14 +1307,14 @@ trait EvalContextPrivExt<'mir, 'tcx: 'mir>: MiriInterpCxExt<'mir, 'tcx> {
                 }
             }
         }
-        Ok(())
+        interp_ok(())
     }
 
     /// Update the data-race detector for an atomic read occurring at the
     /// associated memory-place and on the current thread.
     fn validate_atomic_load(
         &self,
-        place: &MPlaceTy<'tcx, Provenance>,
+        place: &MPlaceTy<'tcx>,
         atomic: AtomicReadOrd,
     ) -> InterpResult<'tcx> {
         let this = self.eval_context_ref();
@@ -1224,7 +1336,7 @@ trait EvalContextPrivExt<'mir, 'tcx: 'mir>: MiriInterpCxExt<'mir, 'tcx> {
     /// associated memory-place and on the current thread.
     fn validate_atomic_store(
         &mut self,
-        place: &MPlaceTy<'tcx, Provenance>,
+        place: &MPlaceTy<'tcx>,
         atomic: AtomicWriteOrd,
     ) -> InterpResult<'tcx> {
         let this = self.eval_context_mut();
@@ -1246,7 +1358,7 @@ trait EvalContextPrivExt<'mir, 'tcx: 'mir>: MiriInterpCxExt<'mir, 'tcx> {
     /// at the associated memory place and on the current thread.
     fn validate_atomic_rmw(
         &mut self,
-        place: &MPlaceTy<'tcx, Provenance>,
+        place: &MPlaceTy<'tcx>,
         atomic: AtomicRwOrd,
     ) -> InterpResult<'tcx> {
         use AtomicRwOrd::*;
@@ -1275,7 +1387,7 @@ trait EvalContextPrivExt<'mir, 'tcx: 'mir>: MiriInterpCxExt<'mir, 'tcx> {
     /// Generic atomic operation implementation
     fn validate_atomic_op<A: Debug + Copy>(
         &self,
-        place: &MPlaceTy<'tcx, Provenance>,
+        place: &MPlaceTy<'tcx>,
         atomic: A,
         access: AccessType,
         mut op: impl FnMut(
@@ -1287,70 +1399,68 @@ trait EvalContextPrivExt<'mir, 'tcx: 'mir>: MiriInterpCxExt<'mir, 'tcx> {
     ) -> InterpResult<'tcx> {
         let this = self.eval_context_ref();
         assert!(access.is_atomic());
-        if let Some(data_race) = &this.machine.data_race {
-            if data_race.race_detecting() {
-                let size = place.layout.size;
-                let (alloc_id, base_offset, _prov) = this.ptr_get_alloc_id(place.ptr())?;
-                // Load and log the atomic operation.
-                // Note that atomic loads are possible even from read-only allocations, so `get_alloc_extra_mut` is not an option.
-                let alloc_meta = this.get_alloc_extra(alloc_id)?.data_race.as_ref().unwrap();
-                trace!(
-                    "Atomic op({}) with ordering {:?} on {:?} (size={})",
-                    access.description(None, None),
-                    &atomic,
-                    place.ptr(),
-                    size.bytes()
-                );
+        let Some(data_race) = &this.machine.data_race else { return interp_ok(()) };
+        if !data_race.race_detecting() {
+            return interp_ok(());
+        }
+        let size = place.layout.size;
+        let (alloc_id, base_offset, _prov) = this.ptr_get_alloc_id(place.ptr(), 0)?;
+        // Load and log the atomic operation.
+        // Note that atomic loads are possible even from read-only allocations, so `get_alloc_extra_mut` is not an option.
+        let alloc_meta = this.get_alloc_extra(alloc_id)?.data_race.as_ref().unwrap();
+        trace!(
+            "Atomic op({}) with ordering {:?} on {:?} (size={})",
+            access.description(None, None),
+            &atomic,
+            place.ptr(),
+            size.bytes()
+        );
 
-                let current_span = this.machine.current_span();
-                // Perform the atomic operation.
-                data_race.maybe_perform_sync_operation(
-                    &this.machine.threads,
-                    current_span,
-                    |index, mut thread_clocks| {
-                        for (mem_clocks_range, mem_clocks) in
-                            alloc_meta.alloc_ranges.borrow_mut().iter_mut(base_offset, size)
-                        {
-                            if let Err(DataRace) = op(mem_clocks, &mut thread_clocks, index, atomic)
-                            {
-                                mem::drop(thread_clocks);
-                                return VClockAlloc::report_data_race(
-                                    data_race,
-                                    &this.machine.threads,
-                                    mem_clocks,
-                                    access,
-                                    place.layout.size,
-                                    Pointer::new(
-                                        alloc_id,
-                                        Size::from_bytes(mem_clocks_range.start),
-                                    ),
-                                    None,
-                                )
-                                .map(|_| true);
-                            }
-                        }
-
-                        // This conservatively assumes all operations have release semantics
-                        Ok(true)
-                    },
-                )?;
-
-                // Log changes to atomic memory.
-                if tracing::enabled!(tracing::Level::TRACE) {
-                    for (_offset, mem_clocks) in
-                        alloc_meta.alloc_ranges.borrow().iter(base_offset, size)
-                    {
-                        trace!(
-                            "Updated atomic memory({:?}, size={}) to {:#?}",
-                            place.ptr(),
-                            size.bytes(),
-                            mem_clocks.atomic_ops
-                        );
+        let current_span = this.machine.current_span();
+        // Perform the atomic operation.
+        data_race.maybe_perform_sync_operation(
+            &this.machine.threads,
+            current_span,
+            |index, mut thread_clocks| {
+                for (mem_clocks_range, mem_clocks) in
+                    alloc_meta.alloc_ranges.borrow_mut().iter_mut(base_offset, size)
+                {
+                    if let Err(DataRace) = op(mem_clocks, &mut thread_clocks, index, atomic) {
+                        mem::drop(thread_clocks);
+                        return VClockAlloc::report_data_race(
+                            data_race,
+                            &this.machine.threads,
+                            mem_clocks,
+                            access,
+                            place.layout.size,
+                            interpret::Pointer::new(
+                                alloc_id,
+                                Size::from_bytes(mem_clocks_range.start),
+                            ),
+                            None,
+                        )
+                        .map(|_| true);
                     }
                 }
+
+                // This conservatively assumes all operations have release semantics
+                interp_ok(true)
+            },
+        )?;
+
+        // Log changes to atomic memory.
+        if tracing::enabled!(tracing::Level::TRACE) {
+            for (_offset, mem_clocks) in alloc_meta.alloc_ranges.borrow().iter(base_offset, size) {
+                trace!(
+                    "Updated atomic memory({:?}, size={}) to {:#?}",
+                    place.ptr(),
+                    size.bytes(),
+                    mem_clocks.atomic_ops
+                );
             }
         }
-        Ok(())
+
+        interp_ok(())
     }
 }
 
@@ -1412,13 +1522,6 @@ pub struct GlobalState {
     /// active vector-clocks catch up with the threads timestamp.
     reuse_candidates: RefCell<FxHashSet<VectorIdx>>,
 
-    /// This contains threads that have terminated, but not yet joined
-    /// and so cannot become re-use candidates until a join operation
-    /// occurs.
-    /// The associated vector index will be moved into re-use candidates
-    /// after the join operation occurs.
-    terminated_threads: RefCell<FxHashMap<ThreadId, VectorIdx>>,
-
     /// The timestamp of last SC fence performed by each thread
     last_sc_fence: RefCell<VClock>,
 
@@ -1446,7 +1549,6 @@ impl GlobalState {
             vector_info: RefCell::new(IndexVec::new()),
             thread_info: RefCell::new(IndexVec::new()),
             reuse_candidates: RefCell::new(FxHashSet::default()),
-            terminated_threads: RefCell::new(FxHashMap::default()),
             last_sc_fence: RefCell::new(VClock::default()),
             last_sc_write: RefCell::new(VClock::default()),
             track_outdated_loads: config.track_outdated_loads,
@@ -1480,8 +1582,6 @@ impl GlobalState {
     fn find_vector_index_reuse_candidate(&self) -> Option<VectorIdx> {
         let mut reuse = self.reuse_candidates.borrow_mut();
         let vector_clocks = self.vector_clocks.borrow();
-        let vector_info = self.vector_info.borrow();
-        let terminated_threads = self.terminated_threads.borrow();
         for &candidate in reuse.iter() {
             let target_timestamp = vector_clocks[candidate].clock[candidate];
             if vector_clocks.iter_enumerated().all(|(clock_idx, clock)| {
@@ -1491,9 +1591,7 @@ impl GlobalState {
 
                 // The vector represents a thread that has terminated and hence cannot
                 // report a data-race with the candidate index.
-                let thread_id = vector_info[clock_idx];
-                let vector_terminated =
-                    reuse.contains(&clock_idx) || terminated_threads.contains_key(&thread_id);
+                let vector_terminated = reuse.contains(&clock_idx);
 
                 // The vector index cannot report a race with the candidate index
                 // and hence allows the candidate index to be re-used.
@@ -1515,7 +1613,7 @@ impl GlobalState {
     #[inline]
     pub fn thread_created(
         &mut self,
-        thread_mgr: &ThreadManager<'_, '_>,
+        thread_mgr: &ThreadManager<'_>,
         thread: ThreadId,
         current_span: Span,
     ) {
@@ -1583,54 +1681,37 @@ impl GlobalState {
     /// thread (the joinee, the thread that someone waited on) and the current thread (the joiner,
     /// the thread who was waiting).
     #[inline]
-    pub fn thread_joined(
-        &mut self,
-        thread_mgr: &ThreadManager<'_, '_>,
-        joiner: ThreadId,
-        joinee: ThreadId,
-    ) {
-        let clocks_vec = self.vector_clocks.get_mut();
-        let thread_info = self.thread_info.get_mut();
-
-        // Load the vector clock of the current thread.
-        let current_index = thread_info[joiner]
-            .vector_index
-            .expect("Performed thread join on thread with no assigned vector");
-        let current = &mut clocks_vec[current_index];
+    pub fn thread_joined(&mut self, threads: &ThreadManager<'_>, joinee: ThreadId) {
+        let thread_info = self.thread_info.borrow();
+        let thread_info = &thread_info[joinee];
 
         // Load the associated vector clock for the terminated thread.
-        let join_clock = thread_info[joinee]
+        let join_clock = thread_info
             .termination_vector_clock
             .as_ref()
-            .expect("Joined with thread but thread has not terminated");
-
-        // The join thread happens-before the current thread
-        // so update the current vector clock.
-        // Is not a release operation so the clock is not incremented.
-        current.clock.join(join_clock);
+            .expect("joined with thread but thread has not terminated");
+        // Acquire that into the current thread.
+        self.acquire_clock(join_clock, threads);
 
         // Check the number of live threads, if the value is 1
         // then test for potentially disabling multi-threaded execution.
-        if thread_mgr.get_live_thread_count() == 1 {
-            // May potentially be able to disable multi-threaded execution.
-            let current_clock = &clocks_vec[current_index];
-            if clocks_vec
-                .iter_enumerated()
-                .all(|(idx, clocks)| clocks.clock[idx] <= current_clock.clock[idx])
-            {
-                // All thread terminations happen-before the current clock
-                // therefore no data-races can be reported until a new thread
-                // is created, so disable multi-threaded execution.
-                self.multi_threaded.set(false);
+        // This has to happen after `acquire_clock`, otherwise there'll always
+        // be some thread that has not synchronized yet.
+        if let Some(current_index) = thread_info.vector_index {
+            if threads.get_live_thread_count() == 1 {
+                let vector_clocks = self.vector_clocks.get_mut();
+                // May potentially be able to disable multi-threaded execution.
+                let current_clock = &vector_clocks[current_index];
+                if vector_clocks
+                    .iter_enumerated()
+                    .all(|(idx, clocks)| clocks.clock[idx] <= current_clock.clock[idx])
+                {
+                    // All thread terminations happen-before the current clock
+                    // therefore no data-races can be reported until a new thread
+                    // is created, so disable multi-threaded execution.
+                    self.multi_threaded.set(false);
+                }
             }
-        }
-
-        // If the thread is marked as terminated but not joined
-        // then move the thread to the re-use set.
-        let termination = self.terminated_threads.get_mut();
-        if let Some(index) = termination.remove(&joinee) {
-            let reuse = self.reuse_candidates.get_mut();
-            reuse.insert(index);
         }
     }
 
@@ -1642,29 +1723,18 @@ impl GlobalState {
     /// This should be called strictly before any calls to
     /// `thread_joined`.
     #[inline]
-    pub fn thread_terminated(&mut self, thread_mgr: &ThreadManager<'_, '_>, current_span: Span) {
+    pub fn thread_terminated(&mut self, thread_mgr: &ThreadManager<'_>) {
+        let current_thread = thread_mgr.active_thread();
         let current_index = self.active_thread_index(thread_mgr);
 
-        // Increment the clock to a unique termination timestamp.
-        let vector_clocks = self.vector_clocks.get_mut();
-        let current_clocks = &mut vector_clocks[current_index];
-        current_clocks.increment_clock(current_index, current_span);
+        // Store the terminaion clock.
+        let terminaion_clock = self.release_clock(thread_mgr).clone();
+        self.thread_info.get_mut()[current_thread].termination_vector_clock =
+            Some(terminaion_clock);
 
-        // Load the current thread id for the executing vector.
-        let vector_info = self.vector_info.get_mut();
-        let current_thread = vector_info[current_index];
-
-        // Load the current thread metadata, and move to a terminated
-        // vector state. Setting up the vector clock all join operations
-        // will use.
-        let thread_info = self.thread_info.get_mut();
-        let current = &mut thread_info[current_thread];
-        current.termination_vector_clock = Some(current_clocks.clock.clone());
-
-        // Add this thread as a candidate for re-use after a thread join
-        // occurs.
-        let termination = self.terminated_threads.get_mut();
-        termination.insert(current_thread, current_index);
+        // Add this thread's clock index as a candidate for re-use.
+        let reuse = self.reuse_candidates.get_mut();
+        reuse.insert(current_index);
     }
 
     /// Attempt to perform a synchronized operation, this
@@ -1676,7 +1746,7 @@ impl GlobalState {
     /// operation may create.
     fn maybe_perform_sync_operation<'tcx>(
         &self,
-        thread_mgr: &ThreadManager<'_, '_>,
+        thread_mgr: &ThreadManager<'_>,
         current_span: Span,
         op: impl FnOnce(VectorIdx, RefMut<'_, ThreadClockSet>) -> InterpResult<'tcx, bool>,
     ) -> InterpResult<'tcx> {
@@ -1687,38 +1757,37 @@ impl GlobalState {
                 clocks.increment_clock(index, current_span);
             }
         }
-        Ok(())
+        interp_ok(())
     }
 
     /// Internal utility to identify a thread stored internally
     /// returns the id and the name for better diagnostics.
-    fn print_thread_metadata(
-        &self,
-        thread_mgr: &ThreadManager<'_, '_>,
-        vector: VectorIdx,
-    ) -> String {
+    fn print_thread_metadata(&self, thread_mgr: &ThreadManager<'_>, vector: VectorIdx) -> String {
         let thread = self.vector_info.borrow()[vector];
         let thread_name = thread_mgr.get_thread_display_name(thread);
         format!("thread `{thread_name}`")
     }
 
-    /// Acquire the given clock into the given thread, establishing synchronization with
+    /// Acquire the given clock into the current thread, establishing synchronization with
     /// the moment when that clock snapshot was taken via `release_clock`.
     /// As this is an acquire operation, the thread timestamp is not
     /// incremented.
-    pub fn acquire_clock(&self, lock: &VClock, thread: ThreadId) {
+    pub fn acquire_clock<'tcx>(&self, clock: &VClock, threads: &ThreadManager<'tcx>) {
+        let thread = threads.active_thread();
         let (_, mut clocks) = self.thread_state_mut(thread);
-        clocks.clock.join(lock);
+        clocks.clock.join(clock);
     }
 
-    /// Returns the `release` clock of the given thread.
+    /// Returns the `release` clock of the current thread.
     /// Other threads can acquire this clock in the future to establish synchronization
     /// with this program point.
-    pub fn release_clock(&self, thread: ThreadId, current_span: Span) -> Ref<'_, VClock> {
+    pub fn release_clock<'tcx>(&self, threads: &ThreadManager<'tcx>) -> Ref<'_, VClock> {
+        let thread = threads.active_thread();
+        let span = threads.active_thread_ref().current_span();
         // We increment the clock each time this happens, to ensure no two releases
         // can be confused with each other.
         let (index, mut clocks) = self.thread_state_mut(thread);
-        clocks.increment_clock(index, current_span);
+        clocks.increment_clock(index, span);
         drop(clocks);
         // To return a read-only view, we need to release the RefCell
         // and borrow it again.
@@ -1755,9 +1824,9 @@ impl GlobalState {
     #[inline]
     pub(super) fn active_thread_state(
         &self,
-        thread_mgr: &ThreadManager<'_, '_>,
+        thread_mgr: &ThreadManager<'_>,
     ) -> (VectorIdx, Ref<'_, ThreadClockSet>) {
-        self.thread_state(thread_mgr.get_active_thread_id())
+        self.thread_state(thread_mgr.active_thread())
     }
 
     /// Load the current vector clock in use and the current set of thread clocks
@@ -1765,27 +1834,27 @@ impl GlobalState {
     #[inline]
     pub(super) fn active_thread_state_mut(
         &self,
-        thread_mgr: &ThreadManager<'_, '_>,
+        thread_mgr: &ThreadManager<'_>,
     ) -> (VectorIdx, RefMut<'_, ThreadClockSet>) {
-        self.thread_state_mut(thread_mgr.get_active_thread_id())
+        self.thread_state_mut(thread_mgr.active_thread())
     }
 
     /// Return the current thread, should be the same
     /// as the data-race active thread.
     #[inline]
-    fn active_thread_index(&self, thread_mgr: &ThreadManager<'_, '_>) -> VectorIdx {
-        let active_thread_id = thread_mgr.get_active_thread_id();
+    fn active_thread_index(&self, thread_mgr: &ThreadManager<'_>) -> VectorIdx {
+        let active_thread_id = thread_mgr.active_thread();
         self.thread_index(active_thread_id)
     }
 
     // SC ATOMIC STORE rule in the paper.
-    pub(super) fn sc_write(&self, thread_mgr: &ThreadManager<'_, '_>) {
+    pub(super) fn sc_write(&self, thread_mgr: &ThreadManager<'_>) {
         let (index, clocks) = self.active_thread_state(thread_mgr);
         self.last_sc_write.borrow_mut().set_at_index(&clocks.clock, index);
     }
 
     // SC ATOMIC READ rule in the paper.
-    pub(super) fn sc_read(&self, thread_mgr: &ThreadManager<'_, '_>) {
+    pub(super) fn sc_read(&self, thread_mgr: &ThreadManager<'_>) {
         let (.., mut clocks) = self.active_thread_state_mut(thread_mgr);
         clocks.read_seqcst.join(&self.last_sc_fence.borrow());
     }

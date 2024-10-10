@@ -3,20 +3,6 @@
 #[cfg(test)]
 mod tests;
 
-use crate::cmp;
-use crate::io::{self, BorrowedCursor, IoSlice, IoSliceMut, Read};
-use crate::os::unix::io::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
-use crate::sys::cvt;
-use crate::sys_common::{AsInner, FromInner, IntoInner};
-
-#[cfg(any(
-    target_os = "android",
-    target_os = "linux",
-    target_os = "emscripten",
-    target_os = "l4re",
-    target_os = "hurd",
-))]
-use libc::off64_t;
 #[cfg(not(any(
     target_os = "linux",
     target_os = "emscripten",
@@ -25,6 +11,20 @@ use libc::off64_t;
     target_os = "hurd",
 )))]
 use libc::off_t as off64_t;
+#[cfg(any(
+    target_os = "android",
+    target_os = "linux",
+    target_os = "emscripten",
+    target_os = "l4re",
+    target_os = "hurd",
+))]
+use libc::off64_t;
+
+use crate::cmp;
+use crate::io::{self, BorrowedCursor, IoSlice, IoSliceMut, Read};
+use crate::os::unix::io::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
+use crate::sys::cvt;
+use crate::sys_common::{AsInner, FromInner, IntoInner};
 
 #[derive(Debug)]
 pub struct FileDesc(OwnedFd);
@@ -82,6 +82,11 @@ const fn max_iov() -> usize {
 }
 
 impl FileDesc {
+    #[inline]
+    pub fn try_clone(&self) -> io::Result<Self> {
+        self.duplicate()
+    }
+
     pub fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
         let ret = cvt(unsafe {
             libc::read(
@@ -93,7 +98,12 @@ impl FileDesc {
         Ok(ret as usize)
     }
 
-    #[cfg(not(any(target_os = "espidf", target_os = "horizon", target_os = "vita")))]
+    #[cfg(not(any(
+        target_os = "espidf",
+        target_os = "horizon",
+        target_os = "vita",
+        target_os = "nuttx"
+    )))]
     pub fn read_vectored(&self, bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
         let ret = cvt(unsafe {
             libc::readv(
@@ -105,14 +115,24 @@ impl FileDesc {
         Ok(ret as usize)
     }
 
-    #[cfg(any(target_os = "espidf", target_os = "horizon", target_os = "vita"))]
+    #[cfg(any(
+        target_os = "espidf",
+        target_os = "horizon",
+        target_os = "vita",
+        target_os = "nuttx"
+    ))]
     pub fn read_vectored(&self, bufs: &mut [IoSliceMut<'_>]) -> io::Result<usize> {
         io::default_read_vectored(|b| self.read(b), bufs)
     }
 
     #[inline]
     pub fn is_read_vectored(&self) -> bool {
-        cfg!(not(any(target_os = "espidf", target_os = "horizon", target_os = "vita")))
+        cfg!(not(any(
+            target_os = "espidf",
+            target_os = "horizon",
+            target_os = "vita",
+            target_os = "nuttx"
+        )))
     }
 
     pub fn read_to_end(&self, buf: &mut Vec<u8>) -> io::Result<usize> {
@@ -120,6 +140,7 @@ impl FileDesc {
         (&mut me).read_to_end(buf)
     }
 
+    #[cfg_attr(target_os = "vxworks", allow(unused_unsafe))]
     pub fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
         #[cfg(not(any(
             all(target_os = "linux", not(target_env = "musl")),
@@ -291,7 +312,12 @@ impl FileDesc {
         Ok(ret as usize)
     }
 
-    #[cfg(not(any(target_os = "espidf", target_os = "horizon", target_os = "vita")))]
+    #[cfg(not(any(
+        target_os = "espidf",
+        target_os = "horizon",
+        target_os = "vita",
+        target_os = "nuttx"
+    )))]
     pub fn write_vectored(&self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
         let ret = cvt(unsafe {
             libc::writev(
@@ -303,16 +329,27 @@ impl FileDesc {
         Ok(ret as usize)
     }
 
-    #[cfg(any(target_os = "espidf", target_os = "horizon", target_os = "vita"))]
+    #[cfg(any(
+        target_os = "espidf",
+        target_os = "horizon",
+        target_os = "vita",
+        target_os = "nuttx"
+    ))]
     pub fn write_vectored(&self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
         io::default_write_vectored(|b| self.write(b), bufs)
     }
 
     #[inline]
     pub fn is_write_vectored(&self) -> bool {
-        cfg!(not(any(target_os = "espidf", target_os = "horizon", target_os = "vita")))
+        cfg!(not(any(
+            target_os = "espidf",
+            target_os = "horizon",
+            target_os = "vita",
+            target_os = "nuttx"
+        )))
     }
 
+    #[cfg_attr(target_os = "vxworks", allow(unused_unsafe))]
     pub fn write_at(&self, buf: &[u8], offset: u64) -> io::Result<usize> {
         #[cfg(not(any(
             all(target_os = "linux", not(target_env = "musl")),

@@ -2,26 +2,26 @@
 // unresolved type variables and replaces "ty_var" types with their
 // generic parameters.
 
-use crate::FnCtxt;
+use std::mem;
+
 use rustc_data_structures::unord::ExtendUnord;
 use rustc_errors::{ErrorGuaranteed, StashKey};
 use rustc_hir as hir;
-use rustc_hir::intravisit::{self, Visitor};
 use rustc_hir::HirId;
-use rustc_infer::infer::error_reporting::TypeAnnotationNeeded::E0282;
+use rustc_hir::intravisit::{self, Visitor};
 use rustc_middle::span_bug;
 use rustc_middle::traits::ObligationCause;
 use rustc_middle::ty::adjustment::{Adjust, Adjustment, PointerCoercion};
 use rustc_middle::ty::fold::{TypeFoldable, TypeFolder};
 use rustc_middle::ty::visit::TypeVisitableExt;
-use rustc_middle::ty::TypeSuperFoldable;
-use rustc_middle::ty::{self, Ty, TyCtxt};
-use rustc_span::symbol::sym;
+use rustc_middle::ty::{self, Ty, TyCtxt, TypeSuperFoldable};
 use rustc_span::Span;
+use rustc_span::symbol::sym;
+use rustc_trait_selection::error_reporting::infer::need_type_info::TypeAnnotationNeeded;
 use rustc_trait_selection::solve;
-use rustc_trait_selection::traits::error_reporting::TypeErrCtxtExt;
+use tracing::{debug, instrument};
 
-use std::mem;
+use crate::FnCtxt;
 
 ///////////////////////////////////////////////////////////////////////////
 // Entry point
@@ -36,7 +36,7 @@ use std::mem;
 // resolve_type_vars_in_body, which creates a new TypeTables which
 // doesn't contain any inference types.
 impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
-    pub fn resolve_type_vars_in_body(
+    pub(crate) fn resolve_type_vars_in_body(
         &self,
         body: &'tcx hir::Body<'tcx>,
     ) -> &'tcx ty::TypeckResults<'tcx> {
@@ -219,28 +219,9 @@ impl<'cx, 'tcx> WritebackCx<'cx, 'tcx> {
     fn fix_index_builtin_expr(&mut self, e: &hir::Expr<'_>) {
         if let hir::ExprKind::Index(ref base, ref index, _) = e.kind {
             // All valid indexing looks like this; might encounter non-valid indexes at this point.
-            let base_ty = self.typeck_results.expr_ty_adjusted_opt(base);
-            if base_ty.is_none() {
-                // When encountering `return [0][0]` outside of a `fn` body we can encounter a base
-                // that isn't in the type table. We assume more relevant errors have already been
-                // emitted. (#64638)
-                assert!(self.tcx().dcx().has_errors().is_some(), "bad base: `{base:?}`");
-            }
-            if let Some(base_ty) = base_ty
-                && let ty::Ref(_, base_ty_inner, _) = *base_ty.kind()
-            {
-                let index_ty =
-                    self.typeck_results.expr_ty_adjusted_opt(index).unwrap_or_else(|| {
-                        // When encountering `return [0][0]` outside of a `fn` body we would attempt
-                        // to access an nonexistent index. We assume that more relevant errors will
-                        // already have been emitted, so we only gate on this with an ICE if no
-                        // error has been emitted. (#64638)
-                        Ty::new_error_with_message(
-                            self.fcx.tcx,
-                            e.span,
-                            format!("bad index {index:?} for base: `{base:?}`"),
-                        )
-                    });
+            let base_ty = self.typeck_results.expr_ty_adjusted(base);
+            if let ty::Ref(_, base_ty_inner, _) = *base_ty.kind() {
+                let index_ty = self.typeck_results.expr_ty_adjusted(index);
                 if self.is_builtin_index(e, base_ty_inner, index_ty) {
                     // Remove the method call record
                     self.typeck_results.type_dependent_defs_mut().remove(e.hir_id);
@@ -793,7 +774,7 @@ impl<'cx, 'tcx> Resolver<'cx, 'tcx> {
     }
 
     fn report_error(&self, p: impl Into<ty::GenericArg<'tcx>>) -> ErrorGuaranteed {
-        if let Some(guar) = self.fcx.dcx().has_errors() {
+        if let Some(guar) = self.fcx.tainted_by_errors() {
             guar
         } else {
             self.fcx
@@ -802,7 +783,7 @@ impl<'cx, 'tcx> Resolver<'cx, 'tcx> {
                     self.fcx.tcx.hir().body_owner_def_id(self.body.id()),
                     self.span.to_span(self.fcx.tcx),
                     p.into(),
-                    E0282,
+                    TypeAnnotationNeeded::E0282,
                     false,
                 )
                 .emit()
@@ -822,7 +803,7 @@ impl<'cx, 'tcx> Resolver<'cx, 'tcx> {
         // We must deeply normalize in the new solver, since later lints
         // expect that types that show up in the typeck are fully
         // normalized.
-        let value = if self.should_normalize {
+        let mut value = if self.should_normalize {
             let body_id = tcx.hir().body_owner_def_id(self.body.id());
             let cause = ObligationCause::misc(self.span.to_span(tcx), body_id);
             let at = self.fcx.at(&cause, self.fcx.param_env);
@@ -837,17 +818,32 @@ impl<'cx, 'tcx> Resolver<'cx, 'tcx> {
             value
         };
 
+        // Bail if there are any non-region infer.
         if value.has_non_region_infer() {
             let guar = self.report_error(value);
-            new_err(tcx, guar)
-        } else {
-            tcx.fold_regions(value, |_, _| tcx.lifetimes.re_erased)
+            value = new_err(tcx, guar);
         }
+
+        // Erase the regions from the ty, since it's not really meaningful what
+        // these region values are; there's not a trivial correspondence between
+        // regions in the HIR and MIR, so when we turn the body into MIR, there's
+        // no reason to keep regions around. They will be repopulated during MIR
+        // borrowck, and specifically region constraints will be populated during
+        // MIR typeck which is run on the new body.
+        value = tcx.fold_regions(value, |_, _| tcx.lifetimes.re_erased);
+
+        // Normalize consts in writeback, because GCE doesn't normalize eagerly.
+        if tcx.features().generic_const_exprs {
+            value =
+                value.fold_with(&mut EagerlyNormalizeConsts { tcx, param_env: self.fcx.param_env });
+        }
+
+        value
     }
 }
 
 impl<'cx, 'tcx> TypeFolder<TyCtxt<'tcx>> for Resolver<'cx, 'tcx> {
-    fn interner(&self) -> TyCtxt<'tcx> {
+    fn cx(&self) -> TyCtxt<'tcx> {
         self.fcx.tcx
     }
 
@@ -862,8 +858,9 @@ impl<'cx, 'tcx> TypeFolder<TyCtxt<'tcx>> for Resolver<'cx, 'tcx> {
 
     fn fold_const(&mut self, ct: ty::Const<'tcx>) -> ty::Const<'tcx> {
         self.handle_term(ct, ty::Const::outer_exclusive_binder, |tcx, guar| {
-            ty::Const::new_error(tcx, guar, ct.ty())
+            ty::Const::new_error(tcx, guar)
         })
+        .super_fold_with(self)
     }
 
     fn fold_predicate(&mut self, predicate: ty::Predicate<'tcx>) -> ty::Predicate<'tcx> {
@@ -874,5 +871,19 @@ impl<'cx, 'tcx> TypeFolder<TyCtxt<'tcx>> for Resolver<'cx, 'tcx> {
         let predicate = predicate.super_fold_with(self);
         self.should_normalize = prev;
         predicate
+    }
+}
+
+struct EagerlyNormalizeConsts<'tcx> {
+    tcx: TyCtxt<'tcx>,
+    param_env: ty::ParamEnv<'tcx>,
+}
+impl<'tcx> TypeFolder<TyCtxt<'tcx>> for EagerlyNormalizeConsts<'tcx> {
+    fn cx(&self) -> TyCtxt<'tcx> {
+        self.tcx
+    }
+
+    fn fold_const(&mut self, ct: ty::Const<'tcx>) -> ty::Const<'tcx> {
+        self.tcx.try_normalize_erasing_regions(self.param_env, ct).unwrap_or(ct)
     }
 }

@@ -2,38 +2,37 @@
 //!
 //! [RFC 1946]: https://github.com/rust-lang/rfcs/blob/master/text/1946-intra-rustdoc-links.md
 
-use pulldown_cmark::LinkType;
-use rustc_ast::util::comments::may_have_doc_links;
-use rustc_data_structures::{
-    fx::{FxHashMap, FxHashSet},
-    intern::Interned,
-};
-use rustc_errors::{Applicability, Diag, DiagMessage};
-use rustc_hir::def::Namespace::*;
-use rustc_hir::def::{DefKind, Namespace, PerNS};
-use rustc_hir::def_id::{DefId, CRATE_DEF_ID};
-use rustc_hir::Mutability;
-use rustc_middle::ty::{Ty, TyCtxt};
-use rustc_middle::{bug, span_bug, ty};
-use rustc_resolve::rustdoc::{has_primitive_or_keyword_docs, prepare_to_doc_link_resolution};
-use rustc_resolve::rustdoc::{
-    source_span_for_markdown_range, strip_generics_from_path, MalformedGenerics,
-};
-use rustc_session::lint::Lint;
-use rustc_span::hygiene::MacroKind;
-use rustc_span::symbol::{sym, Ident, Symbol};
-use rustc_span::BytePos;
-use smallvec::{smallvec, SmallVec};
-
 use std::borrow::Cow;
 use std::fmt::Display;
 use std::mem;
 use std::ops::Range;
 
-use crate::clean::{self, utils::find_nearest_parent_module};
-use crate::clean::{Crate, Item, ItemLink, PrimitiveType};
+use pulldown_cmark::LinkType;
+use rustc_ast::util::comments::may_have_doc_links;
+use rustc_data_structures::fx::{FxHashMap, FxHashSet, FxIndexSet};
+use rustc_data_structures::intern::Interned;
+use rustc_errors::{Applicability, Diag, DiagMessage};
+use rustc_hir::def::Namespace::*;
+use rustc_hir::def::{DefKind, Namespace, PerNS};
+use rustc_hir::def_id::{CRATE_DEF_ID, DefId};
+use rustc_hir::{Mutability, Safety};
+use rustc_middle::ty::{Ty, TyCtxt};
+use rustc_middle::{bug, span_bug, ty};
+use rustc_resolve::rustdoc::{
+    MalformedGenerics, has_primitive_or_keyword_docs, prepare_to_doc_link_resolution,
+    source_span_for_markdown_range, strip_generics_from_path,
+};
+use rustc_session::lint::Lint;
+use rustc_span::BytePos;
+use rustc_span::hygiene::MacroKind;
+use rustc_span::symbol::{Ident, Symbol, sym};
+use smallvec::{SmallVec, smallvec};
+use tracing::{debug, info, instrument, trace};
+
+use crate::clean::utils::find_nearest_parent_module;
+use crate::clean::{self, Crate, Item, ItemLink, PrimitiveType};
 use crate::core::DocContext;
-use crate::html::markdown::{markdown_links, MarkdownLink, MarkdownLinkRange};
+use crate::html::markdown::{MarkdownLink, MarkdownLinkRange, markdown_links};
 use crate::lint::{BROKEN_INTRA_DOC_LINKS, PRIVATE_INTRA_DOC_LINKS};
 use crate::passes::Pass;
 use crate::visit::DocVisitor;
@@ -55,7 +54,7 @@ fn filter_assoc_items_by_name_and_namespace<'a>(
     assoc_items_of: DefId,
     ident: Ident,
     ns: Namespace,
-) -> impl Iterator<Item = &ty::AssocItem> + 'a {
+) -> impl Iterator<Item = &'a ty::AssocItem> + 'a {
     tcx.associated_items(assoc_items_of).filter_by_name_unhygienic(ident.name).filter(move |item| {
         item.kind.namespace() == ns && tcx.hygienic_eq(ident, item.ident(tcx), assoc_items_of)
     })
@@ -111,7 +110,6 @@ impl Res {
 
         let prefix = match kind {
             DefKind::Fn | DefKind::AssocFn => return Suggestion::Function,
-            DefKind::Field => return Suggestion::RemoveDisambiguator,
             DefKind::Macro(MacroKind::Bang) => return Suggestion::Macro,
 
             DefKind::Macro(MacroKind::Derive) => "derive",
@@ -124,6 +122,8 @@ impl Res {
                 "const"
             }
             DefKind::Static { .. } => "static",
+            DefKind::Field => "field",
+            DefKind::Variant | DefKind::Ctor(..) => "variant",
             // Now handle things that don't have a specific disambiguator
             _ => match kind
                 .ns()
@@ -416,6 +416,7 @@ impl<'a, 'tcx> LinkCollector<'a, 'tcx> {
         &mut self,
         path_str: &'path str,
         ns: Namespace,
+        disambiguator: Option<Disambiguator>,
         item_id: DefId,
         module_id: DefId,
     ) -> Result<Vec<(Res, Option<DefId>)>, UnresolvedPath<'path>> {
@@ -455,7 +456,7 @@ impl<'a, 'tcx> LinkCollector<'a, 'tcx> {
         match resolve_primitive(path_root, TypeNS)
             .or_else(|| self.resolve_path(path_root, TypeNS, item_id, module_id))
             .map(|ty_res| {
-                self.resolve_associated_item(ty_res, item_name, ns, module_id)
+                self.resolve_associated_item(ty_res, item_name, ns, disambiguator, module_id)
                     .into_iter()
                     .map(|(res, def_id)| (res, Some(def_id)))
                     .collect::<Vec<_>>()
@@ -497,7 +498,7 @@ impl<'a, 'tcx> LinkCollector<'a, 'tcx> {
             ty::RawPtr(_, _) => Res::Primitive(RawPointer),
             ty::Ref(..) => Res::Primitive(Reference),
             ty::FnDef(..) => panic!("type alias to a function definition"),
-            ty::FnPtr(_) => Res::Primitive(Fn),
+            ty::FnPtr(..) => Res::Primitive(Fn),
             ty::Never => Res::Primitive(Never),
             ty::Adt(ty::AdtDef(Interned(&ty::AdtDefData { did, .. }, _)), _) | ty::Foreign(did) => {
                 Res::from_def_id(self.cx.tcx, did)
@@ -558,6 +559,7 @@ impl<'a, 'tcx> LinkCollector<'a, 'tcx> {
         root_res: Res,
         item_name: Symbol,
         ns: Namespace,
+        disambiguator: Option<Disambiguator>,
         module_id: DefId,
     ) -> Vec<(Res, DefId)> {
         let tcx = self.cx.tcx;
@@ -584,7 +586,7 @@ impl<'a, 'tcx> LinkCollector<'a, 'tcx> {
                 // FIXME: if the associated item is defined directly on the type alias,
                 // it will show up on its documentation page, we should link there instead.
                 let Some(res) = self.def_id_to_res(did) else { return Vec::new() };
-                self.resolve_associated_item(res, item_name, ns, module_id)
+                self.resolve_associated_item(res, item_name, ns, disambiguator, module_id)
             }
             Res::Def(
                 def_kind @ (DefKind::Struct | DefKind::Union | DefKind::Enum | DefKind::ForeignTy),
@@ -605,11 +607,43 @@ impl<'a, 'tcx> LinkCollector<'a, 'tcx> {
                     }
                 }
 
+                let search_for_field = || {
+                    let (DefKind::Struct | DefKind::Union) = def_kind else { return vec![] };
+                    debug!("looking for fields named {item_name} for {did:?}");
+                    // FIXME: this doesn't really belong in `associated_item` (maybe `variant_field` is better?)
+                    // NOTE: it's different from variant_field because it only resolves struct fields,
+                    // not variant fields (2 path segments, not 3).
+                    //
+                    // We need to handle struct (and union) fields in this code because
+                    // syntactically their paths are identical to associated item paths:
+                    // `module::Type::field` and `module::Type::Assoc`.
+                    //
+                    // On the other hand, variant fields can't be mistaken for associated
+                    // items because they look like this: `module::Type::Variant::field`.
+                    //
+                    // Variants themselves don't need to be handled here, even though
+                    // they also look like associated items (`module::Type::Variant`),
+                    // because they are real Rust syntax (unlike the intra-doc links
+                    // field syntax) and are handled by the compiler's resolver.
+                    let ty::Adt(def, _) = tcx.type_of(did).instantiate_identity().kind() else {
+                        unreachable!()
+                    };
+                    def.non_enum_variant()
+                        .fields
+                        .iter()
+                        .filter(|field| field.name == item_name)
+                        .map(|field| (root_res, field.did))
+                        .collect::<Vec<_>>()
+                };
+
+                if let Some(Disambiguator::Kind(DefKind::Field)) = disambiguator {
+                    return search_for_field();
+                }
+
                 // Checks if item_name belongs to `impl SomeItem`
                 let mut assoc_items: Vec<_> = tcx
                     .inherent_impls(did)
                     .into_iter()
-                    .flatten()
                     .flat_map(|&imp| {
                         filter_assoc_items_by_name_and_namespace(
                             tcx,
@@ -648,32 +682,8 @@ impl<'a, 'tcx> LinkCollector<'a, 'tcx> {
                 if ns != Namespace::ValueNS {
                     return Vec::new();
                 }
-                debug!("looking for fields named {item_name} for {did:?}");
-                // FIXME: this doesn't really belong in `associated_item` (maybe `variant_field` is better?)
-                // NOTE: it's different from variant_field because it only resolves struct fields,
-                // not variant fields (2 path segments, not 3).
-                //
-                // We need to handle struct (and union) fields in this code because
-                // syntactically their paths are identical to associated item paths:
-                // `module::Type::field` and `module::Type::Assoc`.
-                //
-                // On the other hand, variant fields can't be mistaken for associated
-                // items because they look like this: `module::Type::Variant::field`.
-                //
-                // Variants themselves don't need to be handled here, even though
-                // they also look like associated items (`module::Type::Variant`),
-                // because they are real Rust syntax (unlike the intra-doc links
-                // field syntax) and are handled by the compiler's resolver.
-                let def = match tcx.type_of(did).instantiate_identity().kind() {
-                    ty::Adt(def, _) if !def.is_enum() => def,
-                    _ => return Vec::new(),
-                };
-                def.non_enum_variant()
-                    .fields
-                    .iter()
-                    .filter(|field| field.name == item_name)
-                    .map(|field| (root_res, field.did))
-                    .collect::<Vec<_>>()
+
+                search_for_field()
             }
             Res::Def(DefKind::Trait, did) => filter_assoc_items_by_name_and_namespace(
                 tcx,
@@ -768,9 +778,9 @@ fn trait_impls_for<'a>(
     cx: &mut DocContext<'a>,
     ty: Ty<'a>,
     module: DefId,
-) -> FxHashSet<(DefId, DefId)> {
+) -> FxIndexSet<(DefId, DefId)> {
     let tcx = cx.tcx;
-    let mut impls = FxHashSet::default();
+    let mut impls = FxIndexSet::default();
 
     for &trait_ in tcx.doc_link_traits_in_scope(module) {
         tcx.for_each_relevant_impl(trait_, ty, |impl_| {
@@ -818,7 +828,7 @@ fn is_derive_trait_collision<T>(ns: &PerNS<Result<Vec<(Res, T)>, ResolutionFailu
     }
 }
 
-impl<'a, 'tcx> DocVisitor for LinkCollector<'a, 'tcx> {
+impl<'a, 'tcx> DocVisitor<'_> for LinkCollector<'a, 'tcx> {
     fn visit_item(&mut self, item: &Item) {
         self.resolve_links(item);
         self.visit_item_recur(item)
@@ -1030,21 +1040,6 @@ impl LinkCollector<'_, '_> {
             false,
         )?;
 
-        if ori_link.display_text.is_some() {
-            self.resolve_display_text(
-                path_str,
-                ResolutionInfo {
-                    item_id,
-                    module_id,
-                    dis: disambiguator,
-                    path_str: ori_link.display_text.clone()?.into_boxed_str(),
-                    extra_fragment: extra_fragment.clone(),
-                },
-                &ori_link,
-                &diag_info,
-            );
-        }
-
         // Check for a primitive which might conflict with a module
         // Report the ambiguity and require that the user specify which one they meant.
         // FIXME: could there ever be a primitive not in the type namespace?
@@ -1078,7 +1073,7 @@ impl LinkCollector<'_, '_> {
                     // valid omission. See https://github.com/rust-lang/rust/pull/80660#discussion_r551585677
                     // for discussion on the matter.
                     let kind = self.cx.tcx.def_kind(id);
-                    self.verify_disambiguator(path_str, kind, id, disambiguator, item, &diag_info)?;
+                    self.verify_disambiguator(path_str, kind, id, disambiguator, &diag_info)?;
                 } else {
                     match disambiguator {
                         Some(Disambiguator::Primitive | Disambiguator::Namespace(_)) | None => {}
@@ -1107,7 +1102,6 @@ impl LinkCollector<'_, '_> {
                     kind_for_dis,
                     id_for_dis,
                     disambiguator,
-                    item,
                     &diag_info,
                 )?;
 
@@ -1128,7 +1122,6 @@ impl LinkCollector<'_, '_> {
         kind: DefKind,
         id: DefId,
         disambiguator: Option<Disambiguator>,
-        item: &Item,
         diag_info: &DiagnosticInfo<'_>,
     ) -> Option<()> {
         debug!("intra-doc link to {path_str} resolved to {:?}", (kind, id));
@@ -1155,7 +1148,7 @@ impl LinkCollector<'_, '_> {
 
         // item can be non-local e.g. when using `#[rustc_doc_primitive = "pointer"]`
         if let Some((src_id, dst_id)) = id.as_local().and_then(|dst_id| {
-            item.item_id.expect_def_id().as_local().map(|src_id| (src_id, dst_id))
+            diag_info.item.item_id.expect_def_id().as_local().map(|src_id| (src_id, dst_id))
         }) {
             if self.cx.tcx.effective_visibilities(()).is_exported(src_id)
                 && !self.cx.tcx.effective_visibilities(()).is_exported(dst_id)
@@ -1299,7 +1292,7 @@ impl LinkCollector<'_, '_> {
 
         match disambiguator.map(Disambiguator::ns) {
             Some(expected_ns) => {
-                match self.resolve(path_str, expected_ns, item_id, module_id) {
+                match self.resolve(path_str, expected_ns, disambiguator, item_id, module_id) {
                     Ok(candidates) => candidates,
                     Err(err) => {
                         // We only looked in one namespace. Try to give a better error if possible.
@@ -1308,8 +1301,9 @@ impl LinkCollector<'_, '_> {
                         let mut err = ResolutionFailure::NotResolved(err);
                         for other_ns in [TypeNS, ValueNS, MacroNS] {
                             if other_ns != expected_ns {
-                                if let Ok(&[res, ..]) =
-                                    self.resolve(path_str, other_ns, item_id, module_id).as_deref()
+                                if let Ok(&[res, ..]) = self
+                                    .resolve(path_str, other_ns, None, item_id, module_id)
+                                    .as_deref()
                                 {
                                     err = ResolutionFailure::WrongNamespace {
                                         res: full_res(self.cx.tcx, res),
@@ -1329,7 +1323,7 @@ impl LinkCollector<'_, '_> {
             None => {
                 // Try everything!
                 let mut candidate = |ns| {
-                    self.resolve(path_str, ns, item_id, module_id)
+                    self.resolve(path_str, ns, None, item_id, module_id)
                         .map_err(ResolutionFailure::NotResolved)
                 };
 
@@ -1385,58 +1379,6 @@ impl LinkCollector<'_, '_> {
                     }
                 }
             }
-        }
-    }
-
-    /// Resolve display text if the provided link has separated parts of links.
-    ///
-    /// For example:
-    /// Inline link `[display_text](dest_link)` and reference link `[display_text][reference_link]` has
-    /// separated parts of links.
-    fn resolve_display_text(
-        &mut self,
-        explicit_link: &Box<str>,
-        display_res_info: ResolutionInfo,
-        ori_link: &MarkdownLink,
-        diag_info: &DiagnosticInfo<'_>,
-    ) {
-        // Check if explicit resolution's path is same as resolution of original link's display text path, see
-        // tests/rustdoc-ui/lint/redundant_explicit_links.rs for more cases.
-        //
-        // To avoid disambiguator from panicking, we check if display text path is possible to be disambiguated
-        // into explicit path.
-        if !matches!(
-            ori_link.kind,
-            LinkType::Inline | LinkType::Reference | LinkType::ReferenceUnknown
-        ) {
-            return;
-        }
-
-        // Algorithm to check if display text could possibly be the explicit link:
-        //
-        // Consider 2 links which are display text and explicit link, pick the shorter
-        // one as symbol and longer one as full qualified path, and tries to match symbol
-        // to the full qualified path's last symbol.
-        //
-        // Otherwise, check if 2 links are same, if so, skip the resolve process.
-        //
-        // Notice that this algorithm is passive, might possibly miss actual redundant cases.
-        let explicit_link = explicit_link.to_string();
-        let display_text = ori_link.display_text.as_ref().unwrap();
-
-        if display_text.len() == explicit_link.len() {
-            // Whether they are same or not, skip the resolve process.
-            return;
-        }
-
-        if explicit_link.ends_with(&display_text[..]) || display_text.ends_with(&explicit_link[..])
-        {
-            self.resolve_with_disambiguator_cached(
-                display_res_info,
-                diag_info.clone(), // this struct should really be Copy, but Range is not :(
-                false,
-                true,
-            );
         }
     }
 }
@@ -1507,6 +1449,15 @@ impl Disambiguator {
     fn from_str(link: &str) -> Result<Option<(Self, &str, &str)>, (String, Range<usize>)> {
         use Disambiguator::{Kind, Namespace as NS, Primitive};
 
+        let suffixes = [
+            // If you update this list, please also update the relevant rustdoc book section!
+            ("!()", DefKind::Macro(MacroKind::Bang)),
+            ("!{}", DefKind::Macro(MacroKind::Bang)),
+            ("![]", DefKind::Macro(MacroKind::Bang)),
+            ("()", DefKind::Fn),
+            ("!", DefKind::Macro(MacroKind::Bang)),
+        ];
+
         if let Some(idx) = link.find('@') {
             let (prefix, rest) = link.split_at(idx);
             let d = match prefix {
@@ -1517,25 +1468,38 @@ impl Disambiguator {
                 "union" => Kind(DefKind::Union),
                 "module" | "mod" => Kind(DefKind::Mod),
                 "const" | "constant" => Kind(DefKind::Const),
-                "static" => Kind(DefKind::Static { mutability: Mutability::Not, nested: false }),
+                "static" => Kind(DefKind::Static {
+                    mutability: Mutability::Not,
+                    nested: false,
+                    safety: Safety::Safe,
+                }),
                 "function" | "fn" | "method" => Kind(DefKind::Fn),
                 "derive" => Kind(DefKind::Macro(MacroKind::Derive)),
+                "field" => Kind(DefKind::Field),
+                "variant" => Kind(DefKind::Variant),
                 "type" => NS(Namespace::TypeNS),
                 "value" => NS(Namespace::ValueNS),
                 "macro" => NS(Namespace::MacroNS),
                 "prim" | "primitive" => Primitive,
                 _ => return Err((format!("unknown disambiguator `{prefix}`"), 0..idx)),
             };
+
+            for (suffix, kind) in suffixes {
+                if let Some(path_str) = rest.strip_suffix(suffix) {
+                    if d.ns() != Kind(kind).ns() {
+                        return Err((
+                            format!("unmatched disambiguator `{prefix}` and suffix `{suffix}`"),
+                            0..idx,
+                        ));
+                    } else if path_str.len() > 1 {
+                        // path_str != "@"
+                        return Ok(Some((d, &path_str[1..], &rest[1..])));
+                    }
+                }
+            }
+
             Ok(Some((d, &rest[1..], &rest[1..])))
         } else {
-            let suffixes = [
-                // If you update this list, please also update the relevant rustdoc book section!
-                ("!()", DefKind::Macro(MacroKind::Bang)),
-                ("!{}", DefKind::Macro(MacroKind::Bang)),
-                ("![]", DefKind::Macro(MacroKind::Bang)),
-                ("()", DefKind::Fn),
-                ("!", DefKind::Macro(MacroKind::Bang)),
-            ];
             for (suffix, kind) in suffixes {
                 if let Some(path_str) = link.strip_suffix(suffix) {
                     // Avoid turning `!` or `()` into an empty string
@@ -1551,6 +1515,8 @@ impl Disambiguator {
     fn ns(self) -> Namespace {
         match self {
             Self::Namespace(n) => n,
+            // for purposes of link resolution, fields are in the value namespace.
+            Self::Kind(DefKind::Field) => ValueNS,
             Self::Kind(k) => {
                 k.ns().expect("only DefKinds with a valid namespace can be disambiguators")
             }
@@ -1585,8 +1551,6 @@ enum Suggestion {
     Function,
     /// `m!`
     Macro,
-    /// `foo` without any disambiguator
-    RemoveDisambiguator,
 }
 
 impl Suggestion {
@@ -1595,7 +1559,6 @@ impl Suggestion {
             Self::Prefix(x) => format!("prefix with `{x}@`").into(),
             Self::Function => "add parentheses".into(),
             Self::Macro => "add an exclamation mark".into(),
-            Self::RemoveDisambiguator => "remove the disambiguator".into(),
         }
     }
 
@@ -1605,13 +1568,11 @@ impl Suggestion {
             Self::Prefix(prefix) => format!("{prefix}@{path_str}"),
             Self::Function => format!("{path_str}()"),
             Self::Macro => format!("{path_str}!"),
-            Self::RemoveDisambiguator => path_str.into(),
         }
     }
 
     fn as_help_span(
         &self,
-        path_str: &str,
         ori_link: &str,
         sp: rustc_span::Span,
     ) -> Vec<(rustc_span::Span, String)> {
@@ -1659,7 +1620,6 @@ impl Suggestion {
                 }
                 sugg
             }
-            Self::RemoveDisambiguator => vec![(sp, path_str.into())],
         }
     }
 }
@@ -1689,7 +1649,9 @@ fn report_diagnostic(
 
     let sp = item.attr_span(tcx);
 
-    tcx.node_span_lint(lint, hir_id, sp, msg, |lint| {
+    tcx.node_span_lint(lint, hir_id, sp, |lint| {
+        lint.primary_message(msg);
+
         let (span, link_range) = match link_range {
             MarkdownLinkRange::Destination(md_range) => {
                 let mut md_range = md_range.clone();
@@ -1806,7 +1768,9 @@ fn resolution_failure(
                         };
                         name = start;
                         for ns in [TypeNS, ValueNS, MacroNS] {
-                            if let Ok(v_res) = collector.resolve(start, ns, item_id, module_id) {
+                            if let Ok(v_res) =
+                                collector.resolve(start, ns, None, item_id, module_id)
+                            {
                                 debug!("found partial_res={v_res:?}");
                                 if let Some(&res) = v_res.first() {
                                     *partial_res = Some(full_res(tcx, res));
@@ -1930,7 +1894,9 @@ fn resolution_failure(
                             | TraitAlias
                             | TyParam
                             | Static { .. } => "associated item",
-                            Impl { .. } | GlobalAsm => unreachable!("not a path"),
+                            Impl { .. } | GlobalAsm | SyntheticCoroutineBody => {
+                                unreachable!("not a path")
+                            }
                         }
                     } else {
                         "associated item"
@@ -1961,11 +1927,22 @@ fn resolution_failure(
                             &diag_info,
                         );
 
-                        format!(
-                            "this link resolves to {}, which is not in the {} namespace",
-                            item(res),
-                            expected_ns.descr()
-                        )
+                        if let Some(disambiguator) = disambiguator
+                            && !matches!(disambiguator, Disambiguator::Namespace(..))
+                        {
+                            format!(
+                                "this link resolves to {}, which is not {} {}",
+                                item(res),
+                                disambiguator.article(),
+                                disambiguator.descr()
+                            )
+                        } else {
+                            format!(
+                                "this link resolves to {}, which is not in the {} namespace",
+                                item(res),
+                                expected_ns.descr()
+                            )
+                        }
                     }
                 };
                 if let Some(span) = sp {
@@ -2142,7 +2119,7 @@ fn suggest_disambiguator(
     };
 
     if let (Some(sp), Some(ori_link)) = (sp, ori_link) {
-        let mut spans = suggestion.as_help_span(path_str, ori_link, sp);
+        let mut spans = suggestion.as_help_span(ori_link, sp);
         if spans.len() > 1 {
             diag.multipart_suggestion(help, spans, Applicability::MaybeIncorrect);
         } else {

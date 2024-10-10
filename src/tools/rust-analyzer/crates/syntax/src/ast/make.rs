@@ -117,7 +117,7 @@ pub fn name_ref(name_ref: &str) -> ast::NameRef {
     ast_from_text(&format!("fn f() {{ {raw_escape}{name_ref}; }}"))
 }
 fn raw_ident_esc(ident: &str) -> &'static str {
-    if is_raw_identifier(ident) {
+    if is_raw_identifier(ident, Edition::CURRENT) {
         "r#"
     } else {
         ""
@@ -172,25 +172,25 @@ pub fn ty_alias(
     assignment: Option<(ast::Type, Option<ast::WhereClause>)>,
 ) -> ast::TypeAlias {
     let mut s = String::new();
-    s.push_str(&format!("type {}", ident));
+    s.push_str(&format!("type {ident}"));
 
     if let Some(list) = generic_param_list {
         s.push_str(&list.to_string());
     }
 
     if let Some(list) = type_param_bounds {
-        s.push_str(&format!(" : {}", &list));
+        s.push_str(&format!(" : {list}"));
     }
 
     if let Some(cl) = where_clause {
-        s.push_str(&format!(" {}", &cl.to_string()));
+        s.push_str(&format!(" {cl}"));
     }
 
     if let Some(exp) = assignment {
         if let Some(cl) = exp.1 {
-            s.push_str(&format!(" = {} {}", &exp.0.to_string(), &cl.to_string()));
+            s.push_str(&format!(" = {} {cl}", exp.0));
         } else {
-            s.push_str(&format!(" = {}", &exp.0.to_string()));
+            s.push_str(&format!(" = {}", exp.0));
         }
     }
 
@@ -297,7 +297,7 @@ pub fn impl_trait(
         };
 
     let where_clause = merge_where_clause(ty_where_clause, trait_where_clause)
-        .map_or_else(|| " ".to_owned(), |wc| format!("\n{}\n", wc));
+        .map_or_else(|| " ".to_owned(), |wc| format!("\n{wc}\n"));
 
     let body = match body {
         Some(bd) => bd.iter().map(|elem| elem.to_string()).join(""),
@@ -1035,6 +1035,7 @@ pub fn fn_(
     is_async: bool,
     is_const: bool,
     is_unsafe: bool,
+    is_gen: bool,
 ) -> ast::Fn {
     let type_params = match type_params {
         Some(type_params) => format!("{type_params}"),
@@ -1056,9 +1057,10 @@ pub fn fn_(
     let async_literal = if is_async { "async " } else { "" };
     let const_literal = if is_const { "const " } else { "" };
     let unsafe_literal = if is_unsafe { "unsafe " } else { "" };
+    let gen_literal = if is_gen { "gen " } else { "" };
 
     ast_from_text(&format!(
-        "{visibility}{async_literal}{const_literal}{unsafe_literal}fn {fn_name}{type_params}{params} {ret_type}{where_clause}{body}",
+        "{visibility}{const_literal}{async_literal}{gen_literal}{unsafe_literal}fn {fn_name}{type_params}{params} {ret_type}{where_clause}{body}",
     ))
 }
 pub fn struct_(
@@ -1152,14 +1154,15 @@ pub fn token(kind: SyntaxKind) -> SyntaxToken {
 }
 
 pub mod tokens {
-    use once_cell::sync::Lazy;
+    use std::sync::LazyLock;
+
     use parser::Edition;
 
     use crate::{ast, AstNode, Parse, SourceFile, SyntaxKind::*, SyntaxToken};
 
-    pub(super) static SOURCE_FILE: Lazy<Parse<SourceFile>> = Lazy::new(|| {
+    pub(super) static SOURCE_FILE: LazyLock<Parse<SourceFile>> = LazyLock::new(|| {
         SourceFile::parse(
-            "const C: <()>::Item = ( true && true , true || true , 1 != 1, 2 == 2, 3 < 3, 4 <= 4, 5 > 5, 6 >= 6, !true, *p, &p , &mut p, { let a @ [] })\n;\n\nimpl A for B where: {}", Edition::CURRENT,
+            "use crate::foo; const C: <()>::Item = ( true && true , true || true , 1 != 1, 2 == 2, 3 < 3, 4 <= 4, 5 > 5, 6 >= 6, !true, *p, &p , &mut p, async { let _ @ [] })\n;\n\nimpl A for B where: {}", Edition::CURRENT,
         )
     });
 
@@ -1182,6 +1185,17 @@ pub mod tokens {
             .descendants_with_tokens()
             .filter_map(|it| it.into_token())
             .find(|it| it.kind() == WHITESPACE && it.text() == " ")
+            .unwrap()
+    }
+
+    pub fn crate_kw() -> SyntaxToken {
+        SOURCE_FILE
+            .tree()
+            .syntax()
+            .clone_for_update()
+            .descendants_with_tokens()
+            .filter_map(|it| it.into_token())
+            .find(|it| it.kind() == CRATE_KW)
             .unwrap()
     }
 

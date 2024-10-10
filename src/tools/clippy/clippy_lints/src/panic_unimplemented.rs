@@ -1,21 +1,30 @@
+use clippy_config::Conf;
 use clippy_utils::diagnostics::span_lint;
-use clippy_utils::is_in_test;
 use clippy_utils::macros::{is_panic, root_macro_call_first_node};
-use rustc_hir::Expr;
+use clippy_utils::{is_in_test, match_def_path, paths};
+use rustc_hir::def::{DefKind, Res};
+use rustc_hir::{Expr, ExprKind, QPath};
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_session::impl_lint_pass;
 
-#[derive(Clone)]
 pub struct PanicUnimplemented {
-    pub allow_panic_in_tests: bool,
+    allow_panic_in_tests: bool,
+}
+
+impl PanicUnimplemented {
+    pub fn new(conf: &'static Conf) -> Self {
+        Self {
+            allow_panic_in_tests: conf.allow_panic_in_tests,
+        }
+    }
 }
 
 declare_clippy_lint! {
     /// ### What it does
     /// Checks for usage of `panic!`.
     ///
-    /// ### Why is this bad?
-    /// `panic!` will stop the execution of the executable.
+    /// ### Why restrict this?
+    /// This macro, or panics in general, may be unwanted in production code.
     ///
     /// ### Example
     /// ```no_run
@@ -31,8 +40,8 @@ declare_clippy_lint! {
     /// ### What it does
     /// Checks for usage of `unimplemented!`.
     ///
-    /// ### Why is this bad?
-    /// This macro should not be present in production code.
+    /// ### Why restrict this?
+    /// This macro, or panics in general, may be unwanted in production code.
     ///
     /// ### Example
     /// ```no_run
@@ -48,9 +57,9 @@ declare_clippy_lint! {
     /// ### What it does
     /// Checks for usage of `todo!`.
     ///
-    /// ### Why is this bad?
-    /// The `todo!` macro is often used for unfinished code, and it causes
-    /// code to panic. It should not be present in production code.
+    /// ### Why restrict this?
+    /// The `todo!` macro indicates the presence of unfinished code,
+    /// so it should not be present in production code.
     ///
     /// ### Example
     /// ```no_run
@@ -70,8 +79,8 @@ declare_clippy_lint! {
     /// ### What it does
     /// Checks for usage of `unreachable!`.
     ///
-    /// ### Why is this bad?
-    /// This macro can cause code to panic.
+    /// ### Why restrict this?
+    /// This macro, or panics in general, may be unwanted in production code.
     ///
     /// ### Example
     /// ```no_run
@@ -87,10 +96,49 @@ impl_lint_pass!(PanicUnimplemented => [UNIMPLEMENTED, UNREACHABLE, TODO, PANIC])
 
 impl<'tcx> LateLintPass<'tcx> for PanicUnimplemented {
     fn check_expr(&mut self, cx: &LateContext<'tcx>, expr: &'tcx Expr<'_>) {
-        let Some(macro_call) = root_macro_call_first_node(cx, expr) else {
-            return;
-        };
-        if is_panic(cx, macro_call.def_id) {
+        if let Some(macro_call) = root_macro_call_first_node(cx, expr) {
+            if is_panic(cx, macro_call.def_id) {
+                if cx.tcx.hir().is_inside_const_context(expr.hir_id)
+                    || self.allow_panic_in_tests && is_in_test(cx.tcx, expr.hir_id)
+                {
+                    return;
+                }
+
+                span_lint(
+                    cx,
+                    PANIC,
+                    macro_call.span,
+                    "`panic` should not be present in production code",
+                );
+                return;
+            }
+            match cx.tcx.item_name(macro_call.def_id).as_str() {
+                "todo" => {
+                    span_lint(
+                        cx,
+                        TODO,
+                        macro_call.span,
+                        "`todo` should not be present in production code",
+                    );
+                },
+                "unimplemented" => {
+                    span_lint(
+                        cx,
+                        UNIMPLEMENTED,
+                        macro_call.span,
+                        "`unimplemented` should not be present in production code",
+                    );
+                },
+                "unreachable" => {
+                    span_lint(cx, UNREACHABLE, macro_call.span, "usage of the `unreachable!` macro");
+                },
+                _ => {},
+            }
+        } else if let ExprKind::Call(func, [_]) = expr.kind
+            && let ExprKind::Path(QPath::Resolved(None, expr_path)) = func.kind
+            && let Res::Def(DefKind::Fn, def_id) = expr_path.res
+            && match_def_path(cx, def_id, &paths::PANIC_ANY)
+        {
             if cx.tcx.hir().is_inside_const_context(expr.hir_id)
                 || self.allow_panic_in_tests && is_in_test(cx.tcx, expr.hir_id)
             {
@@ -100,32 +148,10 @@ impl<'tcx> LateLintPass<'tcx> for PanicUnimplemented {
             span_lint(
                 cx,
                 PANIC,
-                macro_call.span,
-                "`panic` should not be present in production code",
+                expr.span,
+                "`panic_any` should not be present in production code",
             );
             return;
-        }
-        match cx.tcx.item_name(macro_call.def_id).as_str() {
-            "todo" => {
-                span_lint(
-                    cx,
-                    TODO,
-                    macro_call.span,
-                    "`todo` should not be present in production code",
-                );
-            },
-            "unimplemented" => {
-                span_lint(
-                    cx,
-                    UNIMPLEMENTED,
-                    macro_call.span,
-                    "`unimplemented` should not be present in production code",
-                );
-            },
-            "unreachable" => {
-                span_lint(cx, UNREACHABLE, macro_call.span, "usage of the `unreachable!` macro");
-            },
-            _ => {},
         }
     }
 }

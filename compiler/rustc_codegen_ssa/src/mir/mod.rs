@@ -1,22 +1,22 @@
-use crate::base;
-use crate::traits::*;
-use rustc_index::bit_set::BitSet;
+use std::iter;
+
 use rustc_index::IndexVec;
+use rustc_index::bit_set::BitSet;
 use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags;
-use rustc_middle::mir;
-use rustc_middle::mir::traversal;
-use rustc_middle::mir::UnwindTerminateReason;
+use rustc_middle::mir::{UnwindTerminateReason, traversal};
 use rustc_middle::ty::layout::{FnAbiOf, HasTyCtxt, TyAndLayout};
 use rustc_middle::ty::{self, Instance, Ty, TyCtxt, TypeFoldable, TypeVisitableExt};
-use rustc_middle::{bug, span_bug};
+use rustc_middle::{bug, mir, span_bug};
 use rustc_target::abi::call::{FnAbi, PassMode};
+use tracing::{debug, instrument};
 
-use std::iter;
+use crate::base;
+use crate::traits::*;
 
 mod analyze;
 mod block;
-pub mod constant;
-pub mod coverageinfo;
+mod constant;
+mod coverageinfo;
 pub mod debuginfo;
 mod intrinsic;
 mod locals;
@@ -40,6 +40,9 @@ enum CachedLlbb<T> {
     /// Nothing created yet, and nothing should be.
     Skip,
 }
+
+type PerLocalVarDebugInfoIndexVec<'tcx, V> =
+    IndexVec<mir::Local, Vec<PerLocalVarDebugInfo<'tcx, V>>>;
 
 /// Master context for codegenning from MIR.
 pub struct FunctionCx<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> {
@@ -106,9 +109,8 @@ pub struct FunctionCx<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> {
     locals: locals::Locals<'tcx, Bx::Value>,
 
     /// All `VarDebugInfo` from the MIR body, partitioned by `Local`.
-    /// This is `None` if no var`#[non_exhaustive]`iable debuginfo/names are needed.
-    per_local_var_debug_info:
-        Option<IndexVec<mir::Local, Vec<PerLocalVarDebugInfo<'tcx, Bx::DIVariable>>>>,
+    /// This is `None` if no variable debuginfo/names are needed.
+    per_local_var_debug_info: Option<PerLocalVarDebugInfoIndexVec<'tcx, Bx::DIVariable>>,
 
     /// Caller location propagated if this function has `#[track_caller]`.
     caller_location: Option<OperandRef<'tcx, Bx::Value>>,
@@ -131,9 +133,9 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
 enum LocalRef<'tcx, V> {
     Place(PlaceRef<'tcx, V>),
     /// `UnsizedPlace(p)`: `p` itself is a thin pointer (indirect place).
-    /// `*p` is the fat pointer that references the actual unsized place.
+    /// `*p` is the wide pointer that references the actual unsized place.
     /// Every time it is initialized, we have to reallocate the place
-    /// and update the fat pointer. That's the reason why it is indirect.
+    /// and update the wide pointer. That's the reason why it is indirect.
     UnsizedPlace(PlaceRef<'tcx, V>),
     /// The backend [`OperandValue`] has already been generated.
     Operand(OperandRef<'tcx, V>),
@@ -216,9 +218,12 @@ pub fn codegen_mir<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
     // monomorphization, and if there is an error during collection then codegen never starts -- so
     // we don't have to do it again.
 
-    fx.per_local_var_debug_info = fx.compute_per_local_var_debug_info(&mut start_bx);
+    let (per_local_var_debug_info, consts_debug_info) =
+        fx.compute_per_local_var_debug_info(&mut start_bx).unzip();
+    fx.per_local_var_debug_info = per_local_var_debug_info;
 
-    let memory_locals = analyze::non_ssa_locals(&fx);
+    let traversal_order = traversal::mono_reachable_reverse_postorder(mir, cx.tcx(), instance);
+    let memory_locals = analyze::non_ssa_locals(&fx, &traversal_order);
 
     // Allocate variable and temp allocas
     let local_values = {
@@ -229,10 +234,20 @@ pub fn codegen_mir<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
             let layout = start_bx.layout_of(fx.monomorphize(decl.ty));
             assert!(!layout.ty.has_erasable_regions());
 
-            if local == mir::RETURN_PLACE && fx.fn_abi.ret.is_indirect() {
-                debug!("alloc: {:?} (return place) -> place", local);
-                let llretptr = start_bx.get_param(0);
-                return LocalRef::Place(PlaceRef::new_sized(llretptr, layout));
+            if local == mir::RETURN_PLACE {
+                match fx.fn_abi.ret.mode {
+                    PassMode::Indirect { .. } => {
+                        debug!("alloc: {:?} (return place) -> place", local);
+                        let llretptr = start_bx.get_param(0);
+                        return LocalRef::Place(PlaceRef::new_sized(llretptr, layout));
+                    }
+                    PassMode::Cast { ref cast, .. } => {
+                        debug!("alloc: {:?} (return place) -> place", local);
+                        let size = cast.size(&start_bx);
+                        return LocalRef::Place(PlaceRef::alloca_size(&mut start_bx, size, layout));
+                    }
+                    _ => {}
+                };
             }
 
             if memory_locals.contains(local) {
@@ -257,7 +272,7 @@ pub fn codegen_mir<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
     fx.initialize_locals(local_values);
 
     // Apply debuginfo to the newly allocated locals.
-    fx.debug_introduce_locals(&mut start_bx);
+    fx.debug_introduce_locals(&mut start_bx, consts_debug_info.unwrap_or_default());
 
     // If the backend supports coverage, and coverage is enabled for this function,
     // do any necessary start-of-function codegen (e.g. locals for MC/DC bitmaps).
@@ -267,17 +282,20 @@ pub fn codegen_mir<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
     // So drop the builder of `start_llbb` to avoid having two at the same time.
     drop(start_bx);
 
-    let reachable_blocks = traversal::mono_reachable_as_bitset(mir, cx.tcx(), instance);
+    let mut unreached_blocks = BitSet::new_filled(mir.basic_blocks.len());
+    // Codegen the body of each reachable block using our reverse postorder list.
+    for bb in traversal_order {
+        fx.codegen_block(bb);
+        unreached_blocks.remove(bb);
+    }
 
-    // Codegen the body of each block using reverse postorder
-    for (bb, _) in traversal::reverse_postorder(mir) {
-        if reachable_blocks.contains(bb) {
-            fx.codegen_block(bb);
-        } else {
-            // We want to skip this block, because it's not reachable. But we still create
-            // the block so terminators in other blocks can reference it.
-            fx.codegen_block_as_unreachable(bb);
-        }
+    // FIXME: These empty unreachable blocks are *mostly* a waste. They are occasionally
+    // targets for a SwitchInt terminator, but the reimplementation of the mono-reachable
+    // simplification in SwitchInt lowering sometimes misses cases that
+    // mono_reachable_reverse_postorder manages to figure out.
+    // The solution is to do something like post-mono GVN. But for now we have this hack.
+    for bb in unreached_blocks.iter() {
+        fx.codegen_block_as_unreachable(bb);
     }
 }
 
@@ -411,7 +429,7 @@ fn arg_local_refs<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
                 // Unsized indirect qrguments
                 PassMode::Indirect { attrs: _, meta_attrs: Some(_), on_stack: _ } => {
                     // As the storage for the indirect argument lives during
-                    // the whole function call, we just copy the fat pointer.
+                    // the whole function call, we just copy the wide pointer.
                     let llarg = bx.get_param(llarg_idx);
                     llarg_idx += 1;
                     let llextra = bx.get_param(llarg_idx);

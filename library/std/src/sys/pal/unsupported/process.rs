@@ -1,14 +1,12 @@
+pub use crate::ffi::OsString as EnvKey;
 use crate::ffi::{OsStr, OsString};
-use crate::fmt;
-use crate::io;
 use crate::num::NonZero;
 use crate::path::Path;
 use crate::sys::fs::File;
 use crate::sys::pipe::AnonPipe;
 use crate::sys::unsupported;
 use crate::sys_common::process::{CommandEnv, CommandEnvs};
-
-pub use crate::ffi::OsString as EnvKey;
+use crate::{fmt, io};
 
 ////////////////////////////////////////////////////////////////////////////////
 // Command
@@ -257,11 +255,11 @@ impl ExitStatusError {
 }
 
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
-pub struct ExitCode(bool);
+pub struct ExitCode(u8);
 
 impl ExitCode {
-    pub const SUCCESS: ExitCode = ExitCode(false);
-    pub const FAILURE: ExitCode = ExitCode(true);
+    pub const SUCCESS: ExitCode = ExitCode(0);
+    pub const FAILURE: ExitCode = ExitCode(1);
 
     pub fn as_i32(&self) -> i32 {
         self.0 as i32
@@ -270,10 +268,7 @@ impl ExitCode {
 
 impl From<u8> for ExitCode {
     fn from(code: u8) -> Self {
-        match code {
-            0 => Self::SUCCESS,
-            1..=255 => Self::FAILURE,
-        }
+        Self(code)
     }
 }
 

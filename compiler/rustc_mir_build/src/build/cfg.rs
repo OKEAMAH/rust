@@ -1,8 +1,10 @@
 //! Routines for manipulating the control-flow graph.
 
-use crate::build::CFG;
 use rustc_middle::mir::*;
 use rustc_middle::ty::TyCtxt;
+use tracing::debug;
+
+use crate::build::CFG;
 
 impl<'tcx> CFG<'tcx> {
     pub(crate) fn block_data(&self, blk: BasicBlock) -> &BasicBlockData<'tcx> {
@@ -38,10 +40,10 @@ impl<'tcx> CFG<'tcx> {
         place: Place<'tcx>,
         rvalue: Rvalue<'tcx>,
     ) {
-        self.push(
-            block,
-            Statement { source_info, kind: StatementKind::Assign(Box::new((place, rvalue))) },
-        );
+        self.push(block, Statement {
+            source_info,
+            kind: StatementKind::Assign(Box::new((place, rvalue))),
+        });
     }
 
     pub(crate) fn push_assign_constant(

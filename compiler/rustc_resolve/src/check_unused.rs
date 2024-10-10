@@ -23,22 +23,21 @@
 //  - `check_unused` finally emits the diagnostics based on the data generated
 //    in the last step
 
-use crate::imports::{Import, ImportKind};
-use crate::module_to_string;
-use crate::Resolver;
-
-use crate::{LexicalScopeBinding, NameBindingKind};
 use rustc_ast as ast;
 use rustc_ast::visit::{self, Visitor};
 use rustc_data_structures::fx::{FxHashMap, FxIndexMap, FxIndexSet};
 use rustc_data_structures::unord::UnordSet;
 use rustc_errors::MultiSpan;
 use rustc_hir::def::{DefKind, Res};
-use rustc_session::lint::builtin::{MACRO_USE_EXTERN_CRATE, UNUSED_EXTERN_CRATES};
-use rustc_session::lint::builtin::{UNUSED_IMPORTS, UNUSED_QUALIFICATIONS};
 use rustc_session::lint::BuiltinLintDiag;
-use rustc_span::symbol::{kw, Ident};
-use rustc_span::{Span, DUMMY_SP};
+use rustc_session::lint::builtin::{
+    MACRO_USE_EXTERN_CRATE, UNUSED_EXTERN_CRATES, UNUSED_IMPORTS, UNUSED_QUALIFICATIONS,
+};
+use rustc_span::symbol::{Ident, kw};
+use rustc_span::{DUMMY_SP, Span};
+
+use crate::imports::{Import, ImportKind};
+use crate::{LexicalScopeBinding, NameBindingKind, Resolver, module_to_string};
 
 struct UnusedImport {
     use_tree: ast::UseTree,
@@ -53,8 +52,8 @@ impl UnusedImport {
     }
 }
 
-struct UnusedImportCheckVisitor<'a, 'b, 'tcx> {
-    r: &'a mut Resolver<'b, 'tcx>,
+struct UnusedImportCheckVisitor<'a, 'ra, 'tcx> {
+    r: &'a mut Resolver<'ra, 'tcx>,
     /// All the (so far) unused imports, grouped path list
     unused_imports: FxIndexMap<ast::NodeId, UnusedImport>,
     extern_crate_items: Vec<ExternCrateToLint>,
@@ -79,7 +78,7 @@ struct ExternCrateToLint {
     renames: bool,
 }
 
-impl<'a, 'b, 'tcx> UnusedImportCheckVisitor<'a, 'b, 'tcx> {
+impl<'a, 'ra, 'tcx> UnusedImportCheckVisitor<'a, 'ra, 'tcx> {
     // We have information about whether `use` (import) items are actually
     // used now. If an import is not used at all, we signal a lint error.
     fn check_import(&mut self, id: ast::NodeId) {
@@ -213,7 +212,7 @@ impl<'a, 'b, 'tcx> UnusedImportCheckVisitor<'a, 'b, 'tcx> {
     }
 }
 
-impl<'a, 'b, 'tcx> Visitor<'a> for UnusedImportCheckVisitor<'a, 'b, 'tcx> {
+impl<'a, 'ra, 'tcx> Visitor<'a> for UnusedImportCheckVisitor<'a, 'ra, 'tcx> {
     fn visit_item(&mut self, item: &'a ast::Item) {
         match item.kind {
             // Ignore is_public import statements because there's no way to be sure
@@ -382,9 +381,9 @@ impl Resolver<'_, '_> {
 
         for import in self.potentially_unused_imports.iter() {
             match import.kind {
-                _ if import.used.get().is_some()
-                    || import.expect_vis().is_public()
-                    || import.span.is_dummy() =>
+                _ if import.vis.is_public()
+                    || import.span.is_dummy()
+                    || self.import_use_map.contains_key(import) =>
                 {
                     if let ImportKind::MacroUse { .. } = import.kind {
                         if !import.span.is_dummy() {

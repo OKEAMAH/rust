@@ -1,15 +1,16 @@
-use crate::common::*;
-use crate::type_::Type;
+use std::fmt::Write;
+
+use rustc_abi::Primitive::{Float, Int, Pointer};
+use rustc_abi::{Abi, Align, FieldsShape, Scalar, Size, Variants};
 use rustc_codegen_ssa::traits::*;
 use rustc_middle::bug;
 use rustc_middle::ty::layout::{LayoutOf, TyAndLayout};
 use rustc_middle::ty::print::{with_no_trimmed_paths, with_no_visible_paths};
-use rustc_middle::ty::{self, Ty, TypeVisitableExt};
-use rustc_target::abi::{Abi, Align, FieldsShape};
-use rustc_target::abi::{Float, Int, Pointer};
-use rustc_target::abi::{Scalar, Size, Variants};
+use rustc_middle::ty::{self, CoroutineArgsExt, Ty, TypeVisitableExt};
+use tracing::debug;
 
-use std::fmt::Write;
+use crate::common::*;
+use crate::type_::Type;
 
 fn uncached_llvm_type<'a, 'tcx>(
     cx: &CodegenCx<'a, 'tcx>,
@@ -139,21 +140,21 @@ fn struct_llfields<'a, 'tcx>(
 }
 
 impl<'a, 'tcx> CodegenCx<'a, 'tcx> {
-    pub fn align_of(&self, ty: Ty<'tcx>) -> Align {
+    pub(crate) fn align_of(&self, ty: Ty<'tcx>) -> Align {
         self.layout_of(ty).align.abi
     }
 
-    pub fn size_of(&self, ty: Ty<'tcx>) -> Size {
+    pub(crate) fn size_of(&self, ty: Ty<'tcx>) -> Size {
         self.layout_of(ty).size
     }
 
-    pub fn size_and_align_of(&self, ty: Ty<'tcx>) -> (Size, Align) {
+    pub(crate) fn size_and_align_of(&self, ty: Ty<'tcx>) -> (Size, Align) {
         let layout = self.layout_of(ty);
         (layout.size, layout.align.abi)
     }
 }
 
-pub trait LayoutLlvmExt<'tcx> {
+pub(crate) trait LayoutLlvmExt<'tcx> {
     fn is_llvm_immediate(&self) -> bool;
     fn is_llvm_scalar_pair(&self) -> bool;
     fn llvm_type<'a>(&self, cx: &CodegenCx<'a, 'tcx>) -> &'a Type;
@@ -199,7 +200,7 @@ impl<'tcx> LayoutLlvmExt<'tcx> for TyAndLayout<'tcx> {
         // layout.
         if let Abi::Scalar(scalar) = self.abi {
             // Use a different cache for scalars because pointers to DSTs
-            // can be either fat or thin (data pointers of fat pointers).
+            // can be either wide or thin (data pointers of wide pointers).
             if let Some(&llty) = cx.scalar_lltypes.borrow().get(&self.ty) {
                 return llty;
             }

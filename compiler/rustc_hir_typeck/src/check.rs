@@ -1,8 +1,5 @@
 use std::cell::RefCell;
 
-use crate::coercion::CoerceMany;
-use crate::gather_locals::GatherLocalsVisitor;
-use crate::{CoroutineTypes, Diverges, FnCtxt};
 use rustc_hir as hir;
 use rustc_hir::def::DefKind;
 use rustc_hir::intravisit::Visitor;
@@ -15,6 +12,11 @@ use rustc_span::def_id::LocalDefId;
 use rustc_span::symbol::sym;
 use rustc_target::spec::abi::Abi;
 use rustc_trait_selection::traits::{ObligationCause, ObligationCauseCode};
+use tracing::{debug, instrument};
+
+use crate::coercion::CoerceMany;
+use crate::gather_locals::GatherLocalsVisitor;
+use crate::{CoroutineTypes, Diverges, FnCtxt};
 
 /// Helper used for fns and closures. Does the grungy work of checking a function
 /// body and returns the function context used for that purpose, since in the case of a fn item
@@ -97,7 +99,7 @@ pub(super) fn check_fn<'a, 'tcx>(
         if !params_can_be_unsized {
             fcx.require_type_is_sized(
                 param_ty,
-                param.pat.span,
+                param.ty_span,
                 // ty.span == binding_span iff this is a closure parameter with no type ascription,
                 // or if it's an implicit `self` parameter
                 ObligationCauseCode::SizedArgumentType(
@@ -159,15 +161,11 @@ pub(super) fn check_fn<'a, 'tcx>(
     fcx.demand_suptype(span, ret_ty, actual_return_ty);
 
     // Check that a function marked as `#[panic_handler]` has signature `fn(&PanicInfo) -> !`
-    if let Some(panic_impl_did) = tcx.lang_items().panic_impl()
-        && panic_impl_did == fn_def_id.to_def_id()
-    {
-        check_panic_info_fn(tcx, panic_impl_did.expect_local(), fn_sig);
+    if tcx.is_lang_item(fn_def_id.to_def_id(), LangItem::PanicImpl) {
+        check_panic_info_fn(tcx, fn_def_id, fn_sig);
     }
 
-    if let Some(lang_start_defid) = tcx.lang_items().start_fn()
-        && lang_start_defid == fn_def_id.to_def_id()
-    {
+    if tcx.is_lang_item(fn_def_id.to_def_id(), LangItem::Start) {
         check_lang_start_fn(tcx, fn_sig, fn_def_id);
     }
 
@@ -193,21 +191,18 @@ fn check_panic_info_fn(tcx: TyCtxt<'_>, fn_id: LocalDefId, fn_sig: ty::FnSig<'_>
     let panic_info_did = tcx.require_lang_item(hir::LangItem::PanicInfo, Some(span));
 
     // build type `for<'a, 'b> fn(&'a PanicInfo<'b>) -> !`
-    let panic_info_ty = tcx.type_of(panic_info_did).instantiate(
-        tcx,
-        &[ty::GenericArg::from(ty::Region::new_bound(
-            tcx,
-            ty::INNERMOST,
-            ty::BoundRegion { var: ty::BoundVar::from_u32(1), kind: ty::BrAnon },
-        ))],
-    );
+    let panic_info_ty = tcx.type_of(panic_info_did).instantiate(tcx, &[ty::GenericArg::from(
+        ty::Region::new_bound(tcx, ty::INNERMOST, ty::BoundRegion {
+            var: ty::BoundVar::from_u32(1),
+            kind: ty::BrAnon,
+        }),
+    )]);
     let panic_info_ref_ty = Ty::new_imm_ref(
         tcx,
-        ty::Region::new_bound(
-            tcx,
-            ty::INNERMOST,
-            ty::BoundRegion { var: ty::BoundVar::ZERO, kind: ty::BrAnon },
-        ),
+        ty::Region::new_bound(tcx, ty::INNERMOST, ty::BoundRegion {
+            var: ty::BoundVar::ZERO,
+            kind: ty::BrAnon,
+        }),
         panic_info_ty,
     );
 

@@ -1,21 +1,19 @@
 use std::path::PathBuf;
 
-use rustc_data_structures::fx::FxHashMap;
+use rinja::Template;
+use rustc_data_structures::fx::FxIndexMap;
 
+use super::static_files::{STATIC_FILES, StaticFiles};
 use crate::externalfiles::ExternalHtml;
 use crate::html::format::{Buffer, Print};
-use crate::html::render::{ensure_trailing_slash, StylePath};
-
-use askama::Template;
-
-use super::static_files::{StaticFiles, STATIC_FILES};
+use crate::html::render::{StylePath, ensure_trailing_slash};
 
 #[derive(Clone)]
 pub(crate) struct Layout {
     pub(crate) logo: String,
     pub(crate) favicon: String,
     pub(crate) external_html: ExternalHtml,
-    pub(crate) default_settings: FxHashMap<String, String>,
+    pub(crate) default_settings: FxIndexMap<String, String>,
     pub(crate) krate: String,
     pub(crate) krate_version: String,
     /// The given user css file which allow to customize the generated
@@ -70,6 +68,8 @@ struct PageLayout<'a> {
     display_krate_version_number: &'a str,
     display_krate_version_extra: &'a str,
 }
+
+pub(crate) use crate::html::render::sidebar::filters;
 
 pub(crate) fn render<T: Print, S: Print>(
     layout: &Layout,

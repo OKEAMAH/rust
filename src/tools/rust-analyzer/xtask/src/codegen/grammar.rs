@@ -11,37 +11,55 @@ use std::{
     fs,
 };
 
+use either::Either;
 use itertools::Itertools;
 use proc_macro2::{Punct, Spacing};
 use quote::{format_ident, quote};
+use stdx::panic_context;
 use ungrammar::{Grammar, Rule};
 
 use crate::{
-    codegen::{add_preamble, ensure_file_contents, reformat},
+    codegen::{add_preamble, ensure_file_contents, grammar::ast_src::generate_kind_src, reformat},
     project_root,
 };
 
 mod ast_src;
-use self::ast_src::{AstEnumSrc, AstNodeSrc, AstSrc, Cardinality, Field, KindsSrc, KINDS_SRC};
+use self::ast_src::{AstEnumSrc, AstNodeSrc, AstSrc, Cardinality, Field, KindsSrc};
 
 pub(crate) fn generate(check: bool) {
-    let syntax_kinds = generate_syntax_kinds(KINDS_SRC);
-    let syntax_kinds_file = project_root().join("crates/parser/src/syntax_kind/generated.rs");
-    ensure_file_contents(syntax_kinds_file.as_path(), &syntax_kinds, check);
-
     let grammar = fs::read_to_string(project_root().join("crates/syntax/rust.ungram"))
         .unwrap()
         .parse()
         .unwrap();
     let ast = lower(&grammar);
+    let kinds_src = generate_kind_src(&ast.nodes, &ast.enums, &grammar);
+
+    let syntax_kinds = generate_syntax_kinds(kinds_src);
+    let syntax_kinds_file = project_root().join("crates/parser/src/syntax_kind/generated.rs");
+    ensure_file_contents(
+        crate::flags::CodegenType::Grammar,
+        syntax_kinds_file.as_path(),
+        &syntax_kinds,
+        check,
+    );
 
     let ast_tokens = generate_tokens(&ast);
     let ast_tokens_file = project_root().join("crates/syntax/src/ast/generated/tokens.rs");
-    ensure_file_contents(ast_tokens_file.as_path(), &ast_tokens, check);
+    ensure_file_contents(
+        crate::flags::CodegenType::Grammar,
+        ast_tokens_file.as_path(),
+        &ast_tokens,
+        check,
+    );
 
-    let ast_nodes = generate_nodes(KINDS_SRC, &ast);
+    let ast_nodes = generate_nodes(kinds_src, &ast);
     let ast_nodes_file = project_root().join("crates/syntax/src/ast/generated/nodes.rs");
-    ensure_file_contents(ast_nodes_file.as_path(), &ast_nodes, check);
+    ensure_file_contents(
+        crate::flags::CodegenType::Grammar,
+        ast_nodes_file.as_path(),
+        &ast_nodes,
+        check,
+    );
 }
 
 fn generate_tokens(grammar: &AstSrc) -> String {
@@ -69,7 +87,7 @@ fn generate_tokens(grammar: &AstSrc) -> String {
     });
 
     add_preamble(
-        "sourcegen_ast",
+        crate::flags::CodegenType::Grammar,
         reformat(
             quote! {
                 use crate::{SyntaxKind::{self, *}, SyntaxToken, ast::AstToken};
@@ -81,7 +99,7 @@ fn generate_tokens(grammar: &AstSrc) -> String {
     .replace("#[derive", "\n#[derive")
 }
 
-fn generate_nodes(kinds: KindsSrc<'_>, grammar: &AstSrc) -> String {
+fn generate_nodes(kinds: KindsSrc, grammar: &AstSrc) -> String {
     let (node_defs, node_boilerplate_impls): (Vec<_>, Vec<_>) = grammar
         .nodes
         .iter()
@@ -102,23 +120,26 @@ fn generate_nodes(kinds: KindsSrc<'_>, grammar: &AstSrc) -> String {
                 });
 
             let methods = node.fields.iter().map(|field| {
-                let method_name = field.method_name();
+                let method_name = format_ident!("{}", field.method_name());
                 let ty = field.ty();
 
                 if field.is_many() {
                     quote! {
+                        #[inline]
                         pub fn #method_name(&self) -> AstChildren<#ty> {
                             support::children(&self.syntax)
                         }
                     }
                 } else if let Some(token_kind) = field.token_kind() {
                     quote! {
+                        #[inline]
                         pub fn #method_name(&self) -> Option<#ty> {
                             support::token(&self.syntax, #token_kind)
                         }
                     }
                 } else {
                     quote! {
+                        #[inline]
                         pub fn #method_name(&self) -> Option<#ty> {
                             support::child(&self.syntax)
                         }
@@ -141,12 +162,15 @@ fn generate_nodes(kinds: KindsSrc<'_>, grammar: &AstSrc) -> String {
                 },
                 quote! {
                     impl AstNode for #name {
+                        #[inline]
                         fn can_cast(kind: SyntaxKind) -> bool {
                             kind == #kind
                         }
+                        #[inline]
                         fn cast(syntax: SyntaxNode) -> Option<Self> {
                             if Self::can_cast(syntax.kind()) { Some(Self { syntax }) } else { None }
                         }
+                        #[inline]
                         fn syntax(&self) -> &SyntaxNode { &self.syntax }
                     }
                 },
@@ -175,9 +199,11 @@ fn generate_nodes(kinds: KindsSrc<'_>, grammar: &AstSrc) -> String {
             } else {
                 quote! {
                     impl AstNode for #name {
+                        #[inline]
                         fn can_cast(kind: SyntaxKind) -> bool {
                             matches!(kind, #(#kinds)|*)
                         }
+                        #[inline]
                         fn cast(syntax: SyntaxNode) -> Option<Self> {
                             let res = match syntax.kind() {
                                 #(
@@ -187,6 +213,7 @@ fn generate_nodes(kinds: KindsSrc<'_>, grammar: &AstSrc) -> String {
                             };
                             Some(res)
                         }
+                        #[inline]
                         fn syntax(&self) -> &SyntaxNode {
                             match self {
                                 #(
@@ -211,6 +238,7 @@ fn generate_nodes(kinds: KindsSrc<'_>, grammar: &AstSrc) -> String {
                 quote! {
                     #(
                         impl From<#variants> for #name {
+                            #[inline]
                             fn from(node: #variants) -> #name {
                                 #name::#variants(node)
                             }
@@ -235,7 +263,7 @@ fn generate_nodes(kinds: KindsSrc<'_>, grammar: &AstSrc) -> String {
                 .iter()
                 .map(|name| format_ident!("{}", to_upper_snake_case(&name.name.to_string())))
                 .collect();
-
+            let nodes = nodes.iter().map(|node| format_ident!("{}", node.name));
             (
                 quote! {
                     #[pretty_doc_comment_placeholder_workaround]
@@ -255,16 +283,28 @@ fn generate_nodes(kinds: KindsSrc<'_>, grammar: &AstSrc) -> String {
                         }
                     }
                     impl AstNode for #name {
+                        #[inline]
                         fn can_cast(kind: SyntaxKind) -> bool {
                             matches!(kind, #(#kinds)|*)
                         }
+                        #[inline]
                         fn cast(syntax: SyntaxNode) -> Option<Self> {
                             Self::can_cast(syntax.kind()).then_some(#name { syntax })
                         }
+                        #[inline]
                         fn syntax(&self) -> &SyntaxNode {
                             &self.syntax
                         }
                     }
+
+                    #(
+                        impl From<#nodes> for #name {
+                            #[inline]
+                            fn from(node: #nodes) -> #name {
+                                #name { syntax: node.syntax }
+                            }
+                        }
+                    )*
                 },
             )
         })
@@ -328,7 +368,7 @@ fn generate_nodes(kinds: KindsSrc<'_>, grammar: &AstSrc) -> String {
         }
     }
 
-    let res = add_preamble("sourcegen_ast", reformat(res));
+    let res = add_preamble(crate::flags::CodegenType::Grammar, reformat(res));
     res.replace("#[derive", "\n#[derive")
 }
 
@@ -338,7 +378,7 @@ fn write_doc_comment(contents: &[String], dest: &mut String) {
     }
 }
 
-fn generate_syntax_kinds(grammar: KindsSrc<'_>) -> String {
+fn generate_syntax_kinds(grammar: KindsSrc) -> String {
     let (single_byte_tokens_values, single_byte_tokens): (Vec<_>, Vec<_>) = grammar
         .punct
         .iter()
@@ -358,34 +398,79 @@ fn generate_syntax_kinds(grammar: KindsSrc<'_>) -> String {
     let punctuation =
         grammar.punct.iter().map(|(_token, name)| format_ident!("{}", name)).collect::<Vec<_>>();
 
-    let x = |&name| match name {
+    let fmt_kw_as_variant = |&name| match name {
         "Self" => format_ident!("SELF_TYPE_KW"),
         name => format_ident!("{}_KW", to_upper_snake_case(name)),
     };
-    let full_keywords_values = grammar.keywords;
-    let full_keywords = full_keywords_values.iter().map(x);
+    let strict_keywords = grammar.keywords;
+    let strict_keywords_variants =
+        strict_keywords.iter().map(fmt_kw_as_variant).collect::<Vec<_>>();
+    let strict_keywords_tokens = strict_keywords.iter().map(|it| format_ident!("{it}"));
 
-    let contextual_keywords_values = &grammar.contextual_keywords;
-    let contextual_keywords = contextual_keywords_values.iter().map(x);
-
-    let all_keywords_values = grammar
-        .keywords
+    let edition_dependent_keywords_variants_match_arm = grammar
+        .edition_dependent_keywords
         .iter()
-        .chain(grammar.contextual_keywords.iter())
-        .copied()
+        .map(|(kw, ed)| {
+            let kw = fmt_kw_as_variant(kw);
+            quote! { #kw if #ed <= edition }
+        })
         .collect::<Vec<_>>();
-    let all_keywords_idents = all_keywords_values.iter().map(|kw| format_ident!("{}", kw));
-    let all_keywords = all_keywords_values.iter().map(x).collect::<Vec<_>>();
+    let edition_dependent_keywords_str_match_arm = grammar
+        .edition_dependent_keywords
+        .iter()
+        .map(|(kw, ed)| {
+            quote! { #kw if #ed <= edition }
+        })
+        .collect::<Vec<_>>();
+    let edition_dependent_keywords_variants = grammar
+        .edition_dependent_keywords
+        .iter()
+        .map(|(kw, _)| fmt_kw_as_variant(kw))
+        .collect::<Vec<_>>();
+    let edition_dependent_keywords_tokens =
+        grammar.edition_dependent_keywords.iter().map(|(it, _)| format_ident!("{it}"));
+
+    let contextual_keywords = grammar.contextual_keywords;
+    let contextual_keywords_variants =
+        contextual_keywords.iter().map(fmt_kw_as_variant).collect::<Vec<_>>();
+    let contextual_keywords_tokens = contextual_keywords.iter().map(|it| format_ident!("{it}"));
+    let contextual_keywords_str_match_arm = grammar.contextual_keywords.iter().map(|kw| {
+        match grammar.edition_dependent_keywords.iter().find(|(ed_kw, _)| ed_kw == kw) {
+            Some((_, ed)) => quote! { #kw if edition < #ed },
+            None => quote! { #kw },
+        }
+    });
+    let contextual_keywords_variants_match_arm = grammar
+        .contextual_keywords
+        .iter()
+        .map(|kw_s| {
+            let kw = fmt_kw_as_variant(kw_s);
+            match grammar.edition_dependent_keywords.iter().find(|(ed_kw, _)| ed_kw == kw_s) {
+                Some((_, ed)) => quote! { #kw if edition < #ed },
+                None => quote! { #kw },
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let non_strict_keyword_variants = contextual_keywords_variants
+        .iter()
+        .chain(edition_dependent_keywords_variants.iter())
+        .sorted()
+        .dedup()
+        .collect::<Vec<_>>();
 
     let literals =
         grammar.literals.iter().map(|name| format_ident!("{}", name)).collect::<Vec<_>>();
 
     let tokens = grammar.tokens.iter().map(|name| format_ident!("{}", name)).collect::<Vec<_>>();
 
+    // FIXME: This generates enum kinds?
     let nodes = grammar.nodes.iter().map(|name| format_ident!("{}", name)).collect::<Vec<_>>();
 
     let ast = quote! {
         #![allow(bad_style, missing_docs, unreachable_pub)]
+        use crate::Edition;
+
         /// The kind of syntax node, e.g. `IDENT`, `USE_KW`, or `STRUCT`.
         #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
         #[repr(u16)]
@@ -397,7 +482,8 @@ fn generate_syntax_kinds(grammar: KindsSrc<'_>) -> String {
             #[doc(hidden)]
             EOF,
             #(#punctuation,)*
-            #(#all_keywords,)*
+            #(#strict_keywords_variants,)*
+            #(#non_strict_keyword_variants,)*
             #(#literals,)*
             #(#tokens,)*
             #(#nodes,)*
@@ -409,31 +495,55 @@ fn generate_syntax_kinds(grammar: KindsSrc<'_>) -> String {
         use self::SyntaxKind::*;
 
         impl SyntaxKind {
-            pub fn is_keyword(self) -> bool {
-                matches!(self, #(#all_keywords)|*)
+            /// Checks whether this syntax kind is a strict keyword for the given edition.
+            /// Strict keywords are identifiers that are always considered keywords.
+            pub fn is_strict_keyword(self, edition: Edition) -> bool {
+                matches!(self, #(#strict_keywords_variants)|*)
+                || match self {
+                    #(#edition_dependent_keywords_variants_match_arm => true,)*
+                    _ => false,
+                }
+            }
+
+            /// Checks whether this syntax kind is a weak keyword for the given edition.
+            /// Weak keywords are identifiers that are considered keywords only in certain contexts.
+            pub fn is_contextual_keyword(self, edition: Edition) -> bool {
+                match self {
+                    #(#contextual_keywords_variants_match_arm => true,)*
+                    _ => false,
+                }
+            }
+
+            /// Checks whether this syntax kind is a strict or weak keyword for the given edition.
+            pub fn is_keyword(self, edition: Edition) -> bool {
+                matches!(self, #(#strict_keywords_variants)|*)
+                || match self {
+                    #(#edition_dependent_keywords_variants_match_arm => true,)*
+                    #(#contextual_keywords_variants_match_arm => true,)*
+                    _ => false,
+                }
             }
 
             pub fn is_punct(self) -> bool {
-
                 matches!(self, #(#punctuation)|*)
-
             }
 
             pub fn is_literal(self) -> bool {
                 matches!(self, #(#literals)|*)
             }
 
-            pub fn from_keyword(ident: &str) -> Option<SyntaxKind> {
+            pub fn from_keyword(ident: &str, edition: Edition) -> Option<SyntaxKind> {
                 let kw = match ident {
-                    #(#full_keywords_values => #full_keywords,)*
+                    #(#strict_keywords => #strict_keywords_variants,)*
+                    #(#edition_dependent_keywords_str_match_arm => #edition_dependent_keywords_variants,)*
                     _ => return None,
                 };
                 Some(kw)
             }
 
-            pub fn from_contextual_keyword(ident: &str) -> Option<SyntaxKind> {
+            pub fn from_contextual_keyword(ident: &str, edition: Edition) -> Option<SyntaxKind> {
                 let kw = match ident {
-                    #(#contextual_keywords_values => #contextual_keywords,)*
+                    #(#contextual_keywords_str_match_arm => #contextual_keywords_variants,)*
                     _ => return None,
                 };
                 Some(kw)
@@ -451,14 +561,18 @@ fn generate_syntax_kinds(grammar: KindsSrc<'_>) -> String {
         #[macro_export]
         macro_rules! T {
             #([#punctuation_values] => { $crate::SyntaxKind::#punctuation };)*
-            #([#all_keywords_idents] => { $crate::SyntaxKind::#all_keywords };)*
+            #([#strict_keywords_tokens] => { $crate::SyntaxKind::#strict_keywords_variants };)*
+            #([#contextual_keywords_tokens] => { $crate::SyntaxKind::#contextual_keywords_variants };)*
+            #([#edition_dependent_keywords_tokens] => { $crate::SyntaxKind::#edition_dependent_keywords_variants };)*
             [lifetime_ident] => { $crate::SyntaxKind::LIFETIME_IDENT };
+            [int_number] => { $crate::SyntaxKind::INT_NUMBER };
             [ident] => { $crate::SyntaxKind::IDENT };
+            [string] => { $crate::SyntaxKind::STRING };
             [shebang] => { $crate::SyntaxKind::SHEBANG };
         }
     };
 
-    add_preamble("sourcegen_ast", reformat(ast.to_string()))
+    add_preamble(crate::flags::CodegenType::Grammar, reformat(ast.to_string()))
 }
 
 fn to_upper_snake_case(s: &str) -> String {
@@ -522,7 +636,7 @@ impl Field {
             _ => None,
         }
     }
-    fn method_name(&self) -> proc_macro2::Ident {
+    fn method_name(&self) -> String {
         match self {
             Field::Token(name) => {
                 let name = match name.as_str() {
@@ -557,13 +671,13 @@ impl Field {
                     "~" => "tilde",
                     _ => name,
                 };
-                format_ident!("{}_token", name)
+                format!("{name}_token",)
             }
             Field::Node { name, .. } => {
                 if name == "type" {
-                    format_ident!("ty")
+                    String::from("ty")
                 } else {
-                    format_ident!("{}", name)
+                    name.to_owned()
                 }
             }
         }
@@ -573,6 +687,15 @@ impl Field {
             Field::Token(_) => format_ident!("SyntaxToken"),
             Field::Node { ty, .. } => format_ident!("{}", ty),
         }
+    }
+}
+
+fn clean_token_name(name: &str) -> String {
+    let cleaned = name.trim_start_matches(['@', '#', '?']);
+    if cleaned.is_empty() {
+        name.to_owned()
+    } else {
+        cleaned.to_owned()
     }
 }
 
@@ -591,6 +714,7 @@ fn lower(grammar: &Grammar) -> AstSrc {
     for &node in &nodes {
         let name = grammar[node].name.clone();
         let rule = &grammar[node].rule;
+        let _g = panic_context::enter(name.clone());
         match lower_enum(grammar, rule) {
             Some(variants) => {
                 let enum_src = AstEnumSrc { doc: Vec::new(), name, traits: Vec::new(), variants };
@@ -655,14 +779,12 @@ fn lower_rule(acc: &mut Vec<Field>, grammar: &Grammar, label: Option<&String>, r
         }
         Rule::Token(token) => {
             assert!(label.is_none());
-            let mut name = grammar[*token].name.clone();
-            if name != "int_number" && name != "string" {
-                if "[]{}()".contains(&name) {
-                    name = format!("'{name}'");
-                }
-                let field = Field::Token(name);
-                acc.push(field);
+            let mut name = clean_token_name(&grammar[*token].name);
+            if "[]{}()".contains(&name) {
+                name = format!("'{name}'");
             }
+            let field = Field::Token(name);
+            acc.push(field);
         }
         Rule::Rep(inner) => {
             if let Rule::Node(node) = &**inner {
@@ -692,6 +814,8 @@ fn lower_rule(acc: &mut Vec<Field>, grammar: &Grammar, label: Option<&String>, r
                     | "self_ty"
                     | "iterable"
                     | "condition"
+                    | "args"
+                    | "body"
             );
             if manually_implemented {
                 return;
@@ -718,11 +842,16 @@ fn lower_separated_list(
         Rule::Seq(it) => it,
         _ => return false,
     };
-    let (node, repeat, trailing_sep) = match rule.as_slice() {
+
+    let (nt, repeat, trailing_sep) = match rule.as_slice() {
         [Rule::Node(node), Rule::Rep(repeat), Rule::Opt(trailing_sep)] => {
-            (node, repeat, Some(trailing_sep))
+            (Either::Left(node), repeat, Some(trailing_sep))
         }
-        [Rule::Node(node), Rule::Rep(repeat)] => (node, repeat, None),
+        [Rule::Node(node), Rule::Rep(repeat)] => (Either::Left(node), repeat, None),
+        [Rule::Token(token), Rule::Rep(repeat), Rule::Opt(trailing_sep)] => {
+            (Either::Right(token), repeat, Some(trailing_sep))
+        }
+        [Rule::Token(token), Rule::Rep(repeat)] => (Either::Right(token), repeat, None),
         _ => return false,
     };
     let repeat = match &**repeat {
@@ -731,15 +860,28 @@ fn lower_separated_list(
     };
     if !matches!(
         repeat.as_slice(),
-        [comma, Rule::Node(n)]
-            if trailing_sep.map_or(true, |it| comma == &**it) && n == node
+        [comma, nt_]
+            if trailing_sep.map_or(true, |it| comma == &**it) && match (nt, nt_) {
+                (Either::Left(node), Rule::Node(nt_)) => node == nt_,
+                (Either::Right(token), Rule::Token(nt_)) => token == nt_,
+                _ => false,
+            }
     ) {
         return false;
     }
-    let ty = grammar[*node].name.clone();
-    let name = label.cloned().unwrap_or_else(|| pluralize(&to_lower_snake_case(&ty)));
-    let field = Field::Node { name, ty, cardinality: Cardinality::Many };
-    acc.push(field);
+    match nt {
+        Either::Right(token) => {
+            let name = clean_token_name(&grammar[*token].name);
+            let field = Field::Token(name);
+            acc.push(field);
+        }
+        Either::Left(node) => {
+            let ty = grammar[*node].name.clone();
+            let name = label.cloned().unwrap_or_else(|| pluralize(&to_lower_snake_case(&ty)));
+            let field = Field::Node { name, ty, cardinality: Cardinality::Many };
+            acc.push(field);
+        }
+    }
     true
 }
 
@@ -780,20 +922,21 @@ fn extract_enums(ast: &mut AstSrc) {
     }
 }
 
-fn extract_struct_traits(ast: &mut AstSrc) {
-    let traits: &[(&str, &[&str])] = &[
-        ("HasAttrs", &["attrs"]),
-        ("HasName", &["name"]),
-        ("HasVisibility", &["visibility"]),
-        ("HasGenericParams", &["generic_param_list", "where_clause"]),
-        ("HasTypeBounds", &["type_bound_list", "colon_token"]),
-        ("HasModuleItem", &["items"]),
-        ("HasLoopBody", &["label", "loop_body"]),
-        ("HasArgList", &["arg_list"]),
-    ];
+const TRAITS: &[(&str, &[&str])] = &[
+    ("HasAttrs", &["attrs"]),
+    ("HasName", &["name"]),
+    ("HasVisibility", &["visibility"]),
+    ("HasGenericParams", &["generic_param_list", "where_clause"]),
+    ("HasGenericArgs", &["generic_arg_list"]),
+    ("HasTypeBounds", &["type_bound_list", "colon_token"]),
+    ("HasModuleItem", &["items"]),
+    ("HasLoopBody", &["label", "loop_body"]),
+    ("HasArgList", &["arg_list"]),
+];
 
+fn extract_struct_traits(ast: &mut AstSrc) {
     for node in &mut ast.nodes {
-        for (name, methods) in traits {
+        for (name, methods) in TRAITS {
             extract_struct_trait(node, name, methods);
         }
     }
@@ -832,7 +975,7 @@ fn extract_struct_traits(ast: &mut AstSrc) {
 fn extract_struct_trait(node: &mut AstNodeSrc, trait_name: &str, methods: &[&str]) {
     let mut to_remove = Vec::new();
     for (i, field) in node.fields.iter().enumerate() {
-        let method_name = field.method_name().to_string();
+        let method_name = field.method_name();
         if methods.iter().any(|&it| it == method_name) {
             to_remove.push(i);
         }
@@ -872,4 +1015,9 @@ impl AstNodeSrc {
             self.fields.remove(idx);
         });
     }
+}
+
+#[test]
+fn test() {
+    generate(true);
 }

@@ -1,15 +1,17 @@
 use std::borrow::Cow;
 
-use crate::spec::{base, CodeModel, SplitDebuginfo, Target, TargetOptions};
+use crate::spec::{CodeModel, SplitDebuginfo, Target, TargetOptions, base};
 
-pub fn target() -> Target {
+pub(crate) fn target() -> Target {
     Target {
         llvm_target: "riscv32-unknown-linux-musl".into(),
         metadata: crate::spec::TargetMetadata {
-            description: None,
-            tier: None,
-            host_tools: None,
-            std: None,
+            description: Some(
+                "RISC-V Linux (kernel 5.4, musl 1.2.3 + RISCV32 support patches".into(),
+            ),
+            tier: Some(3),
+            host_tools: Some(false),
+            std: Some(false),
         },
         pointer_width: 32,
         data_layout: "e-m:e-p:32:32-i64:64-n32-S128".into(),

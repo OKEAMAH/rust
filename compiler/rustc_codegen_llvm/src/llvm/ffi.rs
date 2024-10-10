@@ -1,19 +1,18 @@
 #![allow(non_camel_case_types)]
 #![allow(non_upper_case_globals)]
 
+use std::marker::PhantomData;
+
+use libc::{c_char, c_int, c_uint, c_ulonglong, c_void, size_t};
+use rustc_target::spec::SymbolVisibility;
+
+use super::RustString;
 use super::debuginfo::{
     DIArray, DIBasicType, DIBuilder, DICompositeType, DIDerivedType, DIDescriptor, DIEnumerator,
     DIFile, DIFlags, DIGlobalVariableExpression, DILexicalBlock, DILocation, DINameSpace,
     DISPFlags, DIScope, DISubprogram, DISubrange, DITemplateTypeParameter, DIType, DIVariable,
     DebugEmissionKind, DebugNameTableKind,
 };
-
-use libc::{c_char, c_int, c_uint, size_t};
-use libc::{c_ulonglong, c_void};
-
-use std::marker::PhantomData;
-
-use super::RustString;
 
 pub type Bool = c_uint;
 
@@ -135,6 +134,16 @@ pub enum Visibility {
     Protected = 2,
 }
 
+impl Visibility {
+    pub fn from_generic(visibility: SymbolVisibility) -> Self {
+        match visibility {
+            SymbolVisibility::Hidden => Visibility::Hidden,
+            SymbolVisibility::Protected => Visibility::Protected,
+            SymbolVisibility::Interposable => Visibility::Default,
+        }
+    }
+}
+
 /// LLVMUnnamedAddr
 #[repr(C)]
 pub enum UnnamedAddr {
@@ -222,17 +231,18 @@ pub enum IntPredicate {
 
 impl IntPredicate {
     pub fn from_generic(intpre: rustc_codegen_ssa::common::IntPredicate) -> Self {
+        use rustc_codegen_ssa::common::IntPredicate as Common;
         match intpre {
-            rustc_codegen_ssa::common::IntPredicate::IntEQ => IntPredicate::IntEQ,
-            rustc_codegen_ssa::common::IntPredicate::IntNE => IntPredicate::IntNE,
-            rustc_codegen_ssa::common::IntPredicate::IntUGT => IntPredicate::IntUGT,
-            rustc_codegen_ssa::common::IntPredicate::IntUGE => IntPredicate::IntUGE,
-            rustc_codegen_ssa::common::IntPredicate::IntULT => IntPredicate::IntULT,
-            rustc_codegen_ssa::common::IntPredicate::IntULE => IntPredicate::IntULE,
-            rustc_codegen_ssa::common::IntPredicate::IntSGT => IntPredicate::IntSGT,
-            rustc_codegen_ssa::common::IntPredicate::IntSGE => IntPredicate::IntSGE,
-            rustc_codegen_ssa::common::IntPredicate::IntSLT => IntPredicate::IntSLT,
-            rustc_codegen_ssa::common::IntPredicate::IntSLE => IntPredicate::IntSLE,
+            Common::IntEQ => Self::IntEQ,
+            Common::IntNE => Self::IntNE,
+            Common::IntUGT => Self::IntUGT,
+            Common::IntUGE => Self::IntUGE,
+            Common::IntULT => Self::IntULT,
+            Common::IntULE => Self::IntULE,
+            Common::IntSGT => Self::IntSGT,
+            Common::IntSGE => Self::IntSGE,
+            Common::IntSLT => Self::IntSLT,
+            Common::IntSLE => Self::IntSLE,
         }
     }
 }
@@ -261,27 +271,24 @@ pub enum RealPredicate {
 
 impl RealPredicate {
     pub fn from_generic(realp: rustc_codegen_ssa::common::RealPredicate) -> Self {
+        use rustc_codegen_ssa::common::RealPredicate as Common;
         match realp {
-            rustc_codegen_ssa::common::RealPredicate::RealPredicateFalse => {
-                RealPredicate::RealPredicateFalse
-            }
-            rustc_codegen_ssa::common::RealPredicate::RealOEQ => RealPredicate::RealOEQ,
-            rustc_codegen_ssa::common::RealPredicate::RealOGT => RealPredicate::RealOGT,
-            rustc_codegen_ssa::common::RealPredicate::RealOGE => RealPredicate::RealOGE,
-            rustc_codegen_ssa::common::RealPredicate::RealOLT => RealPredicate::RealOLT,
-            rustc_codegen_ssa::common::RealPredicate::RealOLE => RealPredicate::RealOLE,
-            rustc_codegen_ssa::common::RealPredicate::RealONE => RealPredicate::RealONE,
-            rustc_codegen_ssa::common::RealPredicate::RealORD => RealPredicate::RealORD,
-            rustc_codegen_ssa::common::RealPredicate::RealUNO => RealPredicate::RealUNO,
-            rustc_codegen_ssa::common::RealPredicate::RealUEQ => RealPredicate::RealUEQ,
-            rustc_codegen_ssa::common::RealPredicate::RealUGT => RealPredicate::RealUGT,
-            rustc_codegen_ssa::common::RealPredicate::RealUGE => RealPredicate::RealUGE,
-            rustc_codegen_ssa::common::RealPredicate::RealULT => RealPredicate::RealULT,
-            rustc_codegen_ssa::common::RealPredicate::RealULE => RealPredicate::RealULE,
-            rustc_codegen_ssa::common::RealPredicate::RealUNE => RealPredicate::RealUNE,
-            rustc_codegen_ssa::common::RealPredicate::RealPredicateTrue => {
-                RealPredicate::RealPredicateTrue
-            }
+            Common::RealPredicateFalse => Self::RealPredicateFalse,
+            Common::RealOEQ => Self::RealOEQ,
+            Common::RealOGT => Self::RealOGT,
+            Common::RealOGE => Self::RealOGE,
+            Common::RealOLT => Self::RealOLT,
+            Common::RealOLE => Self::RealOLE,
+            Common::RealONE => Self::RealONE,
+            Common::RealORD => Self::RealORD,
+            Common::RealUNO => Self::RealUNO,
+            Common::RealUEQ => Self::RealUEQ,
+            Common::RealUGT => Self::RealUGT,
+            Common::RealUGE => Self::RealUGE,
+            Common::RealULT => Self::RealULT,
+            Common::RealULE => Self::RealULE,
+            Common::RealUNE => Self::RealUNE,
+            Common::RealPredicateTrue => Self::RealPredicateTrue,
         }
     }
 }
@@ -305,7 +312,6 @@ pub enum TypeKind {
     Pointer = 12,
     Vector = 13,
     Metadata = 14,
-    X86_MMX = 15,
     Token = 16,
     ScalableVector = 17,
     BFloat = 18,
@@ -314,27 +320,27 @@ pub enum TypeKind {
 
 impl TypeKind {
     pub fn to_generic(self) -> rustc_codegen_ssa::common::TypeKind {
+        use rustc_codegen_ssa::common::TypeKind as Common;
         match self {
-            TypeKind::Void => rustc_codegen_ssa::common::TypeKind::Void,
-            TypeKind::Half => rustc_codegen_ssa::common::TypeKind::Half,
-            TypeKind::Float => rustc_codegen_ssa::common::TypeKind::Float,
-            TypeKind::Double => rustc_codegen_ssa::common::TypeKind::Double,
-            TypeKind::X86_FP80 => rustc_codegen_ssa::common::TypeKind::X86_FP80,
-            TypeKind::FP128 => rustc_codegen_ssa::common::TypeKind::FP128,
-            TypeKind::PPC_FP128 => rustc_codegen_ssa::common::TypeKind::PPC_FP128,
-            TypeKind::Label => rustc_codegen_ssa::common::TypeKind::Label,
-            TypeKind::Integer => rustc_codegen_ssa::common::TypeKind::Integer,
-            TypeKind::Function => rustc_codegen_ssa::common::TypeKind::Function,
-            TypeKind::Struct => rustc_codegen_ssa::common::TypeKind::Struct,
-            TypeKind::Array => rustc_codegen_ssa::common::TypeKind::Array,
-            TypeKind::Pointer => rustc_codegen_ssa::common::TypeKind::Pointer,
-            TypeKind::Vector => rustc_codegen_ssa::common::TypeKind::Vector,
-            TypeKind::Metadata => rustc_codegen_ssa::common::TypeKind::Metadata,
-            TypeKind::X86_MMX => rustc_codegen_ssa::common::TypeKind::X86_MMX,
-            TypeKind::Token => rustc_codegen_ssa::common::TypeKind::Token,
-            TypeKind::ScalableVector => rustc_codegen_ssa::common::TypeKind::ScalableVector,
-            TypeKind::BFloat => rustc_codegen_ssa::common::TypeKind::BFloat,
-            TypeKind::X86_AMX => rustc_codegen_ssa::common::TypeKind::X86_AMX,
+            Self::Void => Common::Void,
+            Self::Half => Common::Half,
+            Self::Float => Common::Float,
+            Self::Double => Common::Double,
+            Self::X86_FP80 => Common::X86_FP80,
+            Self::FP128 => Common::FP128,
+            Self::PPC_FP128 => Common::PPC_FP128,
+            Self::Label => Common::Label,
+            Self::Integer => Common::Integer,
+            Self::Function => Common::Function,
+            Self::Struct => Common::Struct,
+            Self::Array => Common::Array,
+            Self::Pointer => Common::Pointer,
+            Self::Vector => Common::Vector,
+            Self::Metadata => Common::Metadata,
+            Self::Token => Common::Token,
+            Self::ScalableVector => Common::ScalableVector,
+            Self::BFloat => Common::BFloat,
+            Self::X86_AMX => Common::X86_AMX,
         }
     }
 }
@@ -358,18 +364,19 @@ pub enum AtomicRmwBinOp {
 
 impl AtomicRmwBinOp {
     pub fn from_generic(op: rustc_codegen_ssa::common::AtomicRmwBinOp) -> Self {
+        use rustc_codegen_ssa::common::AtomicRmwBinOp as Common;
         match op {
-            rustc_codegen_ssa::common::AtomicRmwBinOp::AtomicXchg => AtomicRmwBinOp::AtomicXchg,
-            rustc_codegen_ssa::common::AtomicRmwBinOp::AtomicAdd => AtomicRmwBinOp::AtomicAdd,
-            rustc_codegen_ssa::common::AtomicRmwBinOp::AtomicSub => AtomicRmwBinOp::AtomicSub,
-            rustc_codegen_ssa::common::AtomicRmwBinOp::AtomicAnd => AtomicRmwBinOp::AtomicAnd,
-            rustc_codegen_ssa::common::AtomicRmwBinOp::AtomicNand => AtomicRmwBinOp::AtomicNand,
-            rustc_codegen_ssa::common::AtomicRmwBinOp::AtomicOr => AtomicRmwBinOp::AtomicOr,
-            rustc_codegen_ssa::common::AtomicRmwBinOp::AtomicXor => AtomicRmwBinOp::AtomicXor,
-            rustc_codegen_ssa::common::AtomicRmwBinOp::AtomicMax => AtomicRmwBinOp::AtomicMax,
-            rustc_codegen_ssa::common::AtomicRmwBinOp::AtomicMin => AtomicRmwBinOp::AtomicMin,
-            rustc_codegen_ssa::common::AtomicRmwBinOp::AtomicUMax => AtomicRmwBinOp::AtomicUMax,
-            rustc_codegen_ssa::common::AtomicRmwBinOp::AtomicUMin => AtomicRmwBinOp::AtomicUMin,
+            Common::AtomicXchg => Self::AtomicXchg,
+            Common::AtomicAdd => Self::AtomicAdd,
+            Common::AtomicSub => Self::AtomicSub,
+            Common::AtomicAnd => Self::AtomicAnd,
+            Common::AtomicNand => Self::AtomicNand,
+            Common::AtomicOr => Self::AtomicOr,
+            Common::AtomicXor => Self::AtomicXor,
+            Common::AtomicMax => Self::AtomicMax,
+            Common::AtomicMin => Self::AtomicMin,
+            Common::AtomicUMax => Self::AtomicUMax,
+            Common::AtomicUMin => Self::AtomicUMin,
         }
     }
 }
@@ -391,17 +398,14 @@ pub enum AtomicOrdering {
 
 impl AtomicOrdering {
     pub fn from_generic(ao: rustc_codegen_ssa::common::AtomicOrdering) -> Self {
+        use rustc_codegen_ssa::common::AtomicOrdering as Common;
         match ao {
-            rustc_codegen_ssa::common::AtomicOrdering::Unordered => AtomicOrdering::Unordered,
-            rustc_codegen_ssa::common::AtomicOrdering::Relaxed => AtomicOrdering::Monotonic,
-            rustc_codegen_ssa::common::AtomicOrdering::Acquire => AtomicOrdering::Acquire,
-            rustc_codegen_ssa::common::AtomicOrdering::Release => AtomicOrdering::Release,
-            rustc_codegen_ssa::common::AtomicOrdering::AcquireRelease => {
-                AtomicOrdering::AcquireRelease
-            }
-            rustc_codegen_ssa::common::AtomicOrdering::SequentiallyConsistent => {
-                AtomicOrdering::SequentiallyConsistent
-            }
+            Common::Unordered => Self::Unordered,
+            Common::Relaxed => Self::Monotonic,
+            Common::Acquire => Self::Acquire,
+            Common::Release => Self::Release,
+            Common::AcquireRelease => Self::AcquireRelease,
+            Common::SequentiallyConsistent => Self::SequentiallyConsistent,
         }
     }
 }
@@ -430,6 +434,7 @@ pub enum MetadataType {
     MD_nontemporal = 9,
     MD_mem_parallel_loop_access = 10,
     MD_nonnull = 11,
+    MD_unpredictable = 15,
     MD_align = 17,
     MD_type = 19,
     MD_vcall_visibility = 28,
@@ -566,13 +571,11 @@ pub enum ArchiveKind {
     K_AIXBIG,
 }
 
-// LLVMRustThinLTOData
-extern "C" {
+unsafe extern "C" {
+    // LLVMRustThinLTOData
     pub type ThinLTOData;
-}
 
-// LLVMRustThinLTOBuffer
-extern "C" {
+    // LLVMRustThinLTOBuffer
     pub type ThinLTOBuffer;
 }
 
@@ -624,7 +627,7 @@ pub enum MemoryEffects {
     InaccessibleMemOnly,
 }
 
-extern "C" {
+unsafe extern "C" {
     type Opaque;
 }
 #[repr(C)]
@@ -634,54 +637,32 @@ struct InvariantOpaque<'a> {
 }
 
 // Opaque pointer types
-extern "C" {
+unsafe extern "C" {
     pub type Module;
-}
-extern "C" {
     pub type Context;
-}
-extern "C" {
     pub type Type;
-}
-extern "C" {
     pub type Value;
-}
-extern "C" {
     pub type ConstantInt;
-}
-extern "C" {
     pub type Attribute;
-}
-extern "C" {
     pub type Metadata;
-}
-extern "C" {
     pub type BasicBlock;
 }
 #[repr(C)]
 pub struct Builder<'a>(InvariantOpaque<'a>);
 #[repr(C)]
 pub struct PassManager<'a>(InvariantOpaque<'a>);
-extern "C" {
+unsafe extern "C" {
     pub type Pass;
-}
-extern "C" {
     pub type TargetMachine;
-}
-extern "C" {
     pub type Archive;
 }
 #[repr(C)]
 pub struct ArchiveIterator<'a>(InvariantOpaque<'a>);
 #[repr(C)]
 pub struct ArchiveChild<'a>(InvariantOpaque<'a>);
-extern "C" {
+unsafe extern "C" {
     pub type Twine;
-}
-extern "C" {
     pub type DiagnosticInfo;
-}
-extern "C" {
     pub type SMDiagnostic;
 }
 #[repr(C)]
@@ -691,7 +672,7 @@ pub struct OperandBundleDef<'a>(InvariantOpaque<'a>);
 #[repr(C)]
 pub struct Linker<'a>(InvariantOpaque<'a>);
 
-extern "C" {
+unsafe extern "C" {
     pub type DiagnosticHandler;
 }
 
@@ -699,8 +680,9 @@ pub type DiagnosticHandlerTy = unsafe extern "C" fn(&DiagnosticInfo, *mut c_void
 pub type InlineAsmDiagHandlerTy = unsafe extern "C" fn(&SMDiagnostic, *const c_void, c_uint);
 
 pub mod debuginfo {
-    use super::{InvariantOpaque, Metadata};
     use bitflags::bitflags;
+
+    use super::{InvariantOpaque, Metadata};
 
     #[repr(C)]
     pub struct DIBuilder<'a>(InvariantOpaque<'a>);
@@ -825,7 +807,7 @@ bitflags! {
     }
 }
 
-extern "C" {
+unsafe extern "C" {
     pub type ModuleBuffer;
 }
 
@@ -836,7 +818,7 @@ pub type SelfProfileAfterPassCallback = unsafe extern "C" fn(*mut c_void);
 pub type GetSymbolsCallback = unsafe extern "C" fn(*mut c_void, *const c_char) -> *mut c_void;
 pub type GetSymbolsErrorCallback = unsafe extern "C" fn(*const c_char) -> *mut c_void;
 
-extern "C" {
+unsafe extern "C" {
     // Create and destroy contexts.
     pub fn LLVMContextDispose(C: &'static mut Context);
     pub fn LLVMGetMDKindIDInContext(C: &Context, Name: *const c_char, SLen: c_uint) -> c_uint;
@@ -914,17 +896,7 @@ extern "C" {
     pub fn LLVMGetPoison(Ty: &Type) -> &Value;
 
     // Operations on metadata
-    // FIXME: deprecated, replace with LLVMMDStringInContext2
-    pub fn LLVMMDStringInContext(C: &Context, Str: *const c_char, SLen: c_uint) -> &Value;
-
     pub fn LLVMMDStringInContext2(C: &Context, Str: *const c_char, SLen: size_t) -> &Metadata;
-
-    // FIXME: deprecated, replace with LLVMMDNodeInContext2
-    pub fn LLVMMDNodeInContext<'a>(
-        C: &'a Context,
-        Vals: *const &'a Value,
-        Count: c_uint,
-    ) -> &'a Value;
     pub fn LLVMMDNodeInContext2<'a>(
         C: &'a Context,
         Vals: *const &'a Metadata,
@@ -976,6 +948,7 @@ extern "C" {
     pub fn LLVMGetAlignment(Global: &Value) -> c_uint;
     pub fn LLVMSetAlignment(Global: &Value, Bytes: c_uint);
     pub fn LLVMSetDLLStorageClass(V: &Value, C: DLLStorageClass);
+    pub fn LLVMGlobalGetValueType(Global: &Value) -> &Type;
 
     // Operations on global variables
     pub fn LLVMIsAGlobalVariable(GlobalVar: &Value) -> Option<&Value>;
@@ -1042,7 +1015,7 @@ extern "C" {
     pub fn LLVMDisposeBuilder<'a>(Builder: &'a mut Builder<'a>);
 
     // Metadata
-    pub fn LLVMSetCurrentDebugLocation2<'a>(Builder: &Builder<'a>, Loc: &'a Metadata);
+    pub fn LLVMSetCurrentDebugLocation2<'a>(Builder: &Builder<'a>, Loc: *const Metadata);
 
     // Terminators
     pub fn LLVMBuildRetVoid<'a>(B: &Builder<'a>) -> &'a Value;
@@ -1520,7 +1493,7 @@ extern "C" {
 }
 
 #[link(name = "llvm-wrapper", kind = "static")]
-extern "C" {
+unsafe extern "C" {
     pub fn LLVMRustInstallErrorHandlers();
     pub fn LLVMRustDisableSystemDialogsOnCrash();
 
@@ -1577,6 +1550,12 @@ extern "C" {
     pub fn LLVMRustCreateAllocSizeAttr(C: &Context, size_arg: u32) -> &Attribute;
     pub fn LLVMRustCreateAllocKindAttr(C: &Context, size_arg: u64) -> &Attribute;
     pub fn LLVMRustCreateMemoryEffectsAttr(C: &Context, effects: MemoryEffects) -> &Attribute;
+    pub fn LLVMRustCreateRangeAttribute(
+        C: &Context,
+        num_bits: c_uint,
+        lower_words: *const u64,
+        upper_words: *const u64,
+    ) -> &Attribute;
 
     // Operations on functions
     pub fn LLVMRustGetOrInsertFunction<'a>(
@@ -1635,7 +1614,6 @@ extern "C" {
     pub fn LLVMRustGetInstrProfIncrementIntrinsic(M: &Module) -> &Value;
     pub fn LLVMRustGetInstrProfMCDCParametersIntrinsic(M: &Module) -> &Value;
     pub fn LLVMRustGetInstrProfMCDCTVBitmapUpdateIntrinsic(M: &Module) -> &Value;
-    pub fn LLVMRustGetInstrProfMCDCCondBitmapIntrinsic(M: &Module) -> &Value;
 
     pub fn LLVMRustBuildCall<'a>(
         B: &Builder<'a>,
@@ -1856,6 +1834,8 @@ extern "C" {
         CSKind: ChecksumKind,
         Checksum: *const c_char,
         ChecksumLen: size_t,
+        Source: *const c_char,
+        SourceLen: size_t,
     ) -> &'a DIFile;
 
     pub fn LLVMRustDIBuilderCreateSubroutineType<'a>(
@@ -2057,7 +2037,7 @@ extern "C" {
         AddrOpsCount: c_uint,
         DL: &'a DILocation,
         InsertAtEnd: &'a BasicBlock,
-    ) -> &'a Value;
+    );
 
     pub fn LLVMRustDIBuilderCreateEnumerator<'a>(
         Builder: &DIBuilder<'a>,
@@ -2170,7 +2150,8 @@ extern "C" {
 
     pub fn LLVMRustGetHostCPUName(len: *mut usize) -> *const c_char;
 
-    // This function makes copies of pointed to data, so the data's lifetime may end after this function returns
+    // This function makes copies of pointed to data, so the data's lifetime may end after this
+    // function returns.
     pub fn LLVMRustCreateTargetMachine(
         Triple: *const c_char,
         CPU: *const c_char,
@@ -2185,7 +2166,7 @@ extern "C" {
         UniqueSectionNames: bool,
         TrapUnreachable: bool,
         Singlethread: bool,
-        AsmComments: bool,
+        VerboseAsm: bool,
         EmitStackSizeSection: bool,
         RelaxELFRelocations: bool,
         UseInitArray: bool,
@@ -2219,6 +2200,7 @@ extern "C" {
         IsLinkerPluginLTO: bool,
         NoPrepopulatePasses: bool,
         VerifyIR: bool,
+        LintIR: bool,
         UseThinLTOBuffers: bool,
         MergeFunctions: bool,
         UnrollLoops: bool,
@@ -2350,10 +2332,16 @@ extern "C" {
     #[allow(improper_ctypes)]
     pub fn LLVMRustModuleInstructionStats(M: &Module, Str: &RustString);
 
-    pub fn LLVMRustThinLTOBufferCreate(M: &Module, is_thin: bool) -> &'static mut ThinLTOBuffer;
+    pub fn LLVMRustThinLTOBufferCreate(
+        M: &Module,
+        is_thin: bool,
+        emit_summary: bool,
+    ) -> &'static mut ThinLTOBuffer;
     pub fn LLVMRustThinLTOBufferFree(M: &'static mut ThinLTOBuffer);
     pub fn LLVMRustThinLTOBufferPtr(M: &ThinLTOBuffer) -> *const c_char;
     pub fn LLVMRustThinLTOBufferLen(M: &ThinLTOBuffer) -> size_t;
+    pub fn LLVMRustThinLTOBufferThinLinkDataPtr(M: &ThinLTOBuffer) -> *const c_char;
+    pub fn LLVMRustThinLTOBufferThinLinkDataLen(M: &ThinLTOBuffer) -> size_t;
     pub fn LLVMRustCreateThinLTOData(
         Modules: *const ThinLTOModule,
         NumModules: c_uint,
@@ -2434,4 +2422,8 @@ extern "C" {
         callback: GetSymbolsCallback,
         error_callback: GetSymbolsErrorCallback,
     ) -> *mut c_void;
+
+    pub fn LLVMRustIs64BitSymbolicFile(buf_ptr: *const u8, buf_len: usize) -> bool;
+
+    pub fn LLVMRustIsECObject(buf_ptr: *const u8, buf_len: usize) -> bool;
 }

@@ -1,10 +1,10 @@
 use cranelift_codegen::isa::TargetFrontendConfig;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use rustc_index::IndexVec;
+use rustc_middle::ty::TypeFoldable;
 use rustc_middle::ty::layout::{
     self, FnAbiError, FnAbiOfHelpers, FnAbiRequest, LayoutError, LayoutOfHelpers,
 };
-use rustc_middle::ty::TypeFoldable;
 use rustc_span::source_map::Spanned;
 use rustc_target::abi::call::FnAbi;
 use rustc_target::abi::{Float, Integer, Primitive};
@@ -69,7 +69,7 @@ fn clif_type_from_ty<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> Option<types::Typ
             FloatTy::F64 => types::F64,
             FloatTy::F128 => unimplemented!("f16_f128"),
         },
-        ty::FnPtr(_) => pointer_ty(tcx),
+        ty::FnPtr(..) => pointer_ty(tcx),
         ty::RawPtr(pointee_ty, _) | ty::Ref(_, pointee_ty, _) => {
             if has_ptr_meta(tcx, *pointee_ty) {
                 return None;
@@ -101,13 +101,13 @@ fn clif_pair_type_from_ty<'tcx>(
     })
 }
 
-/// Is a pointer to this type a fat ptr?
+/// Is a pointer to this type a wide ptr?
 pub(crate) fn has_ptr_meta<'tcx>(tcx: TyCtxt<'tcx>, ty: Ty<'tcx>) -> bool {
     if ty.is_sized(tcx, ParamEnv::reveal_all()) {
         return false;
     }
 
-    let tail = tcx.struct_tail_erasing_lifetimes(ty, ParamEnv::reveal_all());
+    let tail = tcx.struct_tail_for_codegen(ty, ParamEnv::reveal_all());
     match tail.kind() {
         ty::Foreign(..) => false,
         ty::Str | ty::Slice(..) | ty::Dynamic(..) => true,
@@ -247,7 +247,6 @@ pub(crate) fn type_sign(ty: Ty<'_>) -> bool {
 
 pub(crate) fn create_wrapper_function(
     module: &mut dyn Module,
-    unwind_context: &mut UnwindContext,
     sig: Signature,
     wrapper_name: &str,
     callee_name: &str,
@@ -280,7 +279,6 @@ pub(crate) fn create_wrapper_function(
         bcx.finalize();
     }
     module.define_function(wrapper_func_id, &mut ctx).unwrap();
-    unwind_context.add_function(wrapper_func_id, &ctx, module.isa());
 }
 
 pub(crate) struct FunctionCx<'m, 'clif, 'tcx: 'm> {
@@ -311,8 +309,6 @@ pub(crate) struct FunctionCx<'m, 'clif, 'tcx: 'm> {
 }
 
 impl<'tcx> LayoutOfHelpers<'tcx> for FunctionCx<'_, '_, 'tcx> {
-    type LayoutOfResult = TyAndLayout<'tcx>;
-
     #[inline]
     fn handle_layout_err(&self, err: LayoutError<'tcx>, span: Span, ty: Ty<'tcx>) -> ! {
         RevealAllLayoutCx(self.tcx).handle_layout_err(err, span, ty)
@@ -320,8 +316,6 @@ impl<'tcx> LayoutOfHelpers<'tcx> for FunctionCx<'_, '_, 'tcx> {
 }
 
 impl<'tcx> FnAbiOfHelpers<'tcx> for FunctionCx<'_, '_, 'tcx> {
-    type FnAbiOfResult = &'tcx FnAbi<'tcx, Ty<'tcx>>;
-
     #[inline]
     fn handle_fn_abi_err(
         &self,
@@ -395,6 +389,7 @@ impl<'tcx> FunctionCx<'_, '_, 'tcx> {
                 // FIXME Don't force the size to a multiple of <abi_align> bytes once Cranelift gets
                 // a way to specify stack slot alignment.
                 size: (size + abi_align - 1) / abi_align * abi_align,
+                align_shift: 4,
             });
             Pointer::stack_slot(stack_slot)
         } else {
@@ -405,6 +400,7 @@ impl<'tcx> FunctionCx<'_, '_, 'tcx> {
                 // FIXME Don't force the size to a multiple of <abi_align> bytes once Cranelift gets
                 // a way to specify stack slot alignment.
                 size: (size + align) / abi_align * abi_align,
+                align_shift: 4,
             });
             let base_ptr = self.bcx.ins().stack_addr(self.pointer_type, stack_slot, 0);
             let misalign_offset = self.bcx.ins().urem_imm(base_ptr, i64::from(align));
@@ -450,8 +446,6 @@ impl<'tcx> FunctionCx<'_, '_, 'tcx> {
 pub(crate) struct RevealAllLayoutCx<'tcx>(pub(crate) TyCtxt<'tcx>);
 
 impl<'tcx> LayoutOfHelpers<'tcx> for RevealAllLayoutCx<'tcx> {
-    type LayoutOfResult = TyAndLayout<'tcx>;
-
     #[inline]
     fn handle_layout_err(&self, err: LayoutError<'tcx>, span: Span, ty: Ty<'tcx>) -> ! {
         if let LayoutError::SizeOverflow(_) | LayoutError::ReferencesError(_) = err {
@@ -466,8 +460,6 @@ impl<'tcx> LayoutOfHelpers<'tcx> for RevealAllLayoutCx<'tcx> {
 }
 
 impl<'tcx> FnAbiOfHelpers<'tcx> for RevealAllLayoutCx<'tcx> {
-    type FnAbiOfResult = &'tcx FnAbi<'tcx, Ty<'tcx>>;
-
     #[inline]
     fn handle_fn_abi_err(
         &self,

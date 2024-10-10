@@ -190,4 +190,89 @@ pub const CONFIG_CHANGE_HISTORY: &[ChangeInfo] = &[
         severity: ChangeSeverity::Warning,
         summary: "`rust.lld` has a new default value of `true` on `x86_64-unknown-linux-gnu`. Starting at stage1, `rust-lld` will thus be this target's default linker. No config changes should be necessary.",
     },
+    ChangeInfo {
+        change_id: 125535,
+        severity: ChangeSeverity::Warning,
+        summary: "Removed `dist.missing-tools` configuration as it was deprecated long time ago.",
+    },
+    ChangeInfo {
+        change_id: 126701,
+        severity: ChangeSeverity::Warning,
+        summary: "`llvm.lld` is enabled by default for the dist profile. If set to false, `lld` will not be included in the dist build.",
+    },
+    ChangeInfo {
+        change_id: 127913,
+        severity: ChangeSeverity::Warning,
+        summary: "`debug-logging` option has been removed from the default `tools` profile.",
+    },
+    ChangeInfo {
+        change_id: 127866,
+        severity: ChangeSeverity::Info,
+        summary: "the `wasm-component-ld` tool is now built as part of `build.extended` and can be a member of `build.tools`",
+    },
+    ChangeInfo {
+        change_id: 120593,
+        severity: ChangeSeverity::Info,
+        summary: "Removed android-ndk r25b support in favor of android-ndk r26d.",
+    },
+    ChangeInfo {
+        change_id: 125181,
+        severity: ChangeSeverity::Warning,
+        summary: "For tarball sources, default value for `rust.channel` will be taken from `src/ci/channel` file.",
+    },
+    ChangeInfo {
+        change_id: 125642,
+        severity: ChangeSeverity::Info,
+        summary: "New option `llvm.libzstd` to control whether llvm is built with zstd support.",
+    },
+    ChangeInfo {
+        change_id: 128841,
+        severity: ChangeSeverity::Warning,
+        summary: "./x test --rustc-args was renamed to --compiletest-rustc-args as it only applies there. ./x miri --rustc-args was also removed.",
+    },
+    ChangeInfo {
+        change_id: 129295,
+        severity: ChangeSeverity::Info,
+        summary: "The `build.profiler` option now tries to use source code from `download-ci-llvm` if possible, instead of checking out the `src/llvm-project` submodule.",
+    },
+    ChangeInfo {
+        change_id: 129152,
+        severity: ChangeSeverity::Info,
+        summary: "New option `build.cargo-clippy` added for supporting the use of custom/external clippy.",
+    },
+    ChangeInfo {
+        change_id: 129925,
+        severity: ChangeSeverity::Warning,
+        summary: "Removed `rust.split-debuginfo` as it was deprecated long time ago.",
+    },
+    ChangeInfo {
+        change_id: 129176,
+        severity: ChangeSeverity::Info,
+        summary: "New option `llvm.enzyme` to control whether the llvm based autodiff tool (Enzyme) is built.",
+    },
+    ChangeInfo {
+        change_id: 129473,
+        severity: ChangeSeverity::Warning,
+        summary: "`download-ci-llvm = true` now checks if CI llvm is available and has become the default for the compiler profile",
+    },
+    ChangeInfo {
+        change_id: 130202,
+        severity: ChangeSeverity::Info,
+        summary: "'tools' and 'library' profiles switched `download-ci-llvm` option from `if-unchanged` to `true`.",
+    },
+    ChangeInfo {
+        change_id: 130110,
+        severity: ChangeSeverity::Info,
+        summary: "New option `dist.vendor` added to control whether bootstrap should vendor dependencies for dist tarball.",
+    },
+    ChangeInfo {
+        change_id: 130529,
+        severity: ChangeSeverity::Info,
+        summary: "If `llvm.download-ci-llvm` is not defined, it defaults to `true`.",
+    },
+    ChangeInfo {
+        change_id: 131075,
+        severity: ChangeSeverity::Info,
+        summary: "New option `./x setup editor` added, replacing `./x setup vscode` and adding support for vim, emacs and helix.",
+    },
 ];

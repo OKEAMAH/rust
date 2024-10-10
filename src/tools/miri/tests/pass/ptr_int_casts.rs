@@ -1,8 +1,8 @@
 //@revisions: stack tree
+// Tree Borrows doesn't support int2ptr casts, but let's make sure we don't immediately crash either.
 //@[tree]compile-flags: -Zmiri-tree-borrows
-//@compile-flags: -Zmiri-permissive-provenance
-use std::mem;
-use std::ptr;
+//@[stack]compile-flags: -Zmiri-permissive-provenance
+use std::{mem, ptr};
 
 fn eq_ref<T>(x: &T, y: &T) -> bool {
     x as *const _ == y as *const _

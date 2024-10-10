@@ -2,20 +2,25 @@ use std::collections::BTreeSet;
 
 use ast::make;
 use either::Either;
-use hir::{db::HirDatabase, PathResolution, Semantics, TypeInfo};
+use hir::{
+    db::{ExpandDatabase, HirDatabase},
+    sym, FileRange, PathResolution, Semantics, TypeInfo,
+};
 use ide_db::{
-    base_db::{FileId, FileRange},
+    base_db::CrateId,
     defs::Definition,
     imports::insert_use::remove_path_if_in_use_stmt,
     path_transform::PathTransform,
     search::{FileReference, FileReferenceNode, SearchScope},
     source_change::SourceChangeBuilder,
-    syntax_helpers::{insert_whitespace_into_node::insert_ws_into, node_ext::expr_as_name_ref},
-    RootDatabase,
+    syntax_helpers::{node_ext::expr_as_name_ref, prettify_macro_expansion},
+    EditionedFileId, RootDatabase,
 };
 use itertools::{izip, Itertools};
 use syntax::{
-    ast::{self, edit::IndentLevel, edit_in_place::Indent, HasArgList, Pat, PathExpr},
+    ast::{
+        self, edit::IndentLevel, edit_in_place::Indent, HasArgList, HasGenericArgs, Pat, PathExpr,
+    },
     ted, AstNode, NodeOrToken, SyntaxKind,
 };
 
@@ -101,12 +106,13 @@ pub(crate) fn inline_into_callers(acc: &mut Assists, ctx: &AssistContext<'_>) ->
             let mut remove_def = true;
             let mut inline_refs_for_file = |file_id, refs: Vec<FileReference>| {
                 builder.edit_file(file_id);
+                let call_krate = ctx.sema.file_to_module_def(file_id).map(|it| it.krate());
                 let count = refs.len();
                 // The collects are required as we are otherwise iterating while mutating 🙅‍♀️🙅‍♂️
                 let (name_refs, name_refs_use) = split_refs_and_uses(builder, refs, Some);
                 let call_infos: Vec<_> = name_refs
                     .into_iter()
-                    .filter_map(CallInfo::from_name_ref)
+                    .filter_map(|it| CallInfo::from_name_ref(it, call_krate?.into()))
                     // FIXME: do not handle callsites in macros' parameters, because
                     // directly inlining into macros may cause errors.
                     .filter(|call_info| !ctx.sema.hir_file_for(call_info.node.syntax()).is_macro())
@@ -184,7 +190,10 @@ pub(super) fn split_refs_and_uses<T: ast::AstNode>(
 // ```
 pub(crate) fn inline_call(acc: &mut Assists, ctx: &AssistContext<'_>) -> Option<()> {
     let name_ref: ast::NameRef = ctx.find_node_at_offset()?;
-    let call_info = CallInfo::from_name_ref(name_ref.clone())?;
+    let call_info = CallInfo::from_name_ref(
+        name_ref.clone(),
+        ctx.sema.file_to_module_def(ctx.file_id())?.krate().into(),
+    )?;
     let (function, label) = match &call_info.node {
         ast::CallableExpr::Call(call) => {
             let path = match call.expr()? {
@@ -242,10 +251,11 @@ struct CallInfo {
     node: ast::CallableExpr,
     arguments: Vec<ast::Expr>,
     generic_arg_list: Option<ast::GenericArgList>,
+    krate: CrateId,
 }
 
 impl CallInfo {
-    fn from_name_ref(name_ref: ast::NameRef) -> Option<CallInfo> {
+    fn from_name_ref(name_ref: ast::NameRef, krate: CrateId) -> Option<CallInfo> {
         let parent = name_ref.syntax().parent()?;
         if let Some(call) = ast::MethodCallExpr::cast(parent.clone()) {
             let receiver = call.receiver()?;
@@ -255,6 +265,7 @@ impl CallInfo {
                 generic_arg_list: call.generic_arg_list(),
                 node: ast::CallableExpr::MethodCall(call),
                 arguments,
+                krate,
             })
         } else if let Some(segment) = ast::PathSegment::cast(parent) {
             let path = segment.syntax().parent().and_then(ast::Path::cast)?;
@@ -265,6 +276,7 @@ impl CallInfo {
                 arguments: call.arg_list()?.args().collect(),
                 node: ast::CallableExpr::Call(call),
                 generic_arg_list: segment.generic_arg_list(),
+                krate,
             })
         } else {
             None
@@ -302,15 +314,19 @@ fn get_fn_params(
 
 fn inline(
     sema: &Semantics<'_, RootDatabase>,
-    function_def_file_id: FileId,
+    function_def_file_id: EditionedFileId,
     function: hir::Function,
     fn_body: &ast::BlockExpr,
     params: &[(ast::Pat, Option<ast::Type>, hir::Param)],
-    CallInfo { node, arguments, generic_arg_list }: &CallInfo,
+    CallInfo { node, arguments, generic_arg_list, krate }: &CallInfo,
 ) -> ast::Expr {
-    let mut body = if sema.hir_file_for(fn_body.syntax()).is_macro() {
+    let file_id = sema.hir_file_for(fn_body.syntax());
+    let mut body = if let Some(macro_file) = file_id.macro_file() {
         cov_mark::hit!(inline_call_defined_in_macro);
-        if let Some(body) = ast::BlockExpr::cast(insert_ws_into(fn_body.syntax().clone())) {
+        let span_map = sema.db.expansion_span_map(macro_file);
+        let body_prettified =
+            prettify_macro_expansion(sema.db, fn_body.syntax().clone(), &span_map, *krate);
+        if let Some(body) = ast::BlockExpr::cast(body_prettified) {
             body
         } else {
             fn_body.clone_for_update()
@@ -368,7 +384,7 @@ fn inline(
                     _ => None,
                 })
                 .for_each(|usage| {
-                    ted::replace(usage, &this());
+                    ted::replace(usage, this());
                 });
         }
     }
@@ -419,8 +435,16 @@ fn inline(
 
         let mut insert_let_stmt = || {
             let param_ty = param_ty.clone().map(|param_ty| {
-                if sema.hir_file_for(param_ty.syntax()).is_macro() {
-                    ast::Type::cast(insert_ws_into(param_ty.syntax().clone())).unwrap_or(param_ty)
+                let file_id = sema.hir_file_for(param_ty.syntax());
+                if let Some(macro_file) = file_id.macro_file() {
+                    let span_map = sema.db.expansion_span_map(macro_file);
+                    let param_ty_prettified = prettify_macro_expansion(
+                        sema.db,
+                        param_ty.syntax().clone(),
+                        &span_map,
+                        *krate,
+                    );
+                    ast::Type::cast(param_ty_prettified).unwrap_or(param_ty)
                 } else {
                     param_ty
                 }
@@ -428,10 +452,7 @@ fn inline(
 
             let ty = sema.type_of_expr(expr).filter(TypeInfo::has_adjustment).and(param_ty);
 
-            let is_self = param
-                .name(sema.db)
-                .and_then(|name| name.as_text())
-                .is_some_and(|name| name == "self");
+            let is_self = param.name(sema.db).is_some_and(|name| name == sym::self_.clone());
 
             if is_self {
                 let mut this_pat = make::ident_pat(false, false, make::name("this"));
@@ -483,7 +504,7 @@ fn inline(
                 cov_mark::hit!(inline_call_inline_direct_field);
                 field.replace_expr(replacement.clone_for_update());
             } else {
-                ted::replace(usage.syntax(), &replacement.syntax().clone_for_update());
+                ted::replace(usage.syntax(), replacement.syntax().clone_for_update());
             }
         };
 
@@ -1022,6 +1043,7 @@ fn main() {
         check_assist(
             inline_call,
             r#"
+//- minicore: sized
 fn foo(x: *const u32) -> u32 {
     x as u32
 }

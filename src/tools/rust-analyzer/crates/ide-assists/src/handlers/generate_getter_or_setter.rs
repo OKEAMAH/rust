@@ -47,7 +47,7 @@ pub(crate) fn generate_setter(acc: &mut Assists, ctx: &AssistContext<'_>) -> Opt
     }
 
     // Prepend set_ to fn names.
-    fn_names.iter_mut().for_each(|name| *name = format!("set_{}", name));
+    fn_names.iter_mut().for_each(|name| *name = format!("set_{name}"));
 
     // Return early if we've found an existing fn
     let impl_def = find_struct_impl(ctx, &ast::Adt::Struct(strukt.clone()), &fn_names)?;
@@ -233,7 +233,7 @@ fn generate_getter_from_info(
                 .map(|conversion| {
                     cov_mark::hit!(convert_reference_type);
                     (
-                        conversion.convert_type(ctx.db()),
+                        conversion.convert_type(ctx.db(), krate.edition(ctx.db())),
                         conversion.getter(record_field_info.field_name.to_string()),
                     )
                 })
@@ -261,7 +261,19 @@ fn generate_getter_from_info(
     let ret_type = Some(make::ret_type(ty));
     let body = make::block_expr([], Some(body));
 
-    make::fn_(strukt.visibility(), fn_name, None, None, params, body, ret_type, false, false, false)
+    make::fn_(
+        strukt.visibility(),
+        fn_name,
+        None,
+        None,
+        params,
+        body,
+        ret_type,
+        false,
+        false,
+        false,
+        false,
+    )
 }
 
 fn generate_setter_from_info(info: &AssistInfo, record_field_info: &RecordFieldInfo) -> ast::Fn {
@@ -285,7 +297,19 @@ fn generate_setter_from_info(info: &AssistInfo, record_field_info: &RecordFieldI
     let body = make::block_expr([assign_stmt.into()], None);
 
     // Make the setter fn
-    make::fn_(strukt.visibility(), fn_name, None, None, params, body, None, false, false, false)
+    make::fn_(
+        strukt.visibility(),
+        fn_name,
+        None,
+        None,
+        params,
+        body,
+        None,
+        false,
+        false,
+        false,
+        false,
+    )
 }
 
 fn extract_and_parse(

@@ -1,14 +1,16 @@
 //! Code related to parsing literals.
 
+use std::{ascii, fmt, str};
+
+use rustc_lexer::unescape::{
+    MixedUnit, Mode, byte_from_char, unescape_byte, unescape_char, unescape_mixed, unescape_unicode,
+};
+use rustc_span::Span;
+use rustc_span::symbol::{Symbol, kw, sym};
+use tracing::debug;
+
 use crate::ast::{self, LitKind, MetaItemLit, StrStyle};
 use crate::token::{self, Token};
-use rustc_lexer::unescape::{
-    byte_from_char, unescape_byte, unescape_char, unescape_mixed, unescape_unicode, MixedUnit, Mode,
-};
-use rustc_span::symbol::{kw, sym, Symbol};
-use rustc_span::Span;
-use std::{ascii, fmt, str};
-use tracing::debug;
 
 // Escapes a string, represented as a symbol. Reuses the original symbol,
 // avoiding interning, if no changes are required.

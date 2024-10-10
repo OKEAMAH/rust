@@ -1,5 +1,3 @@
-use std::process::Command;
-
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum CiEnv {
     /// Not a CI environment.
@@ -22,16 +20,13 @@ impl CiEnv {
         Self::current() != CiEnv::None
     }
 
-    /// If in a CI environment, forces the command to run with colors.
-    pub fn force_coloring_in_ci(self, cmd: &mut Command) {
-        if self != CiEnv::None {
-            // Due to use of stamp/docker, the output stream of rustbuild is not
-            // a TTY in CI, so coloring is by-default turned off.
-            // The explicit `TERM=xterm` environment is needed for
-            // `--color always` to actually work. This env var was lost when
-            // compiling through the Makefile. Very strange.
-            cmd.env("TERM", "xterm").args(&["--color", "always"]);
-        }
+    /// Checks if running in rust-lang/rust managed CI job.
+    pub fn is_rust_lang_managed_ci_job() -> bool {
+        Self::is_ci()
+            // If both are present, we can assume it's an upstream CI job
+            // as they are always set unconditionally.
+            && std::env::var_os("CI_JOB_NAME").is_some()
+            && std::env::var_os("TOOLSTATE_REPO").is_some()
     }
 }
 

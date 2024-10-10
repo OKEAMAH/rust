@@ -3,7 +3,7 @@ use std::ops::ControlFlow;
 use clippy_utils::diagnostics::span_lint_and_then;
 use clippy_utils::is_path_lang_item;
 use clippy_utils::ty::is_type_diagnostic_item;
-use clippy_utils::visitors::{for_each_expr, Visitable};
+use clippy_utils::visitors::{Visitable, for_each_expr};
 use rustc_ast::LitKind;
 use rustc_data_structures::fx::FxHashSet;
 use rustc_hir::def::{DefKind, Res};
@@ -13,7 +13,7 @@ use rustc_hir::{
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_middle::ty::{Ty, TypeckResults};
 use rustc_session::declare_lint_pass;
-use rustc_span::{sym, Span, Symbol};
+use rustc_span::{Span, Symbol, sym};
 
 declare_clippy_lint! {
     /// ### What it does
@@ -110,7 +110,7 @@ fn should_lint<'tcx>(
     // Is there a call to `DebugStruct::debug_struct`? Do lint if there is.
     let mut has_debug_struct = false;
 
-    for_each_expr(block, |expr| {
+    for_each_expr(cx, block, |expr| {
         if let ExprKind::MethodCall(path, recv, ..) = &expr.kind {
             let recv_ty = typeck_results.expr_ty(recv).peel_refs();
 
@@ -165,7 +165,7 @@ fn check_struct<'tcx>(
     let mut has_direct_field_access = false;
     let mut field_accesses = FxHashSet::default();
 
-    for_each_expr(block, |expr| {
+    for_each_expr(cx, block, |expr| {
         if let ExprKind::Field(target, ident) = expr.kind
             && let target_ty = typeck_results.expr_ty_adjusted(target).peel_refs()
             && target_ty == self_ty

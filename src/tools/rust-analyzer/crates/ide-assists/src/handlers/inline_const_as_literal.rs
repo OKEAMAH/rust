@@ -51,10 +51,10 @@ pub(crate) fn inline_const_as_literal(acc: &mut Assists, ctx: &AssistContext<'_>
             | ast::Expr::MatchExpr(_)
             | ast::Expr::MacroExpr(_)
             | ast::Expr::BinExpr(_)
-            | ast::Expr::CallExpr(_) => match konst.render_eval(ctx.sema.db) {
-                Ok(result) => result,
-                Err(_) => return None,
-            },
+            | ast::Expr::CallExpr(_) => {
+                let edition = ctx.sema.scope(variable.syntax())?.krate().edition(ctx.db());
+                konst.eval(ctx.sema.db, edition).ok()?
+            }
             _ => return None,
         };
 
@@ -124,12 +124,14 @@ mod tests {
         ("u64", "0", NUMBER),
         ("u128", "0", NUMBER),
         ("usize", "0", NUMBER),
+        ("usize", "16", NUMBER),
         ("i8", "0", NUMBER),
         ("i16", "0", NUMBER),
         ("i32", "0", NUMBER),
         ("i64", "0", NUMBER),
         ("i128", "0", NUMBER),
         ("isize", "0", NUMBER),
+        ("isize", "16", NUMBER),
         ("bool", "false", BOOL),
         ("&str", "\"str\"", STR),
         ("char", "'c'", CHAR),

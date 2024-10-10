@@ -1,6 +1,9 @@
-use ignore::DirEntry;
+use std::ffi::OsStr;
+use std::fs::File;
+use std::io::Read;
+use std::path::Path;
 
-use std::{ffi::OsStr, fs::File, io::Read, path::Path};
+use ignore::DirEntry;
 
 /// The default directory filter.
 pub fn filter_dirs(path: &Path) -> bool {
@@ -16,10 +19,12 @@ pub fn filter_dirs(path: &Path) -> bool {
         "library/stdarch",
         "src/tools/cargo",
         "src/tools/clippy",
+        "src/tools/libcxx-version",
         "src/tools/miri",
         "src/tools/rust-analyzer",
         "src/tools/rustc-perf",
         "src/tools/rustfmt",
+        "src/tools/enzyme",
         "src/doc/book",
         "src/doc/edition-guide",
         "src/doc/embedded-book",
@@ -27,6 +32,7 @@ pub fn filter_dirs(path: &Path) -> bool {
         "src/doc/rust-by-example",
         "src/doc/rustc-dev-guide",
         "src/doc/reference",
+        "src/gcc",
         // Filter RLS output directories
         "target/rls",
         "src/bootstrap/target",
@@ -78,13 +84,11 @@ pub(crate) fn walk_no_read(
     let walker = walker.filter_entry(move |e| {
         !skip(e.path(), e.file_type().map(|ft| ft.is_dir()).unwrap_or(false))
     });
-    for entry in walker.build() {
-        if let Ok(entry) = entry {
-            if entry.file_type().map_or(true, |kind| kind.is_dir() || kind.is_symlink()) {
-                continue;
-            }
-            f(&entry);
+    for entry in walker.build().flatten() {
+        if entry.file_type().map_or(true, |kind| kind.is_dir() || kind.is_symlink()) {
+            continue;
         }
+        f(&entry);
     }
 }
 
@@ -96,11 +100,9 @@ pub(crate) fn walk_dir(
 ) {
     let mut walker = ignore::WalkBuilder::new(path);
     let walker = walker.filter_entry(move |e| !skip(e.path()));
-    for entry in walker.build() {
-        if let Ok(entry) = entry {
-            if entry.path().is_dir() {
-                f(&entry);
-            }
+    for entry in walker.build().flatten() {
+        if entry.path().is_dir() {
+            f(&entry);
         }
     }
 }

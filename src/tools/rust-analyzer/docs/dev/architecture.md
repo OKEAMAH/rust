@@ -42,7 +42,7 @@ The underlying engine makes sure that model is computed lazily (on-demand) and c
 `crates/rust-analyzer/src/bin/main.rs` contains the main function which spawns LSP.
 This is *the* entry point, but it front-loads a lot of complexity, so it's fine to just skim through it.
 
-`crates/rust-analyzer/src/handlers.rs` implements all LSP requests and is a great place to start if you are already familiar with LSP.
+`crates/rust-analyzer/src/handlers/requests.rs` implements all LSP requests and is a great place to start if you are already familiar with LSP.
 
 `Analysis` and `AnalysisHost` types define the main API for consumers of IDE services.
 
@@ -368,7 +368,7 @@ In particular, we generate:
 
 * Documentation tests for assists
 
-See the `sourcegen` crate for details.
+See the `xtask\src\codegen\assists_doc_tests.rs` module for details.
 
 **Architecture Invariant:** we avoid bootstrapping.
 For codegen we need to parse Rust code.
@@ -408,7 +408,7 @@ It has a much richer vocabulary of types than `ide`, but the basic testing setup
 For comparisons, we use the `expect` crate for snapshot testing.
 
 To test various analysis corner cases and avoid forgetting about old tests, we use so-called marks.
-See the `marks` module in the `test_utils` crate for more.
+See the [cov_mark](https://docs.rs/cov-mark/latest/cov_mark/) crate documentation for more.
 
 **Architecture Invariant:** rust-analyzer tests do not use libcore or libstd.
 All required library code must be a part of the tests.

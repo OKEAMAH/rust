@@ -228,6 +228,27 @@
 //! [`Err(E)`]: Err
 //! [io::Error]: ../../std/io/struct.Error.html "io::Error"
 //!
+//! # Representation
+//!
+//! In some cases, [`Result<T, E>`] will gain the same size, alignment, and ABI
+//! guarantees as [`Option<U>`] has. One of either the `T` or `E` type must be a
+//! type that qualifies for the `Option` [representation guarantees][opt-rep],
+//! and the *other* type must meet all of the following conditions:
+//! * Is a zero-sized type with alignment 1 (a "1-ZST").
+//! * Has no fields.
+//! * Does not have the `#[non_exhaustive]` attribute.
+//!
+//! For example, `NonZeroI32` qualifies for the `Option` representation
+//! guarantees, and `()` is a zero-sized type with alignment 1, no fields, and
+//! it isn't `non_exhaustive`. This means that both `Result<NonZeroI32, ()>` and
+//! `Result<(), NonZeroI32>` have the same size, alignment, and ABI guarantees
+//! as `Option<NonZeroI32>`. The only difference is the implied semantics:
+//! * `Option<NonZeroI32>` is "a non-zero i32 might be present"
+//! * `Result<NonZeroI32, ()>` is "a non-zero i32 success result, if any"
+//! * `Result<(), NonZeroI32>` is "a non-zero i32 error result, if any"
+//!
+//! [opt-rep]: ../option/index.html#representation "Option Representation"
+//!
 //! # Method overview
 //!
 //! In addition to working with pattern matching, [`Result`] provides a
@@ -632,6 +653,7 @@ impl<T, E> Result<T, E> {
     /// ```
     #[inline]
     #[stable(feature = "rust1", since = "1.0.0")]
+    #[cfg_attr(not(test), rustc_diagnostic_item = "result_ok_method")]
     pub fn ok(self) -> Option<T> {
         match self {
             Ok(x) => Some(x),
@@ -1460,7 +1482,6 @@ impl<T, E> Result<T, E> {
     #[track_caller]
     #[stable(feature = "option_result_unwrap_unchecked", since = "1.58.0")]
     pub unsafe fn unwrap_unchecked(self) -> T {
-        debug_assert!(self.is_ok());
         match self {
             Ok(t) => t,
             // SAFETY: the safety contract must be upheld by the caller.
@@ -1492,7 +1513,6 @@ impl<T, E> Result<T, E> {
     #[track_caller]
     #[stable(feature = "option_result_unwrap_unchecked", since = "1.58.0")]
     pub unsafe fn unwrap_err_unchecked(self) -> E {
-        debug_assert!(self.is_err());
         match self {
             // SAFETY: the safety contract must be upheld by the caller.
             Ok(_) => unsafe { hint::unreachable_unchecked() },
@@ -1516,11 +1536,17 @@ impl<T, E> Result<&T, E> {
     /// ```
     #[inline]
     #[stable(feature = "result_copied", since = "1.59.0")]
-    pub fn copied(self) -> Result<T, E>
+    #[rustc_const_unstable(feature = "const_result", issue = "82814")]
+    pub const fn copied(self) -> Result<T, E>
     where
         T: Copy,
     {
-        self.map(|&t| t)
+        // FIXME(const-hack): this implementation, which sidesteps using `Result::map` since it's not const
+        // ready yet, should be reverted when possible to avoid code repetition
+        match self {
+            Ok(&v) => Ok(v),
+            Err(e) => Err(e),
+        }
     }
 
     /// Maps a `Result<&T, E>` to a `Result<T, E>` by cloning the contents of the
@@ -1560,11 +1586,17 @@ impl<T, E> Result<&mut T, E> {
     /// ```
     #[inline]
     #[stable(feature = "result_copied", since = "1.59.0")]
-    pub fn copied(self) -> Result<T, E>
+    #[rustc_const_unstable(feature = "const_result", issue = "82814")]
+    pub const fn copied(self) -> Result<T, E>
     where
         T: Copy,
     {
-        self.map(|&mut t| t)
+        // FIXME(const-hack): this implementation, which sidesteps using `Result::map` since it's not const
+        // ready yet, should be reverted when possible to avoid code repetition
+        match self {
+            Ok(&mut v) => Ok(v),
+            Err(e) => Err(e),
+        }
     }
 
     /// Maps a `Result<&mut T, E>` to a `Result<T, E>` by cloning the contents of the
@@ -1644,8 +1676,13 @@ impl<T, E> Result<Result<T, E>, E> {
     /// ```
     #[inline]
     #[unstable(feature = "result_flattening", issue = "70142")]
-    pub fn flatten(self) -> Result<T, E> {
-        self.and_then(convert::identity)
+    #[rustc_const_unstable(feature = "result_flattening", issue = "70142")]
+    pub const fn flatten(self) -> Result<T, E> {
+        // FIXME(const-hack): could be written with `and_then`
+        match self {
+            Ok(inner) => inner,
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -1969,7 +2006,7 @@ impl<T, E, F: From<E>> ops::FromResidual<Result<convert::Infallible, E>> for Res
         }
     }
 }
-
+#[diagnostic::do_not_recommend]
 #[unstable(feature = "try_trait_v2_yeet", issue = "96374")]
 impl<T, E, F: From<E>> ops::FromResidual<ops::Yeet<E>> for Result<T, F> {
     #[inline]

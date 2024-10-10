@@ -26,11 +26,11 @@
 #![feature(let_chains)]
 #![feature(min_specialization)]
 #![feature(negative_impls)]
-#![feature(new_uninit)]
 #![feature(read_buf)]
 #![feature(round_char_boundary)]
 #![feature(rustc_attrs)]
 #![feature(rustdoc_internals)]
+#![warn(unreachable_pub)]
 // tidy-alphabetical-end
 
 // The code produced by the `Encodable`/`Decodable` derive macros refer to
@@ -38,7 +38,8 @@
 // this crate without this line making `rustc_span` available.
 extern crate self as rustc_span;
 
-use rustc_data_structures::{outline, AtomicRef};
+use derive_where::derive_where;
+use rustc_data_structures::{AtomicRef, outline};
 use rustc_macros::{Decodable, Encodable, HashStable_Generic};
 use rustc_serialize::opaque::{FileEncoder, MemDecoder};
 use rustc_serialize::{Decodable, Decoder, Encodable, Encoder};
@@ -46,44 +47,46 @@ use tracing::debug;
 
 mod caching_source_map_view;
 pub mod source_map;
-pub use self::caching_source_map_view::CachingSourceMapView;
 use source_map::{SourceMap, SourceMapInputs};
+
+pub use self::caching_source_map_view::CachingSourceMapView;
 
 pub mod edition;
 use edition::Edition;
 pub mod hygiene;
 use hygiene::Transparency;
-pub use hygiene::{DesugaringKind, ExpnKind, MacroKind};
-pub use hygiene::{ExpnData, ExpnHash, ExpnId, LocalExpnId, SyntaxContext};
+pub use hygiene::{
+    DesugaringKind, ExpnData, ExpnHash, ExpnId, ExpnKind, LocalExpnId, MacroKind, SyntaxContext,
+};
 use rustc_data_structures::stable_hasher::HashingControls;
 pub mod def_id;
-use def_id::{CrateNum, DefId, DefIndex, DefPathHash, LocalDefId, StableCrateId, LOCAL_CRATE};
+use def_id::{CrateNum, DefId, DefIndex, DefPathHash, LOCAL_CRATE, LocalDefId, StableCrateId};
 pub mod edit_distance;
 mod span_encoding;
-pub use span_encoding::{Span, DUMMY_SP};
+pub use span_encoding::{DUMMY_SP, Span};
 
 pub mod symbol;
-pub use symbol::{sym, Symbol};
+pub use symbol::{Symbol, sym};
 
 mod analyze_source_file;
 pub mod fatal_error;
 
 pub mod profiling;
 
-use rustc_data_structures::fx::FxHashMap;
-use rustc_data_structures::stable_hasher::{Hash128, Hash64, HashStable, StableHasher};
-use rustc_data_structures::sync::{FreezeLock, FreezeWriteGuard, Lock, Lrc};
-
 use std::borrow::Cow;
 use std::cmp::{self, Ordering};
+use std::fmt::Display;
 use std::hash::Hash;
+use std::io::{self, Read};
 use std::ops::{Add, Range, Sub};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::{fmt, iter};
 
-use md5::Digest;
-use md5::Md5;
+use md5::{Digest, Md5};
+use rustc_data_structures::fx::FxHashMap;
+use rustc_data_structures::stable_hasher::{Hash64, Hash128, HashStable, StableHasher};
+use rustc_data_structures::sync::{FreezeLock, FreezeWriteGuard, Lock, Lrc};
 use sha1::Sha1;
 use sha2::Sha256;
 
@@ -271,7 +274,7 @@ impl RealFileName {
         }
     }
 
-    /// Return the path remmapped or not depending on the [`FileNameDisplayPreference`].
+    /// Return the path remapped or not depending on the [`FileNameDisplayPreference`].
     ///
     /// For the purpose of this function, local and short preference are equal.
     pub fn to_path(&self, display_pref: FileNameDisplayPreference) -> &Path {
@@ -468,43 +471,20 @@ impl FileName {
 /// sent to other threads, but some pieces of performance infra run in a separate thread.
 /// Using `Span` is generally preferred.
 #[derive(Clone, Copy, Hash, PartialEq, Eq)]
+#[derive_where(PartialOrd, Ord)]
 pub struct SpanData {
     pub lo: BytePos,
     pub hi: BytePos,
     /// Information about where the macro came from, if this piece of
     /// code was created by a macro expansion.
+    #[derive_where(skip)]
+    // `SyntaxContext` does not implement `Ord`.
+    // The other fields are enough to determine in-file order.
     pub ctxt: SyntaxContext,
+    #[derive_where(skip)]
+    // `LocalDefId` does not implement `Ord`.
+    // The other fields are enough to determine in-file order.
     pub parent: Option<LocalDefId>,
-}
-
-// Order spans by position in the file.
-impl Ord for SpanData {
-    fn cmp(&self, other: &Self) -> Ordering {
-        let SpanData {
-            lo: s_lo,
-            hi: s_hi,
-            ctxt: s_ctxt,
-            // `LocalDefId` does not implement `Ord`.
-            // The other fields are enough to determine in-file order.
-            parent: _,
-        } = self;
-        let SpanData {
-            lo: o_lo,
-            hi: o_hi,
-            ctxt: o_ctxt,
-            // `LocalDefId` does not implement `Ord`.
-            // The other fields are enough to determine in-file order.
-            parent: _,
-        } = other;
-
-        (s_lo, s_hi, s_ctxt).cmp(&(o_lo, o_hi, o_ctxt))
-    }
-}
-
-impl PartialOrd for SpanData {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
 }
 
 impl SpanData {
@@ -520,12 +500,14 @@ impl SpanData {
     pub fn with_hi(&self, hi: BytePos) -> Span {
         Span::new(self.lo, hi, self.ctxt, self.parent)
     }
+    /// Avoid if possible, `Span::map_ctxt` should be preferred.
     #[inline]
-    pub fn with_ctxt(&self, ctxt: SyntaxContext) -> Span {
+    fn with_ctxt(&self, ctxt: SyntaxContext) -> Span {
         Span::new(self.lo, self.hi, ctxt, self.parent)
     }
+    /// Avoid if possible, `Span::with_parent` should be preferred.
     #[inline]
-    pub fn with_parent(&self, parent: Option<LocalDefId>) -> Span {
+    fn with_parent(&self, parent: Option<LocalDefId>) -> Span {
         Span::new(self.lo, self.hi, self.ctxt, parent)
     }
     /// Returns `true` if this is a dummy span with any hygienic context.
@@ -577,15 +559,7 @@ impl Span {
     }
     #[inline]
     pub fn with_ctxt(self, ctxt: SyntaxContext) -> Span {
-        self.data_untracked().with_ctxt(ctxt)
-    }
-    #[inline]
-    pub fn parent(self) -> Option<LocalDefId> {
-        self.data().parent
-    }
-    #[inline]
-    pub fn with_parent(self, ctxt: Option<LocalDefId>) -> Span {
-        self.data().with_parent(ctxt)
+        self.map_ctxt(|_| ctxt)
     }
 
     #[inline]
@@ -680,6 +654,13 @@ impl Span {
         let span = self.data();
         let other = other.data();
         if span.hi > other.hi { Some(span.with_lo(cmp::max(span.lo, other.hi))) } else { None }
+    }
+
+    /// Returns `Some(span)`, where the end is trimmed by the start of `other`.
+    pub fn trim_end(self, other: Span) -> Option<Span> {
+        let span = self.data();
+        let other = other.data();
+        if span.lo < other.lo { Some(span.with_hi(cmp::min(span.hi, other.lo))) } else { None }
     }
 
     /// Returns the source span -- this is either the supplied span, or the span for
@@ -959,7 +940,7 @@ impl Span {
     /// This span, but in a larger context, may switch to the metavariable span if suitable.
     pub fn with_neighbor(self, neighbor: Span) -> Span {
         match Span::prepare_to_combine(self, neighbor) {
-            Ok((this, ..)) => Span::new(this.lo, this.hi, this.ctxt, this.parent),
+            Ok((this, ..)) => this.span(),
             Err(_) => self,
         }
     }
@@ -1052,39 +1033,46 @@ impl Span {
 
     #[inline]
     pub fn apply_mark(self, expn_id: ExpnId, transparency: Transparency) -> Span {
-        let span = self.data();
-        span.with_ctxt(span.ctxt.apply_mark(expn_id, transparency))
+        self.map_ctxt(|ctxt| ctxt.apply_mark(expn_id, transparency))
     }
 
     #[inline]
     pub fn remove_mark(&mut self) -> ExpnId {
-        let mut span = self.data();
-        let mark = span.ctxt.remove_mark();
-        *self = Span::new(span.lo, span.hi, span.ctxt, span.parent);
+        let mut mark = ExpnId::root();
+        *self = self.map_ctxt(|mut ctxt| {
+            mark = ctxt.remove_mark();
+            ctxt
+        });
         mark
     }
 
     #[inline]
     pub fn adjust(&mut self, expn_id: ExpnId) -> Option<ExpnId> {
-        let mut span = self.data();
-        let mark = span.ctxt.adjust(expn_id);
-        *self = Span::new(span.lo, span.hi, span.ctxt, span.parent);
+        let mut mark = None;
+        *self = self.map_ctxt(|mut ctxt| {
+            mark = ctxt.adjust(expn_id);
+            ctxt
+        });
         mark
     }
 
     #[inline]
     pub fn normalize_to_macros_2_0_and_adjust(&mut self, expn_id: ExpnId) -> Option<ExpnId> {
-        let mut span = self.data();
-        let mark = span.ctxt.normalize_to_macros_2_0_and_adjust(expn_id);
-        *self = Span::new(span.lo, span.hi, span.ctxt, span.parent);
+        let mut mark = None;
+        *self = self.map_ctxt(|mut ctxt| {
+            mark = ctxt.normalize_to_macros_2_0_and_adjust(expn_id);
+            ctxt
+        });
         mark
     }
 
     #[inline]
     pub fn glob_adjust(&mut self, expn_id: ExpnId, glob_span: Span) -> Option<Option<ExpnId>> {
-        let mut span = self.data();
-        let mark = span.ctxt.glob_adjust(expn_id, glob_span);
-        *self = Span::new(span.lo, span.hi, span.ctxt, span.parent);
+        let mut mark = None;
+        *self = self.map_ctxt(|mut ctxt| {
+            mark = ctxt.glob_adjust(expn_id, glob_span);
+            ctxt
+        });
         mark
     }
 
@@ -1094,22 +1082,22 @@ impl Span {
         expn_id: ExpnId,
         glob_span: Span,
     ) -> Option<Option<ExpnId>> {
-        let mut span = self.data();
-        let mark = span.ctxt.reverse_glob_adjust(expn_id, glob_span);
-        *self = Span::new(span.lo, span.hi, span.ctxt, span.parent);
+        let mut mark = None;
+        *self = self.map_ctxt(|mut ctxt| {
+            mark = ctxt.reverse_glob_adjust(expn_id, glob_span);
+            ctxt
+        });
         mark
     }
 
     #[inline]
     pub fn normalize_to_macros_2_0(self) -> Span {
-        let span = self.data();
-        span.with_ctxt(span.ctxt.normalize_to_macros_2_0())
+        self.map_ctxt(|ctxt| ctxt.normalize_to_macros_2_0())
     }
 
     #[inline]
     pub fn normalize_to_macro_rules(self) -> Span {
-        let span = self.data();
-        span.with_ctxt(span.ctxt.normalize_to_macro_rules())
+        self.map_ctxt(|ctxt| ctxt.normalize_to_macro_rules())
     }
 }
 
@@ -1347,7 +1335,7 @@ impl fmt::Debug for Span {
 
 impl fmt::Debug for SpanData {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Debug::fmt(&Span::new(self.lo, self.hi, self.ctxt, self.parent), f)
+        fmt::Debug::fmt(&self.span(), f)
     }
 }
 
@@ -1358,68 +1346,6 @@ pub struct MultiByteChar {
     pub pos: RelativeBytePos,
     /// The number of bytes, `>= 2`.
     pub bytes: u8,
-}
-
-/// Identifies an offset of a non-narrow character in a `SourceFile`.
-#[derive(Copy, Clone, Encodable, Decodable, Eq, PartialEq, Debug, HashStable_Generic)]
-pub enum NonNarrowChar {
-    /// Represents a zero-width character.
-    ZeroWidth(RelativeBytePos),
-    /// Represents a wide (full-width) character.
-    Wide(RelativeBytePos),
-    /// Represents a tab character, represented visually with a width of 4 characters.
-    Tab(RelativeBytePos),
-}
-
-impl NonNarrowChar {
-    fn new(pos: RelativeBytePos, width: usize) -> Self {
-        match width {
-            0 => NonNarrowChar::ZeroWidth(pos),
-            2 => NonNarrowChar::Wide(pos),
-            4 => NonNarrowChar::Tab(pos),
-            _ => panic!("width {width} given for non-narrow character"),
-        }
-    }
-
-    /// Returns the relative offset of the character in the `SourceFile`.
-    pub fn pos(&self) -> RelativeBytePos {
-        match *self {
-            NonNarrowChar::ZeroWidth(p) | NonNarrowChar::Wide(p) | NonNarrowChar::Tab(p) => p,
-        }
-    }
-
-    /// Returns the width of the character, 0 (zero-width) or 2 (wide).
-    pub fn width(&self) -> usize {
-        match *self {
-            NonNarrowChar::ZeroWidth(_) => 0,
-            NonNarrowChar::Wide(_) => 2,
-            NonNarrowChar::Tab(_) => 4,
-        }
-    }
-}
-
-impl Add<RelativeBytePos> for NonNarrowChar {
-    type Output = Self;
-
-    fn add(self, rhs: RelativeBytePos) -> Self {
-        match self {
-            NonNarrowChar::ZeroWidth(pos) => NonNarrowChar::ZeroWidth(pos + rhs),
-            NonNarrowChar::Wide(pos) => NonNarrowChar::Wide(pos + rhs),
-            NonNarrowChar::Tab(pos) => NonNarrowChar::Tab(pos + rhs),
-        }
-    }
-}
-
-impl Sub<RelativeBytePos> for NonNarrowChar {
-    type Output = Self;
-
-    fn sub(self, rhs: RelativeBytePos) -> Self {
-        match self {
-            NonNarrowChar::ZeroWidth(pos) => NonNarrowChar::ZeroWidth(pos - rhs),
-            NonNarrowChar::Wide(pos) => NonNarrowChar::Wide(pos - rhs),
-            NonNarrowChar::Tab(pos) => NonNarrowChar::Tab(pos - rhs),
-        }
-    }
 }
 
 /// Identifies an offset of a character that was normalized away from `SourceFile`.
@@ -1454,7 +1380,7 @@ pub enum ExternalSourceKind {
 }
 
 impl ExternalSource {
-    pub fn get_source(&self) -> Option<&Lrc<String>> {
+    pub fn get_source(&self) -> Option<&str> {
         match self {
             ExternalSource::Foreign { kind: ExternalSourceKind::Present(ref src), .. } => Some(src),
             _ => None,
@@ -1471,6 +1397,18 @@ pub enum SourceFileHashAlgorithm {
     Md5,
     Sha1,
     Sha256,
+    Blake3,
+}
+
+impl Display for SourceFileHashAlgorithm {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Md5 => "md5",
+            Self::Sha1 => "sha1",
+            Self::Sha256 => "sha256",
+            Self::Blake3 => "blake3",
+        })
+    }
 }
 
 impl FromStr for SourceFileHashAlgorithm {
@@ -1481,12 +1419,13 @@ impl FromStr for SourceFileHashAlgorithm {
             "md5" => Ok(SourceFileHashAlgorithm::Md5),
             "sha1" => Ok(SourceFileHashAlgorithm::Sha1),
             "sha256" => Ok(SourceFileHashAlgorithm::Sha256),
+            "blake3" => Ok(SourceFileHashAlgorithm::Blake3),
             _ => Err(()),
         }
     }
 }
 
-/// The hash of the on-disk source file used for debug info.
+/// The hash of the on-disk source file used for debug info and cargo freshness checks.
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Hash)]
 #[derive(HashStable_Generic, Encodable, Decodable)]
 pub struct SourceFileHash {
@@ -1494,12 +1433,22 @@ pub struct SourceFileHash {
     value: [u8; 32],
 }
 
+impl Display for SourceFileHash {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}=", self.kind)?;
+        for byte in self.value[0..self.hash_len()].into_iter() {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
 impl SourceFileHash {
-    pub fn new(kind: SourceFileHashAlgorithm, src: &str) -> SourceFileHash {
+    pub fn new_in_memory(kind: SourceFileHashAlgorithm, src: impl AsRef<[u8]>) -> SourceFileHash {
         let mut hash = SourceFileHash { kind, value: Default::default() };
         let len = hash.hash_len();
         let value = &mut hash.value[..len];
-        let data = src.as_bytes();
+        let data = src.as_ref();
         match kind {
             SourceFileHashAlgorithm::Md5 => {
                 value.copy_from_slice(&Md5::digest(data));
@@ -1510,13 +1459,94 @@ impl SourceFileHash {
             SourceFileHashAlgorithm::Sha256 => {
                 value.copy_from_slice(&Sha256::digest(data));
             }
-        }
+            SourceFileHashAlgorithm::Blake3 => value.copy_from_slice(blake3::hash(data).as_bytes()),
+        };
         hash
+    }
+
+    pub fn new(kind: SourceFileHashAlgorithm, src: impl Read) -> Result<SourceFileHash, io::Error> {
+        let mut hash = SourceFileHash { kind, value: Default::default() };
+        let len = hash.hash_len();
+        let value = &mut hash.value[..len];
+        // Buffer size is the recommended amount to fully leverage SIMD instructions on AVX-512 as per
+        // blake3 documentation.
+        let mut buf = vec![0; 16 * 1024];
+
+        fn digest<T>(
+            mut hasher: T,
+            mut update: impl FnMut(&mut T, &[u8]),
+            finish: impl FnOnce(T, &mut [u8]),
+            mut src: impl Read,
+            buf: &mut [u8],
+            value: &mut [u8],
+        ) -> Result<(), io::Error> {
+            loop {
+                let bytes_read = src.read(buf)?;
+                if bytes_read == 0 {
+                    break;
+                }
+                update(&mut hasher, &buf[0..bytes_read]);
+            }
+            finish(hasher, value);
+            Ok(())
+        }
+
+        match kind {
+            SourceFileHashAlgorithm::Sha256 => {
+                digest(
+                    Sha256::new(),
+                    |h, b| {
+                        h.update(b);
+                    },
+                    |h, out| out.copy_from_slice(&h.finalize()),
+                    src,
+                    &mut buf,
+                    value,
+                )?;
+            }
+            SourceFileHashAlgorithm::Sha1 => {
+                digest(
+                    Sha1::new(),
+                    |h, b| {
+                        h.update(b);
+                    },
+                    |h, out| out.copy_from_slice(&h.finalize()),
+                    src,
+                    &mut buf,
+                    value,
+                )?;
+            }
+            SourceFileHashAlgorithm::Md5 => {
+                digest(
+                    Md5::new(),
+                    |h, b| {
+                        h.update(b);
+                    },
+                    |h, out| out.copy_from_slice(&h.finalize()),
+                    src,
+                    &mut buf,
+                    value,
+                )?;
+            }
+            SourceFileHashAlgorithm::Blake3 => {
+                digest(
+                    blake3::Hasher::new(),
+                    |h, b| {
+                        h.update(b);
+                    },
+                    |h, out| out.copy_from_slice(h.finalize().as_bytes()),
+                    src,
+                    &mut buf,
+                    value,
+                )?;
+            }
+        }
+        Ok(hash)
     }
 
     /// Check if the stored hash matches the hash of the string.
     pub fn matches(&self, src: &str) -> bool {
-        Self::new(self.kind, src) == *self
+        Self::new_in_memory(self.kind, src.as_bytes()) == *self
     }
 
     /// The bytes of the hash.
@@ -1529,7 +1559,7 @@ impl SourceFileHash {
         match self.kind {
             SourceFileHashAlgorithm::Md5 => 16,
             SourceFileHashAlgorithm::Sha1 => 20,
-            SourceFileHashAlgorithm::Sha256 => 32,
+            SourceFileHashAlgorithm::Sha256 | SourceFileHashAlgorithm::Blake3 => 32,
         }
     }
 }
@@ -1585,6 +1615,10 @@ pub struct SourceFile {
     pub src: Option<Lrc<String>>,
     /// The source code's hash.
     pub src_hash: SourceFileHash,
+    /// Used to enable cargo to use checksums to check if a crate is fresh rather
+    /// than mtimes. This might be the same as `src_hash`, and if the requested algorithm
+    /// is identical we won't compute it twice.
+    pub checksum_hash: Option<SourceFileHash>,
     /// The external source code (used for external crates, which will have a `None`
     /// value as `self.src`.
     pub external_src: FreezeLock<ExternalSource>,
@@ -1596,8 +1630,6 @@ pub struct SourceFile {
     pub lines: FreezeLock<SourceFileLines>,
     /// Locations of multi-byte characters in the source code.
     pub multibyte_chars: Vec<MultiByteChar>,
-    /// Width of characters that are not narrow in the source code.
-    pub non_narrow_chars: Vec<NonNarrowChar>,
     /// Locations of characters removed during normalization.
     pub normalized_pos: Vec<NormalizedPos>,
     /// A hash of the filename & crate-id, used for uniquely identifying source
@@ -1614,12 +1646,12 @@ impl Clone for SourceFile {
             name: self.name.clone(),
             src: self.src.clone(),
             src_hash: self.src_hash,
+            checksum_hash: self.checksum_hash,
             external_src: self.external_src.clone(),
             start_pos: self.start_pos,
             source_len: self.source_len,
             lines: self.lines.clone(),
             multibyte_chars: self.multibyte_chars.clone(),
-            non_narrow_chars: self.non_narrow_chars.clone(),
             normalized_pos: self.normalized_pos.clone(),
             stable_id: self.stable_id,
             cnum: self.cnum,
@@ -1631,6 +1663,7 @@ impl<S: SpanEncoder> Encodable<S> for SourceFile {
     fn encode(&self, s: &mut S) {
         self.name.encode(s);
         self.src_hash.encode(s);
+        self.checksum_hash.encode(s);
         // Do not encode `start_pos` as it's global state for this session.
         self.source_len.encode(s);
 
@@ -1694,7 +1727,6 @@ impl<S: SpanEncoder> Encodable<S> for SourceFile {
         }
 
         self.multibyte_chars.encode(s);
-        self.non_narrow_chars.encode(s);
         self.stable_id.encode(s);
         self.normalized_pos.encode(s);
         self.cnum.encode(s);
@@ -1705,6 +1737,7 @@ impl<D: SpanDecoder> Decodable<D> for SourceFile {
     fn decode(d: &mut D) -> SourceFile {
         let name: FileName = Decodable::decode(d);
         let src_hash: SourceFileHash = Decodable::decode(d);
+        let checksum_hash: Option<SourceFileHash> = Decodable::decode(d);
         let source_len: RelativeBytePos = Decodable::decode(d);
         let lines = {
             let num_lines: u32 = Decodable::decode(d);
@@ -1721,7 +1754,6 @@ impl<D: SpanDecoder> Decodable<D> for SourceFile {
             }
         };
         let multibyte_chars: Vec<MultiByteChar> = Decodable::decode(d);
-        let non_narrow_chars: Vec<NonNarrowChar> = Decodable::decode(d);
         let stable_id = Decodable::decode(d);
         let normalized_pos: Vec<NormalizedPos> = Decodable::decode(d);
         let cnum: CrateNum = Decodable::decode(d);
@@ -1731,12 +1763,12 @@ impl<D: SpanDecoder> Decodable<D> for SourceFile {
             source_len,
             src: None,
             src_hash,
+            checksum_hash,
             // Unused - the metadata decoder will construct
             // a new SourceFile, filling in `external_src` properly
             external_src: FreezeLock::frozen(ExternalSource::Unneeded),
             lines: FreezeLock::new(lines),
             multibyte_chars,
-            non_narrow_chars,
             normalized_pos,
             stable_id,
             cnum,
@@ -1766,7 +1798,7 @@ impl fmt::Debug for SourceFile {
 /// is because SourceFiles for the local crate are allocated very early in the
 /// compilation process when the `StableCrateId` is not yet known. If, due to
 /// some refactoring of the compiler, the `StableCrateId` of the local crate
-/// were to become available, it would be better to uniformely make this a
+/// were to become available, it would be better to uniformly make this a
 /// hash of `(filename, stable_crate_id)`.
 ///
 /// When `SourceFile`s are exported in crate metadata, the `StableSourceFileId`
@@ -1815,28 +1847,35 @@ impl SourceFile {
         name: FileName,
         mut src: String,
         hash_kind: SourceFileHashAlgorithm,
+        checksum_hash_kind: Option<SourceFileHashAlgorithm>,
     ) -> Result<Self, OffsetOverflowError> {
         // Compute the file hash before any normalization.
-        let src_hash = SourceFileHash::new(hash_kind, &src);
+        let src_hash = SourceFileHash::new_in_memory(hash_kind, src.as_bytes());
+        let checksum_hash = checksum_hash_kind.map(|checksum_hash_kind| {
+            if checksum_hash_kind == hash_kind {
+                src_hash
+            } else {
+                SourceFileHash::new_in_memory(checksum_hash_kind, src.as_bytes())
+            }
+        });
         let normalized_pos = normalize_src(&mut src);
 
         let stable_id = StableSourceFileId::from_filename_in_current_crate(&name);
         let source_len = src.len();
         let source_len = u32::try_from(source_len).map_err(|_| OffsetOverflowError)?;
 
-        let (lines, multibyte_chars, non_narrow_chars) =
-            analyze_source_file::analyze_source_file(&src);
+        let (lines, multibyte_chars) = analyze_source_file::analyze_source_file(&src);
 
         Ok(SourceFile {
             name,
             src: Some(Lrc::new(src)),
             src_hash,
+            checksum_hash,
             external_src: FreezeLock::frozen(ExternalSource::Unneeded),
             start_pos: BytePos::from_u32(0),
             source_len: RelativeBytePos::from_u32(source_len),
             lines: FreezeLock::frozen(SourceFileLines::Lines(lines)),
             multibyte_chars,
-            non_narrow_chars,
             normalized_pos,
             stable_id,
             cnum: LOCAL_CRATE,
@@ -2145,38 +2184,42 @@ impl SourceFile {
         let pos = self.relative_position(pos);
         let (line, col_or_chpos) = self.lookup_file_pos(pos);
         if line > 0 {
-            let col = col_or_chpos;
-            let linebpos = self.lines()[line - 1];
-            let col_display = {
-                let start_width_idx = self
-                    .non_narrow_chars
-                    .binary_search_by_key(&linebpos, |x| x.pos())
-                    .unwrap_or_else(|x| x);
-                let end_width_idx = self
-                    .non_narrow_chars
-                    .binary_search_by_key(&pos, |x| x.pos())
-                    .unwrap_or_else(|x| x);
-                let special_chars = end_width_idx - start_width_idx;
-                let non_narrow: usize = self.non_narrow_chars[start_width_idx..end_width_idx]
-                    .iter()
-                    .map(|x| x.width())
-                    .sum();
-                col.0 - special_chars + non_narrow
+            let Some(code) = self.get_line(line - 1) else {
+                // If we don't have the code available, it is ok as a fallback to return the bytepos
+                // instead of the "display" column, which is only used to properly show underlines
+                // in the terminal.
+                // FIXME: we'll want better handling of this in the future for the sake of tools
+                // that want to use the display col instead of byte offsets to modify Rust code, but
+                // that is a problem for another day, the previous code was already incorrect for
+                // both displaying *and* third party tools using the json output naïvely.
+                tracing::info!("couldn't find line {line} {:?}", self.name);
+                return (line, col_or_chpos, col_or_chpos.0);
             };
-            (line, col, col_display)
+            let display_col = code.chars().take(col_or_chpos.0).map(|ch| char_width(ch)).sum();
+            (line, col_or_chpos, display_col)
         } else {
-            let chpos = col_or_chpos;
-            let col_display = {
-                let end_width_idx = self
-                    .non_narrow_chars
-                    .binary_search_by_key(&pos, |x| x.pos())
-                    .unwrap_or_else(|x| x);
-                let non_narrow: usize =
-                    self.non_narrow_chars[0..end_width_idx].iter().map(|x| x.width()).sum();
-                chpos.0 - end_width_idx + non_narrow
-            };
-            (0, chpos, col_display)
+            // This is never meant to happen?
+            (0, col_or_chpos, col_or_chpos.0)
         }
+    }
+}
+
+pub fn char_width(ch: char) -> usize {
+    // FIXME: `unicode_width` sometimes disagrees with terminals on how wide a `char` is. For now,
+    // just accept that sometimes the code line will be longer than desired.
+    match ch {
+        '\t' => 4,
+        // Keep the following list in sync with `rustc_errors::emitter::OUTPUT_REPLACEMENTS`. These
+        // are control points that we replace before printing with a visible codepoint for the sake
+        // of being able to point at them with underlines.
+        '\u{0000}' | '\u{0001}' | '\u{0002}' | '\u{0003}' | '\u{0004}' | '\u{0005}'
+        | '\u{0006}' | '\u{0007}' | '\u{0008}' | '\u{000B}' | '\u{000C}' | '\u{000D}'
+        | '\u{000E}' | '\u{000F}' | '\u{0010}' | '\u{0011}' | '\u{0012}' | '\u{0013}'
+        | '\u{0014}' | '\u{0015}' | '\u{0016}' | '\u{0017}' | '\u{0018}' | '\u{0019}'
+        | '\u{001A}' | '\u{001B}' | '\u{001C}' | '\u{001D}' | '\u{001E}' | '\u{001F}'
+        | '\u{007F}' | '\u{202A}' | '\u{202B}' | '\u{202D}' | '\u{202E}' | '\u{2066}'
+        | '\u{2067}' | '\u{2068}' | '\u{202C}' | '\u{2069}' => 1,
+        _ => unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1),
     }
 }
 

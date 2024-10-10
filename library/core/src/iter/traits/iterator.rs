@@ -1,20 +1,15 @@
+use super::super::{
+    ArrayChunks, ByRefSized, Chain, Cloned, Copied, Cycle, Enumerate, Filter, FilterMap, FlatMap,
+    Flatten, Fuse, Inspect, Intersperse, IntersperseWith, Map, MapWhile, MapWindows, Peekable,
+    Product, Rev, Scan, Skip, SkipWhile, StepBy, Sum, Take, TakeWhile, TrustedRandomAccessNoCoerce,
+    Zip, try_process,
+};
 use crate::array;
 use crate::cmp::{self, Ordering};
 use crate::num::NonZero;
 use crate::ops::{ChangeOutputType, ControlFlow, FromResidual, Residual, Try};
 
-use super::super::try_process;
-use super::super::ByRefSized;
-use super::super::TrustedRandomAccessNoCoerce;
-use super::super::{ArrayChunks, Chain, Cloned, Copied, Cycle, Enumerate, Filter, FilterMap, Fuse};
-use super::super::{FlatMap, Flatten};
-use super::super::{
-    Inspect, Map, MapWhile, MapWindows, Peekable, Rev, Scan, Skip, SkipWhile, StepBy, Take,
-    TakeWhile,
-};
-use super::super::{Intersperse, IntersperseWith, Product, Sum, Zip};
-
-fn _assert_is_object_safe(_: &dyn Iterator<Item = ()>) {}
+fn _assert_is_dyn_compatible(_: &dyn Iterator<Item = ()>) {}
 
 /// A trait for dealing with iterators.
 ///
@@ -823,7 +818,7 @@ pub trait Iterator {
     ///
     /// Given an element the closure must return `true` or `false`. The returned
     /// iterator will yield only the elements for which the closure returns
-    /// true.
+    /// `true`.
     ///
     /// # Examples
     ///
@@ -881,6 +876,7 @@ pub trait Iterator {
     #[inline]
     #[stable(feature = "rust1", since = "1.0.0")]
     #[rustc_do_not_const_check]
+    #[cfg_attr(not(test), rustc_diagnostic_item = "iter_filter")]
     fn filter<P>(self, predicate: P) -> Filter<Self, P>
     where
         Self: Sized,
@@ -2080,8 +2076,7 @@ pub trait Iterator {
     fn try_collect<B>(&mut self) -> ChangeOutputType<Self::Item, B>
     where
         Self: Sized,
-        <Self as Iterator>::Item: Try,
-        <<Self as Iterator>::Item as Try>::Residual: Residual<B>,
+        Self::Item: Try<Residual: Residual<B>>,
         B: FromIterator<<Self::Item as Try>::Output>,
     {
         try_process(ByRefSized(self), |i| i.collect())
@@ -2689,12 +2684,13 @@ pub trait Iterator {
     #[inline]
     #[unstable(feature = "iterator_try_reduce", reason = "new API", issue = "87053")]
     #[rustc_do_not_const_check]
-    fn try_reduce<F, R>(&mut self, f: F) -> ChangeOutputType<R, Option<R::Output>>
+    fn try_reduce<R>(
+        &mut self,
+        f: impl FnMut(Self::Item, Self::Item) -> R,
+    ) -> ChangeOutputType<R, Option<R::Output>>
     where
         Self: Sized,
-        F: FnMut(Self::Item, Self::Item) -> R,
-        R: Try<Output = Self::Item>,
-        R::Residual: Residual<Option<Self::Item>>,
+        R: Try<Output = Self::Item, Residual: Residual<Option<Self::Item>>>,
     {
         let first = match self.next() {
             Some(i) => i,
@@ -2956,12 +2952,13 @@ pub trait Iterator {
     #[inline]
     #[unstable(feature = "try_find", reason = "new API", issue = "63178")]
     #[rustc_do_not_const_check]
-    fn try_find<F, R>(&mut self, f: F) -> ChangeOutputType<R, Option<Self::Item>>
+    fn try_find<R>(
+        &mut self,
+        f: impl FnMut(&Self::Item) -> R,
+    ) -> ChangeOutputType<R, Option<Self::Item>>
     where
         Self: Sized,
-        F: FnMut(&Self::Item) -> R,
-        R: Try<Output = bool>,
-        R::Residual: Residual<Option<Self::Item>>,
+        R: Try<Output = bool, Residual: Residual<Option<Self::Item>>>,
     {
         #[inline]
         fn check<I, V, R>(
@@ -3416,6 +3413,7 @@ pub trait Iterator {
     /// ```
     #[stable(feature = "iter_copied", since = "1.36.0")]
     #[rustc_do_not_const_check]
+    #[cfg_attr(not(test), rustc_diagnostic_item = "iter_copied")]
     fn copied<'a, T: 'a>(self) -> Copied<Self>
     where
         Self: Sized + Iterator<Item = &'a T>,
@@ -3464,6 +3462,7 @@ pub trait Iterator {
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     #[rustc_do_not_const_check]
+    #[cfg_attr(not(test), rustc_diagnostic_item = "iter_cloned")]
     fn cloned<'a, T: 'a>(self) -> Cloned<Self>
     where
         Self: Sized + Iterator<Item = &'a T>,
@@ -3950,8 +3949,6 @@ pub trait Iterator {
     /// # Examples
     ///
     /// ```
-    /// #![feature(is_sorted)]
-    ///
     /// assert!([1, 2, 2, 9].iter().is_sorted());
     /// assert!(![1, 3, 2, 4].iter().is_sorted());
     /// assert!([0].iter().is_sorted());
@@ -3959,7 +3956,7 @@ pub trait Iterator {
     /// assert!(![0.0, 1.0, f32::NAN].iter().is_sorted());
     /// ```
     #[inline]
-    #[unstable(feature = "is_sorted", reason = "new API", issue = "53485")]
+    #[stable(feature = "is_sorted", since = "1.82.0")]
     #[rustc_do_not_const_check]
     fn is_sorted(self) -> bool
     where
@@ -3977,8 +3974,6 @@ pub trait Iterator {
     /// # Examples
     ///
     /// ```
-    /// #![feature(is_sorted)]
-    ///
     /// assert!([1, 2, 2, 9].iter().is_sorted_by(|a, b| a <= b));
     /// assert!(![1, 2, 2, 9].iter().is_sorted_by(|a, b| a < b));
     ///
@@ -3988,7 +3983,7 @@ pub trait Iterator {
     /// assert!(std::iter::empty::<i32>().is_sorted_by(|a, b| false));
     /// assert!(std::iter::empty::<i32>().is_sorted_by(|a, b| true));
     /// ```
-    #[unstable(feature = "is_sorted", reason = "new API", issue = "53485")]
+    #[stable(feature = "is_sorted", since = "1.82.0")]
     #[rustc_do_not_const_check]
     fn is_sorted_by<F>(mut self, compare: F) -> bool
     where
@@ -4029,13 +4024,11 @@ pub trait Iterator {
     /// # Examples
     ///
     /// ```
-    /// #![feature(is_sorted)]
-    ///
     /// assert!(["c", "bb", "aaa"].iter().is_sorted_by_key(|s| s.len()));
     /// assert!(![-2i32, -1, 0, 3].iter().is_sorted_by_key(|n| n.abs()));
     /// ```
     #[inline]
-    #[unstable(feature = "is_sorted", reason = "new API", issue = "53485")]
+    #[stable(feature = "is_sorted", since = "1.82.0")]
     #[rustc_do_not_const_check]
     fn is_sorted_by_key<F, K>(self, f: F) -> bool
     where

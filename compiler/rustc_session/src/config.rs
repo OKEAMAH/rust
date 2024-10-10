@@ -3,37 +3,38 @@
 
 #![allow(rustc::untranslatable_diagnostic)] // FIXME: make this translatable
 
-pub use crate::options::*;
+use std::collections::btree_map::{
+    Iter as BTreeMapIter, Keys as BTreeMapKeysIter, Values as BTreeMapValuesIter,
+};
+use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsStr;
+use std::hash::Hash;
+use std::path::{Path, PathBuf};
+use std::str::{self, FromStr};
+use std::sync::LazyLock;
+use std::{fmt, fs, iter};
 
-use crate::errors::FileWriteFail;
-use crate::search_paths::SearchPath;
-use crate::utils::{CanonicalizedPath, NativeLib, NativeLibKind};
-use crate::{filesearch, lint, HashStableContext};
-use crate::{EarlyDiagCtxt, Session};
 use rustc_data_structures::fx::{FxHashSet, FxIndexMap};
 use rustc_data_structures::stable_hasher::{StableOrd, ToStableHashKey};
 use rustc_errors::emitter::HumanReadableErrorType;
 use rustc_errors::{ColorConfig, DiagArgValue, DiagCtxtFlags, IntoDiagArg};
 use rustc_feature::UnstableFeatures;
 use rustc_macros::{Decodable, Encodable, HashStable_Generic};
-use rustc_span::edition::{Edition, DEFAULT_EDITION, EDITION_NAME_LIST, LATEST_STABLE_EDITION};
+use rustc_span::edition::{DEFAULT_EDITION, EDITION_NAME_LIST, Edition, LATEST_STABLE_EDITION};
 use rustc_span::source_map::FilePathMapping;
-use rustc_span::{FileName, FileNameDisplayPreference, RealFileName, SourceFileHashAlgorithm};
-use rustc_target::spec::{LinkSelfContainedComponents, LinkerFeatures};
-use rustc_target::spec::{SplitDebuginfo, Target, TargetTriple};
-use std::collections::btree_map::{
-    Iter as BTreeMapIter, Keys as BTreeMapKeysIter, Values as BTreeMapValuesIter,
+use rustc_span::{
+    FileName, FileNameDisplayPreference, RealFileName, SourceFileHashAlgorithm, Symbol, sym,
 };
-use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::OsStr;
-use std::fmt;
-use std::fs;
-use std::hash::Hash;
-use std::iter;
-use std::path::{Path, PathBuf};
-use std::str::{self, FromStr};
-use std::sync::LazyLock;
+use rustc_target::spec::{
+    FramePointer, LinkSelfContainedComponents, LinkerFeatures, SplitDebuginfo, Target, TargetTriple,
+};
 use tracing::debug;
+
+use crate::errors::FileWriteFail;
+pub use crate::options::*;
+use crate::search_paths::SearchPath;
+use crate::utils::{CanonicalizedPath, NativeLib, NativeLibKind};
+use crate::{EarlyDiagCtxt, HashStableContext, Session, filesearch, lint};
 
 mod cfg;
 pub mod sigpipe;
@@ -149,7 +150,14 @@ pub enum InstrumentCoverage {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub struct CoverageOptions {
     pub level: CoverageLevel,
-    // Other boolean or enum-valued options might be added here.
+
+    /// `-Z coverage-options=no-mir-spans`: Don't extract block coverage spans
+    /// from MIR statements/terminators, making it easier to inspect/debug
+    /// branch and MC/DC coverage mappings.
+    ///
+    /// For internal debugging only. If other code changes would make it hard
+    /// to keep supporting this flag, remove it.
+    pub no_mir_spans: bool,
 }
 
 /// Controls whether branch coverage or MC/DC coverage is enabled.
@@ -159,7 +167,23 @@ pub enum CoverageLevel {
     Block,
     /// Also instrument branch points (includes block coverage).
     Branch,
-    /// Instrument for MC/DC. Mostly a superset of branch coverage, but might
+    /// Same as branch coverage, but also adds branch instrumentation for
+    /// certain boolean expressions that are not directly used for branching.
+    ///
+    /// For example, in the following code, `b` does not directly participate
+    /// in a branch, but condition coverage will instrument it as its own
+    /// artificial branch:
+    /// ```
+    /// # let (a, b) = (false, true);
+    /// let x = a && b;
+    /// //           ^ last operand
+    /// ```
+    ///
+    /// This level is mainly intended to be a stepping-stone towards full MC/DC
+    /// instrumentation, so it might be removed in the future when MC/DC is
+    /// sufficiently complete, or if it is making MC/DC changes difficult.
+    Condition,
+    /// Instrument for MC/DC. Mostly a superset of condition coverage, but might
     /// differ in some corner cases.
     Mcdc,
 }
@@ -227,7 +251,7 @@ pub struct LinkSelfContained {
     pub explicitly_set: Option<bool>,
 
     /// The components that are enabled on the CLI, using the `+component` syntax or one of the
-    /// `true` shorcuts.
+    /// `true` shortcuts.
     enabled_components: LinkSelfContainedComponents,
 
     /// The components that are disabled on the CLI, using the `-component` syntax or one of the
@@ -289,13 +313,13 @@ impl LinkSelfContained {
     }
 
     /// Returns whether the self-contained linker component was enabled on the CLI, using the
-    /// `-C link-self-contained=+linker` syntax, or one of the `true` shorcuts.
+    /// `-C link-self-contained=+linker` syntax, or one of the `true` shortcuts.
     pub fn is_linker_enabled(&self) -> bool {
         self.enabled_components.contains(LinkSelfContainedComponents::LINKER)
     }
 
     /// Returns whether the self-contained linker component was disabled on the CLI, using the
-    /// `-C link-self-contained=-linker` syntax, or one of the `false` shorcuts.
+    /// `-C link-self-contained=-linker` syntax, or one of the `false` shortcuts.
     pub fn is_linker_disabled(&self) -> bool {
         self.disabled_components.contains(LinkSelfContainedComponents::LINKER)
     }
@@ -336,7 +360,7 @@ impl LinkerFeaturesCli {
         // Duplicate flags are reduced as we go, the last occurrence wins:
         // `+feature,-feature,+feature` only enables the feature, and does not record it as both
         // enabled and disabled on the CLI.
-        // We also only expose `+/-lld` at the moment, as it's currenty the only implemented linker
+        // We also only expose `+/-lld` at the moment, as it's currently the only implemented linker
         // feature and toggling `LinkerFeatures::CC` would be a noop.
         match feature {
             "+lld" => {
@@ -377,6 +401,23 @@ pub struct LocationDetail {
 impl LocationDetail {
     pub(crate) fn all() -> Self {
         Self { file: true, line: true, column: true }
+    }
+}
+
+/// Values for the `-Z fmt-debug` flag.
+#[derive(Copy, Clone, PartialEq, Hash, Debug)]
+pub enum FmtDebug {
+    /// Derive fully-featured implementation
+    Full,
+    /// Print only type name, without fields
+    Shallow,
+    /// `#[derive(Debug)]` and `{:?}` are no-ops
+    None,
+}
+
+impl FmtDebug {
+    pub(crate) fn all() -> [Symbol; 3] {
+        [sym::full, sym::none, sym::shallow]
     }
 }
 
@@ -465,6 +506,7 @@ impl FromStr for SplitDwarfKind {
 #[derive(Encodable, Decodable)]
 pub enum OutputType {
     Bitcode,
+    ThinLinkBitcode,
     Assembly,
     LlvmAssembly,
     Mir,
@@ -474,9 +516,11 @@ pub enum OutputType {
     DepInfo,
 }
 
-// Safety: Trivial C-Style enums have a stable sort order across compilation sessions.
-unsafe impl StableOrd for OutputType {
+impl StableOrd for OutputType {
     const CAN_USE_UNSTABLE_SORT: bool = true;
+
+    // Trivial C-Style enums have a stable sort order across compilation sessions.
+    const THIS_IMPLEMENTATION_HAS_BEEN_TRIPLE_CHECKED: () = ();
 }
 
 impl<HCX: HashStableContext> ToStableHashKey<HCX> for OutputType {
@@ -492,6 +536,7 @@ impl OutputType {
         match *self {
             OutputType::Exe | OutputType::DepInfo | OutputType::Metadata => true,
             OutputType::Bitcode
+            | OutputType::ThinLinkBitcode
             | OutputType::Assembly
             | OutputType::LlvmAssembly
             | OutputType::Mir
@@ -502,6 +547,7 @@ impl OutputType {
     pub fn shorthand(&self) -> &'static str {
         match *self {
             OutputType::Bitcode => "llvm-bc",
+            OutputType::ThinLinkBitcode => "thin-link-bitcode",
             OutputType::Assembly => "asm",
             OutputType::LlvmAssembly => "llvm-ir",
             OutputType::Mir => "mir",
@@ -518,6 +564,7 @@ impl OutputType {
             "llvm-ir" => OutputType::LlvmAssembly,
             "mir" => OutputType::Mir,
             "llvm-bc" => OutputType::Bitcode,
+            "thin-link-bitcode" => OutputType::ThinLinkBitcode,
             "obj" => OutputType::Object,
             "metadata" => OutputType::Metadata,
             "link" => OutputType::Exe,
@@ -528,8 +575,9 @@ impl OutputType {
 
     fn shorthands_display() -> String {
         format!(
-            "`{}`, `{}`, `{}`, `{}`, `{}`, `{}`, `{}`, `{}`",
+            "`{}`, `{}`, `{}`, `{}`, `{}`, `{}`, `{}`, `{}`, `{}`",
             OutputType::Bitcode.shorthand(),
+            OutputType::ThinLinkBitcode.shorthand(),
             OutputType::Assembly.shorthand(),
             OutputType::LlvmAssembly.shorthand(),
             OutputType::Mir.shorthand(),
@@ -543,6 +591,7 @@ impl OutputType {
     pub fn extension(&self) -> &'static str {
         match *self {
             OutputType::Bitcode => "bc",
+            OutputType::ThinLinkBitcode => "indexing.o",
             OutputType::Assembly => "s",
             OutputType::LlvmAssembly => "ll",
             OutputType::Mir => "mir",
@@ -559,9 +608,11 @@ impl OutputType {
             | OutputType::LlvmAssembly
             | OutputType::Mir
             | OutputType::DepInfo => true,
-            OutputType::Bitcode | OutputType::Object | OutputType::Metadata | OutputType::Exe => {
-                false
-            }
+            OutputType::Bitcode
+            | OutputType::ThinLinkBitcode
+            | OutputType::Object
+            | OutputType::Metadata
+            | OutputType::Exe => false,
         }
     }
 }
@@ -570,7 +621,7 @@ impl OutputType {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ErrorOutputType {
     /// Output meant for the consumption of humans.
-    HumanReadable(HumanReadableErrorType),
+    HumanReadable(HumanReadableErrorType, ColorConfig),
     /// Output that's consumed by other tools such as `rustfix` or the `RLS`.
     Json {
         /// Render the JSON in a human readable way (with indents and newlines).
@@ -578,12 +629,13 @@ pub enum ErrorOutputType {
         /// The JSON output includes a `rendered` field that includes the rendered
         /// human output.
         json_rendered: HumanReadableErrorType,
+        color_config: ColorConfig,
     },
 }
 
 impl Default for ErrorOutputType {
     fn default() -> Self {
-        Self::HumanReadable(HumanReadableErrorType::Default(ColorConfig::Auto))
+        Self::HumanReadable(HumanReadableErrorType::Default, ColorConfig::Auto)
     }
 }
 
@@ -644,6 +696,7 @@ impl OutputTypes {
     pub fn should_codegen(&self) -> bool {
         self.0.keys().any(|k| match *k {
             OutputType::Bitcode
+            | OutputType::ThinLinkBitcode
             | OutputType::Assembly
             | OutputType::LlvmAssembly
             | OutputType::Mir
@@ -657,6 +710,7 @@ impl OutputTypes {
     pub fn should_link(&self) -> bool {
         self.0.keys().any(|k| match *k {
             OutputType::Bitcode
+            | OutputType::ThinLinkBitcode
             | OutputType::Assembly
             | OutputType::LlvmAssembly
             | OutputType::Mir
@@ -763,6 +817,7 @@ pub enum PrintKind {
     TargetLibdir,
     CrateName,
     Cfg,
+    CheckCfg,
     CallingConventions,
     TargetList,
     TargetCPUs,
@@ -786,16 +841,6 @@ pub struct NextSolverConfig {
     /// Whether the new trait solver should be enabled everywhere.
     /// This is only `true` if `coherence` is also enabled.
     pub globally: bool,
-    /// Whether to dump proof trees after computing a proof tree.
-    pub dump_tree: DumpSolverProofTree,
-}
-
-#[derive(Default, Debug, Copy, Clone, Hash, PartialEq, Eq)]
-pub enum DumpSolverProofTree {
-    Always,
-    OnError,
-    #[default]
-    Never,
 }
 
 #[derive(Clone)]
@@ -813,10 +858,14 @@ pub enum Input {
 
 impl Input {
     pub fn filestem(&self) -> &str {
-        match *self {
-            Input::File(ref ifile) => ifile.file_stem().unwrap().to_str().unwrap(),
-            Input::Str { .. } => "rust_out",
+        if let Input::File(ifile) = self {
+            // If for some reason getting the file stem as a UTF-8 string fails,
+            // then fallback to a fixed name.
+            if let Some(name) = ifile.file_stem().and_then(OsStr::to_str) {
+                return name;
+            }
         }
+        "rust_out"
     }
 
     pub fn source_name(&self) -> FileName {
@@ -1053,7 +1102,7 @@ bitflags::bitflags! {
         const MACRO = 1 << 0;
         /// Apply remappings to printed compiler diagnostics
         const DIAGNOSTICS = 1 << 1;
-        /// Apply remappings to debug informations
+        /// Apply remappings to debug information
         const DEBUGINFO = 1 << 3;
 
         /// An alias for `macro` and `debuginfo`. This ensures all paths in compiled
@@ -1193,6 +1242,10 @@ impl UnstableOptions {
             }
         })
     }
+
+    pub fn checksum_hash_algorithm(&self) -> Option<SourceFileHashAlgorithm> {
+        self.checksum_hash_algorithm
+    }
 }
 
 // The type of entry function, so users can have their own entry functions
@@ -1275,7 +1328,10 @@ pub(crate) const fn default_lib_output() -> CrateType {
 }
 
 pub fn build_configuration(sess: &Session, mut user_cfg: Cfg) -> Cfg {
-    // Combine the configuration requested by the session (command line) with
+    // First disallow some configuration given on the command line
+    cfg::disallow_cfgs(sess, &user_cfg);
+
+    // Then combine the configuration requested by the session (command line) with
     // some default and generated configuration items.
     user_cfg.extend(cfg::default_configuration(sess));
     user_cfg
@@ -1286,6 +1342,20 @@ pub fn build_target_config(early_dcx: &EarlyDiagCtxt, opts: &Options, sysroot: &
         Ok((target, warnings)) => {
             for warning in warnings.warning_messages() {
                 early_dcx.early_warn(warning)
+            }
+
+            // The `wasm32-wasi` target is being renamed to `wasm32-wasip1` as
+            // part of rust-lang/compiler-team#607 and
+            // rust-lang/compiler-team#695. Warn unconditionally on usage to
+            // raise awareness of the renaming. This code will be deleted in
+            // October 2024.
+            if opts.target_triple.triple() == "wasm32-wasi" {
+                early_dcx.early_warn(
+                    "the `wasm32-wasi` target is being renamed to \
+                    `wasm32-wasip1` and the `wasm32-wasi` target will be \
+                    removed from nightly in October 2024 and removed from \
+                    stable Rust in January 2025",
+                )
             }
             if !matches!(target.pointer_width, 16 | 32 | 64) {
                 early_dcx.early_fatal(format!(
@@ -1310,7 +1380,7 @@ enum OptionStability {
 
 pub struct RustcOptGroup {
     pub apply: Box<dyn Fn(&mut getopts::Options) -> &mut getopts::Options>,
-    name: &'static str,
+    pub name: &'static str,
     stability: OptionStability,
 }
 
@@ -1443,7 +1513,7 @@ pub fn rustc_short_optgroups() -> Vec<RustcOptGroup> {
             "",
             "print",
             "Compiler information to print on stdout",
-            "[crate-name|file-names|sysroot|target-libdir|cfg|calling-conventions|\
+            "[crate-name|file-names|sysroot|target-libdir|cfg|check-cfg|calling-conventions|\
              target-list|target-cpus|target-features|relocation-models|code-models|\
              tls-models|target-spec-json|all-target-specs-json|native-static-libs|\
              stack-protector-strategies|link-args|deployment-target]",
@@ -1585,6 +1655,7 @@ pub fn parse_color(early_dcx: &EarlyDiagCtxt, matches: &getopts::Matches) -> Col
 /// Possible json config files
 pub struct JsonConfig {
     pub json_rendered: HumanReadableErrorType,
+    pub json_color: ColorConfig,
     json_artifact_notifications: bool,
     pub json_unused_externs: JsonUnusedExterns,
     json_future_incompat: bool,
@@ -1622,8 +1693,7 @@ impl JsonUnusedExterns {
 /// The first value returned is how to render JSON diagnostics, and the second
 /// is whether or not artifact notifications are enabled.
 pub fn parse_json(early_dcx: &EarlyDiagCtxt, matches: &getopts::Matches) -> JsonConfig {
-    let mut json_rendered: fn(ColorConfig) -> HumanReadableErrorType =
-        HumanReadableErrorType::Default;
+    let mut json_rendered = HumanReadableErrorType::Default;
     let mut json_color = ColorConfig::Never;
     let mut json_artifact_notifications = false;
     let mut json_unused_externs = JsonUnusedExterns::No;
@@ -1650,7 +1720,8 @@ pub fn parse_json(early_dcx: &EarlyDiagCtxt, matches: &getopts::Matches) -> Json
     }
 
     JsonConfig {
-        json_rendered: json_rendered(json_color),
+        json_rendered,
+        json_color,
         json_artifact_notifications,
         json_unused_externs,
         json_future_incompat,
@@ -1662,6 +1733,7 @@ pub fn parse_error_format(
     early_dcx: &mut EarlyDiagCtxt,
     matches: &getopts::Matches,
     color: ColorConfig,
+    json_color: ColorConfig,
     json_rendered: HumanReadableErrorType,
 ) -> ErrorOutputType {
     // We need the `opts_present` check because the driver will send us Matches
@@ -1671,18 +1743,22 @@ pub fn parse_error_format(
     let error_format = if matches.opts_present(&["error-format".to_owned()]) {
         match matches.opt_str("error-format").as_deref() {
             None | Some("human") => {
-                ErrorOutputType::HumanReadable(HumanReadableErrorType::Default(color))
+                ErrorOutputType::HumanReadable(HumanReadableErrorType::Default, color)
             }
             Some("human-annotate-rs") => {
-                ErrorOutputType::HumanReadable(HumanReadableErrorType::AnnotateSnippet(color))
+                ErrorOutputType::HumanReadable(HumanReadableErrorType::AnnotateSnippet, color)
             }
-            Some("json") => ErrorOutputType::Json { pretty: false, json_rendered },
-            Some("pretty-json") => ErrorOutputType::Json { pretty: true, json_rendered },
-            Some("short") => ErrorOutputType::HumanReadable(HumanReadableErrorType::Short(color)),
-
+            Some("json") => {
+                ErrorOutputType::Json { pretty: false, json_rendered, color_config: json_color }
+            }
+            Some("pretty-json") => {
+                ErrorOutputType::Json { pretty: true, json_rendered, color_config: json_color }
+            }
+            Some("short") => ErrorOutputType::HumanReadable(HumanReadableErrorType::Short, color),
             Some(arg) => {
                 early_dcx.abort_if_error_and_set_error_format(ErrorOutputType::HumanReadable(
-                    HumanReadableErrorType::Default(color),
+                    HumanReadableErrorType::Default,
+                    color,
                 ));
                 early_dcx.early_fatal(format!(
                     "argument for `--error-format` must be `human`, `json` or \
@@ -1691,7 +1767,7 @@ pub fn parse_error_format(
             }
         }
     } else {
-        ErrorOutputType::HumanReadable(HumanReadableErrorType::Default(color))
+        ErrorOutputType::HumanReadable(HumanReadableErrorType::Default, color)
     };
 
     match error_format {
@@ -1745,7 +1821,7 @@ fn check_error_format_stability(
         if let ErrorOutputType::Json { pretty: true, .. } = error_format {
             early_dcx.early_fatal("`--error-format=pretty-json` is unstable");
         }
-        if let ErrorOutputType::HumanReadable(HumanReadableErrorType::AnnotateSnippet(_)) =
+        if let ErrorOutputType::HumanReadable(HumanReadableErrorType::AnnotateSnippet, _) =
             error_format
         {
             early_dcx.early_fatal("`--error-format=human-annotate-rs` is unstable");
@@ -1769,6 +1845,12 @@ fn parse_output_types(
                         display = OutputType::shorthands_display(),
                     ))
                 });
+                if output_type == OutputType::ThinLinkBitcode && !unstable_opts.unstable_options {
+                    early_dcx.early_fatal(format!(
+                        "{} requested but -Zunstable-options not specified",
+                        OutputType::ThinLinkBitcode.shorthand()
+                    ));
+                }
                 output_types.insert(output_type, path);
             }
         }
@@ -1853,6 +1935,7 @@ fn collect_print_requests(
         ("all-target-specs-json", PrintKind::AllTargetSpecs),
         ("calling-conventions", PrintKind::CallingConventions),
         ("cfg", PrintKind::Cfg),
+        ("check-cfg", PrintKind::CheckCfg),
         ("code-models", PrintKind::CodeModels),
         ("crate-name", PrintKind::CrateName),
         ("deployment-target", PrintKind::DeploymentTarget),
@@ -1899,6 +1982,16 @@ fn collect_print_requests(
                     early_dcx.early_fatal(
                         "the `-Z unstable-options` flag must also be passed to \
                          enable the all-target-specs-json print option",
+                    );
+                }
+            }
+            Some((_, PrintKind::CheckCfg)) => {
+                if unstable_opts.unstable_options {
+                    PrintKind::CheckCfg
+                } else {
+                    early_dcx.early_fatal(
+                        "the `-Z unstable-options` flag must also be passed to \
+                         enable the check-cfg print option",
                     );
                 }
             }
@@ -2329,12 +2422,13 @@ pub fn build_session_options(early_dcx: &mut EarlyDiagCtxt, matches: &getopts::M
 
     let JsonConfig {
         json_rendered,
+        json_color,
         json_artifact_notifications,
         json_unused_externs,
         json_future_incompat,
     } = parse_json(early_dcx, matches);
 
-    let error_format = parse_error_format(early_dcx, matches, color, json_rendered);
+    let error_format = parse_error_format(early_dcx, matches, color, json_color, json_rendered);
 
     early_dcx.abort_if_error_and_set_error_format(error_format);
 
@@ -2469,6 +2563,15 @@ pub fn build_session_options(early_dcx: &mut EarlyDiagCtxt, matches: &getopts::M
         }
     }
 
+    if !nightly_options::is_unstable_enabled(matches)
+        && cg.force_frame_pointers == FramePointer::NonLeaf
+    {
+        early_dcx.early_fatal(
+            "`-Cforce-frame-pointers=non-leaf` or `always` also requires `-Zunstable-options` \
+                and a nightly compiler",
+        )
+    }
+
     // For testing purposes, until we have more feedback about these options: ensure `-Z
     // unstable-options` is required when using the unstable `-C link-self-contained` and `-C
     // linker-flavor` options.
@@ -2554,7 +2657,7 @@ pub fn build_session_options(early_dcx: &mut EarlyDiagCtxt, matches: &getopts::M
         // This is the location used by the `rust-src` `rustup` component.
         let mut candidate = sysroot.join("lib/rustlib/src/rust");
         if let Ok(metadata) = candidate.symlink_metadata() {
-            // Replace the symlink rustbuild creates, with its destination.
+            // Replace the symlink bootstrap creates, with its destination.
             // We could try to use `fs::canonicalize` instead, but that might
             // produce unnecessarily verbose path.
             if metadata.file_type().is_symlink() {
@@ -2699,9 +2802,10 @@ pub fn parse_crate_types_from_list(list_list: Vec<String>) -> Result<Vec<CrateTy
 }
 
 pub mod nightly_options {
+    use rustc_feature::UnstableFeatures;
+
     use super::{OptionStability, RustcOptGroup};
     use crate::EarlyDiagCtxt;
-    use rustc_feature::UnstableFeatures;
 
     pub fn is_unstable_enabled(matches: &getopts::Matches) -> bool {
         match_is_nightly_build(matches)
@@ -2812,6 +2916,7 @@ pub enum PpHirMode {
 }
 
 #[derive(Copy, Clone, PartialEq, Debug)]
+/// Pretty print mode
 pub enum PpMode {
     /// Options that print the source code, i.e.
     /// `-Zunpretty=normal` and `-Zunpretty=expanded`
@@ -2894,32 +2999,34 @@ pub enum WasiExecModel {
 /// we have an opt-in scheme here, so one is hopefully forced to think about
 /// how the hash should be calculated when adding a new command-line argument.
 pub(crate) mod dep_tracking {
-    use super::{
-        BranchProtection, CFGuard, CFProtection, CollapseMacroDebuginfo, CoverageOptions,
-        CrateType, DebugInfo, DebugInfoCompression, ErrorOutputType, FunctionReturn,
-        InliningThreshold, InstrumentCoverage, InstrumentXRay, LinkerPluginLto, LocationDetail,
-        LtoCli, NextSolverConfig, OomStrategy, OptLevel, OutFileName, OutputType, OutputTypes,
-        Polonius, RemapPathScopeComponents, ResolveDocLinks, SourceFileHashAlgorithm,
-        SplitDwarfKind, SwitchWithOptPath, SymbolManglingVersion, WasiExecModel,
-    };
-    use crate::lint;
-    use crate::utils::NativeLib;
-    use rustc_data_structures::fx::FxIndexMap;
-    use rustc_data_structures::stable_hasher::Hash64;
-    use rustc_errors::LanguageIdentifier;
-    use rustc_feature::UnstableFeatures;
-    use rustc_span::edition::Edition;
-    use rustc_span::RealFileName;
-    use rustc_target::spec::{
-        CodeModel, MergeFunctions, OnBrokenPipe, PanicStrategy, RelocModel, WasmCAbi,
-    };
-    use rustc_target::spec::{
-        RelroLevel, SanitizerSet, SplitDebuginfo, StackProtector, TargetTriple, TlsModel,
-    };
     use std::collections::BTreeMap;
     use std::hash::{DefaultHasher, Hash};
     use std::num::NonZero;
     use std::path::PathBuf;
+
+    use rustc_data_structures::fx::FxIndexMap;
+    use rustc_data_structures::stable_hasher::Hash64;
+    use rustc_errors::LanguageIdentifier;
+    use rustc_feature::UnstableFeatures;
+    use rustc_span::RealFileName;
+    use rustc_span::edition::Edition;
+    use rustc_target::spec::{
+        CodeModel, FramePointer, MergeFunctions, OnBrokenPipe, PanicStrategy, RelocModel,
+        RelroLevel, SanitizerSet, SplitDebuginfo, StackProtector, SymbolVisibility, TargetTriple,
+        TlsModel, WasmCAbi,
+    };
+
+    use super::{
+        BranchProtection, CFGuard, CFProtection, CollapseMacroDebuginfo, CoverageOptions,
+        CrateType, DebugInfo, DebugInfoCompression, ErrorOutputType, FmtDebug, FunctionReturn,
+        InliningThreshold, InstrumentCoverage, InstrumentXRay, LinkerPluginLto, LocationDetail,
+        LtoCli, NextSolverConfig, OomStrategy, OptLevel, OutFileName, OutputType, OutputTypes,
+        PatchableFunctionEntry, Polonius, RemapPathScopeComponents, ResolveDocLinks,
+        SourceFileHashAlgorithm, SplitDwarfKind, SwitchWithOptPath, SymbolManglingVersion,
+        WasiExecModel,
+    };
+    use crate::lint;
+    use crate::utils::NativeLib;
 
     pub(crate) trait DepTrackingHash {
         fn hash(
@@ -2968,6 +3075,7 @@ pub(crate) mod dep_tracking {
         lint::Level,
         WasiExecModel,
         u32,
+        FramePointer,
         RelocModel,
         CodeModel,
         TlsModel,
@@ -2998,16 +3106,19 @@ pub(crate) mod dep_tracking {
         StackProtector,
         SwitchWithOptPath,
         SymbolManglingVersion,
+        SymbolVisibility,
         RemapPathScopeComponents,
         SourceFileHashAlgorithm,
         OutFileName,
         OutputType,
         RealFileName,
         LocationDetail,
+        FmtDebug,
         BranchProtection,
         OomStrategy,
         LanguageIdentifier,
         NextSolverConfig,
+        PatchableFunctionEntry,
         Polonius,
         InliningThreshold,
         FunctionReturn,
@@ -3185,6 +3296,35 @@ impl DumpMonoStatsFormat {
     }
 }
 
+/// `-Z patchable-function-entry` representation - how many nops to put before and after function
+/// entry.
+#[derive(Clone, Copy, PartialEq, Hash, Debug, Default)]
+pub struct PatchableFunctionEntry {
+    /// Nops before the entry
+    prefix: u8,
+    /// Nops after the entry
+    entry: u8,
+}
+
+impl PatchableFunctionEntry {
+    pub fn from_total_and_prefix_nops(
+        total_nops: u8,
+        prefix_nops: u8,
+    ) -> Option<PatchableFunctionEntry> {
+        if total_nops < prefix_nops {
+            None
+        } else {
+            Some(Self { prefix: prefix_nops, entry: total_nops - prefix_nops })
+        }
+    }
+    pub fn prefix(&self) -> u8 {
+        self.prefix
+    }
+    pub fn entry(&self) -> u8 {
+        self.entry
+    }
+}
+
 /// `-Zpolonius` values, enabling the borrow checker polonius analysis, and which version: legacy,
 /// or future prototype.
 #[derive(Clone, Copy, PartialEq, Hash, Debug, Default)]
@@ -3234,4 +3374,26 @@ pub enum FunctionReturn {
 
     /// Replace returns with jumps to thunk, without emitting the thunk.
     ThunkExtern,
+}
+
+/// Whether extra span comments are included when dumping MIR, via the `-Z mir-include-spans` flag.
+/// By default, only enabled in the NLL MIR dumps, and disabled in all other passes.
+#[derive(Clone, Copy, Default, PartialEq, Debug)]
+pub enum MirIncludeSpans {
+    Off,
+    On,
+    /// Default: include extra comments in NLL MIR dumps only. Can be ignored and considered as
+    /// `Off` in all other cases.
+    #[default]
+    Nll,
+}
+
+impl MirIncludeSpans {
+    /// Unless opting into extra comments for all passes, they can be considered disabled.
+    /// The cases where a distinction between on/off and a per-pass value can exist will be handled
+    /// in the passes themselves: i.e. the `Nll` value is considered off for all intents and
+    /// purposes, except for the NLL MIR dump pass.
+    pub fn is_enabled(self) -> bool {
+        self == MirIncludeSpans::On
+    }
 }

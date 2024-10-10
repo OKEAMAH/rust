@@ -1,23 +1,24 @@
 //! Implements calling functions from a native library.
-use libffi::{high::call as ffi, low::CodePtr};
 use std::ops::Deref;
 
+use libffi::high::call as ffi;
+use libffi::low::CodePtr;
 use rustc_middle::ty::{self as ty, IntTy, UintTy};
 use rustc_span::Symbol;
 use rustc_target::abi::{Abi, HasDataLayout};
 
 use crate::*;
 
-impl<'mir, 'tcx: 'mir> EvalContextExtPriv<'mir, 'tcx> for crate::MiriInterpCx<'mir, 'tcx> {}
-trait EvalContextExtPriv<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
+impl<'tcx> EvalContextExtPriv<'tcx> for crate::MiriInterpCx<'tcx> {}
+trait EvalContextExtPriv<'tcx>: crate::MiriInterpCxExt<'tcx> {
     /// Call native host function and return the output as an immediate.
     fn call_native_with_args<'a>(
         &mut self,
         link_name: Symbol,
-        dest: &MPlaceTy<'tcx, Provenance>,
+        dest: &MPlaceTy<'tcx>,
         ptr: CodePtr,
         libffi_args: Vec<libffi::high::Arg<'a>>,
-    ) -> InterpResult<'tcx, ImmTy<'tcx, Provenance>> {
+    ) -> InterpResult<'tcx, ImmTy<'tcx>> {
         let this = self.eval_context_mut();
 
         // Call the function (`ptr`) with arguments `libffi_args`, and obtain the return value
@@ -72,11 +73,11 @@ trait EvalContextExtPriv<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             // have the output_type `Tuple([])`.
             ty::Tuple(t_list) if t_list.len() == 0 => {
                 unsafe { ffi::call::<()>(ptr, libffi_args.as_slice()) };
-                return Ok(ImmTy::uninit(dest.layout));
+                return interp_ok(ImmTy::uninit(dest.layout));
             }
             _ => throw_unsup_format!("unsupported return type for native call: {:?}", link_name),
         };
-        Ok(ImmTy::from_scalar(scalar, dest.layout))
+        interp_ok(ImmTy::from_scalar(scalar, dest.layout))
     }
 
     /// Get the pointer to the function of the specified name in the shared object file,
@@ -122,8 +123,8 @@ trait EvalContextExtPriv<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
     }
 }
 
-impl<'mir, 'tcx: 'mir> EvalContextExt<'mir, 'tcx> for crate::MiriInterpCx<'mir, 'tcx> {}
-pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
+impl<'tcx> EvalContextExt<'tcx> for crate::MiriInterpCx<'tcx> {}
+pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
     /// Call the native host function, with supplied arguments.
     /// Needs to convert all the arguments from their Miri representations to
     /// a native form (through `libffi` call).
@@ -132,8 +133,8 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
     fn call_native_fn(
         &mut self,
         link_name: Symbol,
-        dest: &MPlaceTy<'tcx, Provenance>,
-        args: &[OpTy<'tcx, Provenance>],
+        dest: &MPlaceTy<'tcx>,
+        args: &[OpTy<'tcx>],
     ) -> InterpResult<'tcx, bool> {
         let this = self.eval_context_mut();
         // Get the pointer to the function in the shared object file if it exists.
@@ -141,7 +142,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             Some(ptr) => ptr,
             None => {
                 // Shared object file does not export this function -- try the shims next.
-                return Ok(false);
+                return interp_ok(false);
             }
         };
 
@@ -163,7 +164,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         // Call the function and store output, depending on return type in the function signature.
         let ret = this.call_native_with_args(link_name, dest, code_ptr, libffi_args)?;
         this.write_immediate(*ret, dest)?;
-        Ok(true)
+        interp_ok(true)
     }
 }
 
@@ -194,6 +195,8 @@ enum CArg {
     UInt64(u64),
     /// usize.
     USize(usize),
+    /// Raw pointer, stored as C's `void*`.
+    RawPtr(*mut std::ffi::c_void),
 }
 
 impl<'a> CArg {
@@ -210,17 +213,15 @@ impl<'a> CArg {
             CArg::UInt32(i) => ffi::arg(i),
             CArg::UInt64(i) => ffi::arg(i),
             CArg::USize(i) => ffi::arg(i),
+            CArg::RawPtr(i) => ffi::arg(i),
         }
     }
 }
 
 /// Extract the scalar value from the result of reading a scalar from the machine,
 /// and convert it to a `CArg`.
-fn imm_to_carg<'tcx>(
-    v: ImmTy<'tcx, Provenance>,
-    cx: &impl HasDataLayout,
-) -> InterpResult<'tcx, CArg> {
-    Ok(match v.layout.ty.kind() {
+fn imm_to_carg<'tcx>(v: ImmTy<'tcx>, cx: &impl HasDataLayout) -> InterpResult<'tcx, CArg> {
+    interp_ok(match v.layout.ty.kind() {
         // If the primitive provided can be converted to a type matching the type pattern
         // then create a `CArg` of this primitive value with the corresponding `CArg` constructor.
         // the ints
@@ -237,6 +238,19 @@ fn imm_to_carg<'tcx>(
         ty::Uint(UintTy::U64) => CArg::UInt64(v.to_scalar().to_u64()?),
         ty::Uint(UintTy::Usize) =>
             CArg::USize(v.to_scalar().to_target_usize(cx)?.try_into().unwrap()),
+        ty::RawPtr(_, mutability) => {
+            // Arbitrary mutable pointer accesses are not currently supported in Miri.
+            if mutability.is_mut() {
+                throw_unsup_format!(
+                    "unsupported mutable pointer type for native call: {}",
+                    v.layout.ty
+                );
+            } else {
+                let s = v.to_scalar().to_pointer(cx)?.addr();
+                // This relies on the `expose_provenance` in `addr_from_alloc_id`.
+                CArg::RawPtr(std::ptr::with_exposed_provenance_mut(s.bytes_usize()))
+            }
+        }
         _ => throw_unsup_format!("unsupported argument type for native call: {}", v.layout.ty),
     })
 }

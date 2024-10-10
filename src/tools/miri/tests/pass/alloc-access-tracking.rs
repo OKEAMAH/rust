@@ -1,8 +1,8 @@
 #![feature(start)]
 #![no_std]
-//@compile-flags: -Zmiri-track-alloc-id=20 -Zmiri-track-alloc-accesses -Cpanic=abort
-//@normalize-stderr-test: "id 20" -> "id $$ALLOC"
-//@only-target-linux: alloc IDs differ between OSes (due to extern static allocations)
+//@compile-flags: -Zmiri-track-alloc-id=21 -Zmiri-track-alloc-accesses -Cpanic=abort
+//@normalize-stderr-test: "id 21" -> "id $$ALLOC"
+//@only-target: linux # alloc IDs differ between OSes (due to extern static allocations)
 
 extern "Rust" {
     fn miri_alloc(size: usize, align: usize) -> *mut u8;

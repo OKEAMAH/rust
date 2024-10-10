@@ -9,6 +9,7 @@ mod type_complexity;
 mod utils;
 mod vec_box;
 
+use clippy_config::Conf;
 use rustc_hir as hir;
 use rustc_hir::intravisit::FnKind;
 use rustc_hir::{
@@ -17,8 +18,8 @@ use rustc_hir::{
 };
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_session::impl_lint_pass;
-use rustc_span::def_id::LocalDefId;
 use rustc_span::Span;
+use rustc_span::def_id::LocalDefId;
 
 declare_clippy_lint! {
     /// ### What it does
@@ -217,7 +218,7 @@ declare_clippy_lint! {
     /// ### What it does
     /// Checks for `Rc<T>` and `Arc<T>` when `T` is a mutable buffer type such as `String` or `Vec`.
     ///
-    /// ### Why is this bad?
+    /// ### Why restrict this?
     /// Expressions such as `Rc<String>` usually have no advantage over `Rc<str>`, since
     /// it is larger and involves an extra level of indirection, and doesn't implement `Borrow<str>`.
     ///
@@ -260,8 +261,59 @@ declare_clippy_lint! {
     /// ### Example
     /// ```no_run
     /// # use std::rc::Rc;
-    /// struct Foo {
-    ///     inner: Rc<Vec<Vec<Box<(u32, u32, u32, u32)>>>>,
+    /// struct PointMatrixContainer {
+    ///     matrix: Rc<Vec<Vec<Box<(u32, u32, u32, u32)>>>>,
+    /// }
+    ///
+    /// fn main() {
+    ///     let point_matrix: Vec<Vec<Box<(u32, u32, u32, u32)>>> = vec![
+    ///         vec![
+    ///             Box::new((1, 2, 3, 4)),
+    ///             Box::new((5, 6, 7, 8)),
+    ///         ],
+    ///         vec![
+    ///             Box::new((9, 10, 11, 12)),
+    ///         ],
+    ///     ];
+    ///
+    ///     let shared_point_matrix: Rc<Vec<Vec<Box<(u32, u32, u32, u32)>>>> = Rc::new(point_matrix);
+    ///
+    ///     let container = PointMatrixContainer {
+    ///         matrix: shared_point_matrix,
+    ///     };
+    ///
+    ///     // ...
+    /// }
+    /// ```
+    /// Use instead:
+    /// ### Example
+    /// ```no_run
+    /// # use std::rc::Rc;
+    /// type PointMatrix = Vec<Vec<Box<(u32, u32, u32, u32)>>>;
+    /// type SharedPointMatrix = Rc<PointMatrix>;
+    ///
+    /// struct PointMatrixContainer {
+    ///     matrix: SharedPointMatrix,
+    /// }
+    ///
+    /// fn main() {
+    ///     let point_matrix: PointMatrix = vec![
+    ///         vec![
+    ///             Box::new((1, 2, 3, 4)),
+    ///             Box::new((5, 6, 7, 8)),
+    ///         ],
+    ///         vec![
+    ///             Box::new((9, 10, 11, 12)),
+    ///         ],
+    ///     ];
+    ///
+    ///     let shared_point_matrix: SharedPointMatrix = Rc::new(point_matrix);
+    ///
+    ///     let container = PointMatrixContainer {
+    ///         matrix: shared_point_matrix,
+    ///     };
+    ///
+    ///     // ...
     /// }
     /// ```
     #[clippy::version = "pre 1.29.0"]
@@ -274,7 +326,7 @@ declare_clippy_lint! {
     /// ### What it does
     /// Checks for `Rc<Mutex<T>>`.
     ///
-    /// ### Why is this bad?
+    /// ### Why restrict this?
     /// `Rc` is used in single thread and `Mutex` is used in multi thread.
     /// Consider using `Rc<RefCell<T>>` in single thread or `Arc<Mutex<T>>` in multi thread.
     ///
@@ -334,30 +386,22 @@ impl<'tcx> LateLintPass<'tcx> for Types {
 
         let is_exported = cx.effective_visibilities.is_exported(def_id);
 
-        self.check_fn_decl(
-            cx,
-            decl,
-            CheckTyContext {
-                is_in_trait_impl,
-                is_exported,
-                in_body: matches!(fn_kind, FnKind::Closure),
-                ..CheckTyContext::default()
-            },
-        );
+        self.check_fn_decl(cx, decl, CheckTyContext {
+            is_in_trait_impl,
+            is_exported,
+            in_body: matches!(fn_kind, FnKind::Closure),
+            ..CheckTyContext::default()
+        });
     }
 
     fn check_item(&mut self, cx: &LateContext<'tcx>, item: &'tcx Item<'tcx>) {
         let is_exported = cx.effective_visibilities.is_exported(item.owner_id.def_id);
 
         match item.kind {
-            ItemKind::Static(ty, _, _) | ItemKind::Const(ty, _, _) => self.check_ty(
-                cx,
-                ty,
-                CheckTyContext {
-                    is_exported,
-                    ..CheckTyContext::default()
-                },
-            ),
+            ItemKind::Static(ty, _, _) | ItemKind::Const(ty, _, _) => self.check_ty(cx, ty, CheckTyContext {
+                is_exported,
+                ..CheckTyContext::default()
+            }),
             // functions, enums, structs, impls and traits are covered
             _ => (),
         }
@@ -375,14 +419,10 @@ impl<'tcx> LateLintPass<'tcx> for Types {
                     false
                 };
 
-                self.check_ty(
-                    cx,
-                    ty,
-                    CheckTyContext {
-                        is_in_trait_impl,
-                        ..CheckTyContext::default()
-                    },
-                );
+                self.check_ty(cx, ty, CheckTyContext {
+                    is_in_trait_impl,
+                    ..CheckTyContext::default()
+                });
             },
             // Methods are covered by check_fn.
             // Type aliases are ignored because oftentimes it's impossible to
@@ -398,14 +438,10 @@ impl<'tcx> LateLintPass<'tcx> for Types {
 
         let is_exported = cx.effective_visibilities.is_exported(field.def_id);
 
-        self.check_ty(
-            cx,
-            field.ty,
-            CheckTyContext {
-                is_exported,
-                ..CheckTyContext::default()
-            },
-        );
+        self.check_ty(cx, field.ty, CheckTyContext {
+            is_exported,
+            ..CheckTyContext::default()
+        });
     }
 
     fn check_trait_item(&mut self, cx: &LateContext<'tcx>, item: &TraitItem<'tcx>) {
@@ -433,24 +469,20 @@ impl<'tcx> LateLintPass<'tcx> for Types {
 
     fn check_local(&mut self, cx: &LateContext<'tcx>, local: &LetStmt<'tcx>) {
         if let Some(ty) = local.ty {
-            self.check_ty(
-                cx,
-                ty,
-                CheckTyContext {
-                    in_body: true,
-                    ..CheckTyContext::default()
-                },
-            );
+            self.check_ty(cx, ty, CheckTyContext {
+                in_body: true,
+                ..CheckTyContext::default()
+            });
         }
     }
 }
 
 impl Types {
-    pub fn new(vec_box_size_threshold: u64, type_complexity_threshold: u64, avoid_breaking_exported_api: bool) -> Self {
+    pub fn new(conf: &'static Conf) -> Self {
         Self {
-            vec_box_size_threshold,
-            type_complexity_threshold,
-            avoid_breaking_exported_api,
+            vec_box_size_threshold: conf.vec_box_size_threshold,
+            type_complexity_threshold: conf.type_complexity_threshold,
+            avoid_breaking_exported_api: conf.avoid_breaking_exported_api,
         }
     }
 

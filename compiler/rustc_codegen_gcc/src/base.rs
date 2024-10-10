@@ -1,11 +1,12 @@
 use std::collections::HashSet;
 use std::env;
+use std::sync::Arc;
 use std::time::Instant;
 
-use gccjit::{FunctionType, GlobalKind};
+use gccjit::{CType, FunctionType, GlobalKind};
 use rustc_codegen_ssa::base::maybe_create_entry_wrapper;
 use rustc_codegen_ssa::mono_item::MonoItemExt;
-use rustc_codegen_ssa::traits::DebugInfoMethods;
+use rustc_codegen_ssa::traits::DebugInfoCodegenMethods;
 use rustc_codegen_ssa::{ModuleCodegen, ModuleKind};
 use rustc_middle::dep_graph;
 use rustc_middle::mir::mono::Linkage;
@@ -18,8 +19,7 @@ use rustc_target::spec::PanicStrategy;
 
 use crate::builder::Builder;
 use crate::context::CodegenCx;
-use crate::GccContext;
-use crate::{gcc_util, new_context, LockedTargetInfo};
+use crate::{GccContext, LockedTargetInfo, SyncContext, gcc_util, new_context};
 
 #[cfg(feature = "master")]
 pub fn visibility_to_gcc(linkage: Visibility) -> gccjit::Visibility {
@@ -128,14 +128,25 @@ pub fn compile_codegen_unit(
         // NOTE: Rust relies on LLVM doing wrapping on overflow.
         context.add_command_line_option("-fwrapv");
 
+        if let Some(model) = tcx.sess.code_model() {
+            use rustc_target::spec::CodeModel;
+
+            context.add_command_line_option(match model {
+                CodeModel::Tiny => "-mcmodel=tiny",
+                CodeModel::Small => "-mcmodel=small",
+                CodeModel::Kernel => "-mcmodel=kernel",
+                CodeModel::Medium => "-mcmodel=medium",
+                CodeModel::Large => "-mcmodel=large",
+            });
+        }
+
         if tcx.sess.relocation_model() == rustc_target::spec::RelocModel::Static {
-            context.add_command_line_option("-mcmodel=kernel");
             context.add_command_line_option("-fno-pie");
         }
 
         let target_cpu = gcc_util::target_cpu(tcx.sess);
         if target_cpu != "generic" {
-            context.add_command_line_option(&format!("-march={}", target_cpu));
+            context.add_command_line_option(format!("-march={}", target_cpu));
         }
 
         if tcx
@@ -181,7 +192,24 @@ pub fn compile_codegen_unit(
         context.set_allow_unreachable_blocks(true);
 
         {
-            let cx = CodegenCx::new(&context, cgu, tcx, target_info.supports_128bit_int());
+            // TODO: to make it less error-prone (calling get_target_info() will add the flag
+            // -fsyntax-only), forbid the compilation when get_target_info() is called on a
+            // context.
+            let f16_type_supported = target_info.supports_target_dependent_type(CType::Float16);
+            let f32_type_supported = target_info.supports_target_dependent_type(CType::Float32);
+            let f64_type_supported = target_info.supports_target_dependent_type(CType::Float64);
+            let f128_type_supported = target_info.supports_target_dependent_type(CType::Float128);
+            // TODO: improve this to avoid passing that many arguments.
+            let cx = CodegenCx::new(
+                &context,
+                cgu,
+                tcx,
+                target_info.supports_128bit_int(),
+                f16_type_supported,
+                f32_type_supported,
+                f64_type_supported,
+                f128_type_supported,
+            );
 
             let mono_items = cgu.items_in_deterministic_order(tcx);
             for &(mono_item, data) in &mono_items {
@@ -205,7 +233,11 @@ pub fn compile_codegen_unit(
 
         ModuleCodegen {
             name: cgu_name.to_string(),
-            module_llvm: GccContext { context, should_combine_object_files: false, temp_dir: None },
+            module_llvm: GccContext {
+                context: Arc::new(SyncContext::new(context)),
+                should_combine_object_files: false,
+                temp_dir: None,
+            },
             kind: ModuleKind::Regular,
         }
     }

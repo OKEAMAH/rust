@@ -1,14 +1,14 @@
-use crate::fmt;
-use crate::fmt::Formatter;
-use crate::fmt::Write;
-use crate::iter::FusedIterator;
-
 use super::from_utf8_unchecked;
 use super::validations::utf8_char_width;
+use crate::fmt;
+use crate::fmt::{Formatter, Write};
+use crate::iter::FusedIterator;
 
 impl [u8] {
     /// Creates an iterator over the contiguous valid UTF-8 ranges of this
     /// slice, and the non-UTF-8 fragments in between.
+    ///
+    /// See the [`Utf8Chunk`] type for documenation of the items yielded by this iterator.
     ///
     /// # Examples
     ///
@@ -149,6 +149,8 @@ impl fmt::Debug for Debug<'_> {
 ///
 /// If you want a simple conversion from UTF-8 byte slices to string slices,
 /// [`from_utf8`] is easier to use.
+///
+/// See the [`Utf8Chunk`] type for documenation of the items yielded by this iterator.
 ///
 /// [byteslice]: slice
 /// [`from_utf8`]: super::from_utf8

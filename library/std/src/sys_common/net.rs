@@ -1,19 +1,14 @@
 #[cfg(test)]
 mod tests;
 
-use crate::cmp;
-use crate::fmt;
+use crate::ffi::{c_int, c_void};
 use crate::io::{self, BorrowedCursor, ErrorKind, IoSlice, IoSliceMut};
-use crate::mem;
 use crate::net::{Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr};
-use crate::ptr;
 use crate::sys::common::small_c_string::run_with_cstr;
-use crate::sys::net::netc as c;
-use crate::sys::net::{cvt, cvt_gai, cvt_r, init, wrlen_t, Socket};
+use crate::sys::net::{Socket, cvt, cvt_gai, cvt_r, init, netc as c, wrlen_t};
 use crate::sys_common::{AsInner, FromInner, IntoInner};
 use crate::time::Duration;
-
-use crate::ffi::{c_int, c_void};
+use crate::{cmp, fmt, mem, ptr};
 
 cfg_if::cfg_if! {
     if #[cfg(any(
@@ -26,6 +21,7 @@ cfg_if::cfg_if! {
         target_os = "haiku",
         target_os = "l4re",
         target_os = "nto",
+        target_os = "nuttx",
         target_vendor = "apple",
     ))] {
         use crate::sys::net::netc::IPV6_JOIN_GROUP as IPV6_ADD_MEMBERSHIP;
@@ -42,6 +38,7 @@ cfg_if::cfg_if! {
         target_os = "hurd",
         target_os = "dragonfly", target_os = "freebsd",
         target_os = "openbsd", target_os = "netbsd",
+        target_os = "solaris", target_os = "illumos",
         target_os = "haiku", target_os = "nto"))] {
         use libc::MSG_NOSIGNAL;
     } else {
@@ -77,7 +74,7 @@ pub fn setsockopt<T>(
             sock.as_raw(),
             level,
             option_name,
-            core::ptr::addr_of!(option_value) as *const _,
+            (&raw const option_value) as *const _,
             mem::size_of::<T>() as c::socklen_t,
         ))?;
         Ok(())
@@ -92,7 +89,7 @@ pub fn getsockopt<T: Copy>(sock: &Socket, level: c_int, option_name: c_int) -> i
             sock.as_raw(),
             level,
             option_name,
-            core::ptr::addr_of_mut!(option_value) as *mut _,
+            (&raw mut option_value) as *mut _,
             &mut option_len,
         ))?;
         Ok(option_value)
@@ -106,7 +103,7 @@ where
     unsafe {
         let mut storage: c::sockaddr_storage = mem::zeroed();
         let mut len = mem::size_of_val(&storage) as c::socklen_t;
-        cvt(f(core::ptr::addr_of_mut!(storage) as *mut _, &mut len))?;
+        cvt(f((&raw mut storage) as *mut _, &mut len))?;
         sockaddr_to_addr(&storage, len as usize)
     }
 }
@@ -455,7 +452,7 @@ impl TcpListener {
     pub fn accept(&self) -> io::Result<(TcpStream, SocketAddr)> {
         let mut storage: c::sockaddr_storage = unsafe { mem::zeroed() };
         let mut len = mem::size_of_val(&storage) as c::socklen_t;
-        let sock = self.inner.accept(core::ptr::addr_of_mut!(storage) as *mut _, &mut len)?;
+        let sock = self.inner.accept((&raw mut storage) as *mut _, &mut len)?;
         let addr = sockaddr_to_addr(&storage, len as usize)?;
         Ok((TcpStream { inner: sock }, addr))
     }

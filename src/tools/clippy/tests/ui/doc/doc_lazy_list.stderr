@@ -1,4 +1,4 @@
-error: doc list item missing indentation
+error: doc list item without indentation
   --> tests/ui/doc/doc_lazy_list.rs:4:5
    |
 LL | /// lazy continuation
@@ -12,7 +12,7 @@ help: indent this line
 LL | ///    lazy continuation
    |     +++
 
-error: doc list item missing indentation
+error: doc list item without indentation
   --> tests/ui/doc/doc_lazy_list.rs:9:5
    |
 LL | /// lazy list continuations don't make warnings with this lint
@@ -24,7 +24,7 @@ help: indent this line
 LL | ///    lazy list continuations don't make warnings with this lint
    |     +++
 
-error: doc list item missing indentation
+error: doc list item without indentation
   --> tests/ui/doc/doc_lazy_list.rs:11:5
    |
 LL | /// because they don't have the
@@ -36,7 +36,7 @@ help: indent this line
 LL | ///    because they don't have the
    |     +++
 
-error: doc list item missing indentation
+error: doc list item without indentation
   --> tests/ui/doc/doc_lazy_list.rs:16:5
    |
 LL | /// lazy continuation
@@ -48,7 +48,7 @@ help: indent this line
 LL | ///     lazy continuation
    |     ++++
 
-error: doc list item missing indentation
+error: doc list item without indentation
   --> tests/ui/doc/doc_lazy_list.rs:21:5
    |
 LL | /// lazy list continuations don't make warnings with this lint
@@ -60,7 +60,7 @@ help: indent this line
 LL | ///     lazy list continuations don't make warnings with this lint
    |     ++++
 
-error: doc list item missing indentation
+error: doc list item without indentation
   --> tests/ui/doc/doc_lazy_list.rs:23:5
    |
 LL | /// because they don't have the
@@ -72,7 +72,7 @@ help: indent this line
 LL | ///     because they don't have the
    |     ++++
 
-error: doc list item missing indentation
+error: doc list item without indentation
   --> tests/ui/doc/doc_lazy_list.rs:28:5
    |
 LL | /// lazy continuation
@@ -84,7 +84,7 @@ help: indent this line
 LL | ///     lazy continuation
    |     ++++
 
-error: doc list item missing indentation
+error: doc list item without indentation
   --> tests/ui/doc/doc_lazy_list.rs:33:5
    |
 LL | /// this will warn on the lazy continuation
@@ -96,7 +96,7 @@ help: indent this line
 LL | ///       this will warn on the lazy continuation
    |     ++++++
 
-error: doc list item missing indentation
+error: doc list item without indentation
   --> tests/ui/doc/doc_lazy_list.rs:35:5
    |
 LL | ///     and so should this
@@ -108,7 +108,7 @@ help: indent this line
 LL | ///       and so should this
    |         ++
 
-error: doc list item missing indentation
+error: doc list item without indentation
   --> tests/ui/doc/doc_lazy_list.rs:56:5
    |
 LL | ///  'protocol_descriptors': [
@@ -120,7 +120,7 @@ help: indent this line
 LL | ///   'protocol_descriptors': [
    |      +
 
-error: doc list item missing indentation
+error: doc list item without indentation
   --> tests/ui/doc/doc_lazy_list.rs:75:5
    |
 LL | ///  ]

@@ -1,14 +1,12 @@
-use crate::{
-    lints::{SupertraitAsDerefTarget, SupertraitAsDerefTargetLabel},
-    LateContext, LateLintPass, LintContext,
-};
-
-use rustc_hir as hir;
+use rustc_hir::{self as hir, LangItem};
 use rustc_middle::ty;
 use rustc_session::lint::FutureIncompatibilityReason;
 use rustc_session::{declare_lint, declare_lint_pass};
 use rustc_span::sym;
 use rustc_trait_selection::traits::supertraits;
+
+use crate::lints::{SupertraitAsDerefTarget, SupertraitAsDerefTargetLabel};
+use crate::{LateContext, LateLintPass, LintContext};
 
 declare_lint! {
     /// The `deref_into_dyn_supertrait` lint is output whenever there is a use of the
@@ -66,7 +64,7 @@ impl<'tcx> LateLintPass<'tcx> for DerefIntoDynSupertrait {
             // the trait is a `Deref` implementation
             && let Some(trait_) = &impl_.of_trait
             && let Some(did) = trait_.trait_def_id()
-            && Some(did) == tcx.lang_items().deref_trait()
+            && tcx.is_lang_item(did, LangItem::Deref)
             // the self type is `dyn t_principal`
             && let self_ty = tcx.type_of(item.owner_id).instantiate_identity()
             && let ty::Dynamic(data, _, ty::Dyn) = self_ty.kind()
@@ -88,19 +86,14 @@ impl<'tcx> LateLintPass<'tcx> for DerefIntoDynSupertrait {
                 .find_map(|i| (i.ident.name == sym::Target).then_some(i.span))
                 .map(|label| SupertraitAsDerefTargetLabel { label });
             let span = tcx.def_span(item.owner_id.def_id);
-            cx.emit_span_lint(
-                DEREF_INTO_DYN_SUPERTRAIT,
-                span,
-                SupertraitAsDerefTarget {
-                    self_ty,
-                    supertrait_principal: supertrait_principal.map_bound(|trait_ref| {
-                        ty::ExistentialTraitRef::erase_self_ty(tcx, trait_ref)
-                    }),
-                    target_principal,
-                    label: span,
-                    label2,
-                },
-            );
+            cx.emit_span_lint(DEREF_INTO_DYN_SUPERTRAIT, span, SupertraitAsDerefTarget {
+                self_ty,
+                supertrait_principal: supertrait_principal
+                    .map_bound(|trait_ref| ty::ExistentialTraitRef::erase_self_ty(tcx, trait_ref)),
+                target_principal,
+                label: span,
+                label2,
+            });
         }
     }
 }

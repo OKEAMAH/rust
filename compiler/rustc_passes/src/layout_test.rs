@@ -2,14 +2,15 @@ use rustc_ast::Attribute;
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::LocalDefId;
 use rustc_middle::span_bug;
-use rustc_middle::ty::layout::{HasParamEnv, HasTyCtxt, LayoutError, LayoutOfHelpers, TyAndLayout};
+use rustc_middle::ty::layout::{HasParamEnv, HasTyCtxt, LayoutError, LayoutOfHelpers};
 use rustc_middle::ty::{self, ParamEnv, Ty, TyCtxt};
+use rustc_span::Span;
 use rustc_span::source_map::Spanned;
 use rustc_span::symbol::sym;
-use rustc_span::Span;
 use rustc_target::abi::{HasDataLayout, TargetDataLayout};
-use rustc_trait_selection::traits::error_reporting::TypeErrCtxtExt;
-use rustc_trait_selection::{infer::TyCtxtInferExt, traits};
+use rustc_trait_selection::error_reporting::InferCtxtErrorExt;
+use rustc_trait_selection::infer::TyCtxtInferExt;
+use rustc_trait_selection::traits;
 
 use crate::errors::{
     LayoutAbi, LayoutAlign, LayoutHomogeneousAggregate, LayoutInvalidAttribute, LayoutOf,
@@ -54,7 +55,7 @@ pub fn ensure_wf<'tcx>(
         pred,
     );
     let infcx = tcx.infer_ctxt().build();
-    let ocx = traits::ObligationCtxt::new(&infcx);
+    let ocx = traits::ObligationCtxt::new_with_diagnostics(&infcx);
     ocx.register_obligation(obligation);
     let errors = ocx.select_all_or_error();
     if !errors.is_empty() {
@@ -127,7 +128,7 @@ fn dump_layout_of(tcx: TyCtxt<'_>, item_def_id: LocalDefId, attr: &Attribute) {
         }
 
         Err(layout_error) => {
-            tcx.dcx().emit_fatal(Spanned { node: layout_error.into_diagnostic(), span });
+            tcx.dcx().emit_err(Spanned { node: layout_error.into_diagnostic(), span });
         }
     }
 }
@@ -138,8 +139,6 @@ struct UnwrapLayoutCx<'tcx> {
 }
 
 impl<'tcx> LayoutOfHelpers<'tcx> for UnwrapLayoutCx<'tcx> {
-    type LayoutOfResult = TyAndLayout<'tcx>;
-
     fn handle_layout_err(&self, err: LayoutError<'tcx>, span: Span, ty: Ty<'tcx>) -> ! {
         span_bug!(span, "`#[rustc_layout(..)]` test resulted in `layout_of({ty}) = Err({err})`",);
     }

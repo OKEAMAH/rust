@@ -15,11 +15,11 @@ use rustc_infer::infer::{BoundRegionConversionTime, RegionVariableOrigin};
 use rustc_middle::mir::*;
 use rustc_middle::ty::{self, Ty};
 use rustc_span::Span;
-
-use crate::renumber::RegionCtxt;
-use crate::universal_regions::{DefiningTy, UniversalRegions};
+use tracing::{debug, instrument};
 
 use super::{Locations, TypeChecker};
+use crate::renumber::RegionCtxt;
+use crate::universal_regions::{DefiningTy, UniversalRegions};
 
 impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
     /// Check explicit closure signature annotation,
@@ -77,20 +77,17 @@ impl<'a, 'tcx> TypeChecker<'a, 'tcx> {
             let output_ty = Ty::new_coroutine(
                 self.tcx(),
                 self.tcx().coroutine_for_closure(mir_def_id),
-                ty::CoroutineArgs::new(
-                    self.tcx(),
-                    ty::CoroutineArgsParts {
-                        parent_args: args.parent_args(),
-                        kind_ty: Ty::from_coroutine_closure_kind(self.tcx(), args.kind()),
-                        return_ty: user_provided_sig.output(),
-                        tupled_upvars_ty,
-                        // For async closures, none of these can be annotated, so just fill
-                        // them with fresh ty vars.
-                        resume_ty: next_ty_var(),
-                        yield_ty: next_ty_var(),
-                        witness: next_ty_var(),
-                    },
-                )
+                ty::CoroutineArgs::new(self.tcx(), ty::CoroutineArgsParts {
+                    parent_args: args.parent_args(),
+                    kind_ty: Ty::from_coroutine_closure_kind(self.tcx(), args.kind()),
+                    return_ty: user_provided_sig.output(),
+                    tupled_upvars_ty,
+                    // For async closures, none of these can be annotated, so just fill
+                    // them with fresh ty vars.
+                    resume_ty: next_ty_var(),
+                    yield_ty: next_ty_var(),
+                    witness: next_ty_var(),
+                })
                 .args,
             );
 

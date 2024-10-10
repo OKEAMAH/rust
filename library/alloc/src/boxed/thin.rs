@@ -1,7 +1,7 @@
-// Based on
-// https://github.com/matthieu-m/rfc2580/blob/b58d1d3cba0d4b5e859d3617ea2d0943aaa31329/examples/thin.rs
-// by matthieu-m
-use crate::alloc::{self, Layout, LayoutError};
+//! Based on
+//! <https://github.com/matthieu-m/rfc2580/blob/b58d1d3cba0d4b5e859d3617ea2d0943aaa31329/examples/thin.rs>
+//! by matthieu-m
+
 use core::error::Error;
 use core::fmt::{self, Debug, Display, Formatter};
 #[cfg(not(no_global_oom_handling))]
@@ -13,8 +13,9 @@ use core::mem;
 #[cfg(not(no_global_oom_handling))]
 use core::mem::SizedTypeProperties;
 use core::ops::{Deref, DerefMut};
-use core::ptr::Pointee;
-use core::ptr::{self, NonNull};
+use core::ptr::{self, NonNull, Pointee};
+
+use crate::alloc::{self, Layout, LayoutError};
 
 /// ThinBox.
 ///
@@ -185,7 +186,7 @@ impl<T: ?Sized> ThinBox<T> {
 
     fn with_header(&self) -> &WithHeader<<T as Pointee>::Metadata> {
         // SAFETY: both types are transparent to `NonNull<u8>`
-        unsafe { &*(core::ptr::addr_of!(self.ptr) as *const WithHeader<_>) }
+        unsafe { &*((&raw const self.ptr) as *const WithHeader<_>) }
     }
 }
 

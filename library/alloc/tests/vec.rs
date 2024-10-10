@@ -1,3 +1,6 @@
+// FIXME(static_mut_refs): Do not allow `static_mut_refs` lint
+#![allow(static_mut_refs)]
+
 use core::alloc::{Allocator, Layout};
 use core::num::NonZero;
 use core::ptr::NonNull;
@@ -8,15 +11,14 @@ use std::borrow::Cow;
 use std::cell::Cell;
 use std::collections::TryReserveErrorKind::*;
 use std::fmt::Debug;
-use std::hint;
 use std::iter::InPlaceIterable;
-use std::mem;
 use std::mem::{size_of, swap};
 use std::ops::Bound::*;
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::vec::{Drain, IntoIter};
+use std::{hint, mem};
 
 struct DropCounter<'a> {
     count: &'a mut u32,
@@ -1285,6 +1287,8 @@ fn test_from_iter_specialization_panic_during_iteration_drops() {
 
 #[test]
 #[cfg_attr(not(panic = "unwind"), ignore = "test requires unwinding support")]
+// FIXME(static_mut_refs): Do not allow `static_mut_refs` lint
+#[cfg_attr(not(bootstrap), allow(static_mut_refs))]
 fn test_from_iter_specialization_panic_during_drop_doesnt_leak() {
     static mut DROP_COUNTER_OLD: [usize; 5] = [0; 5];
     static mut DROP_COUNTER_NEW: [usize; 2] = [0; 2];
@@ -1696,7 +1700,6 @@ fn test_reserve_exact() {
 
 #[test]
 #[cfg_attr(miri, ignore)] // Miri does not support signalling OOM
-#[cfg_attr(target_os = "android", ignore)] // Android used in CI has a broken dlmalloc
 fn test_try_with_capacity() {
     let mut vec: Vec<u32> = Vec::try_with_capacity(5).unwrap();
     assert_eq!(0, vec.len());
@@ -1708,7 +1711,6 @@ fn test_try_with_capacity() {
 
 #[test]
 #[cfg_attr(miri, ignore)] // Miri does not support signalling OOM
-#[cfg_attr(target_os = "android", ignore)] // Android used in CI has a broken dlmalloc
 fn test_try_reserve() {
     // These are the interesting cases:
     // * exactly isize::MAX should never trigger a CapacityOverflow (can be OOM)
@@ -1804,7 +1806,6 @@ fn test_try_reserve() {
 
 #[test]
 #[cfg_attr(miri, ignore)] // Miri does not support signalling OOM
-#[cfg_attr(target_os = "android", ignore)] // Android used in CI has a broken dlmalloc
 fn test_try_reserve_exact() {
     // This is exactly the same as test_try_reserve with the method changed.
     // See that test for comments.
@@ -2572,7 +2573,8 @@ fn test_into_flattened_size_overflow() {
 
 #[test]
 fn test_box_zero_allocator() {
-    use core::{alloc::AllocError, cell::RefCell};
+    use core::alloc::AllocError;
+    use core::cell::RefCell;
     use std::collections::HashSet;
 
     // Track ZST allocations and ensure that they all have a matching free.

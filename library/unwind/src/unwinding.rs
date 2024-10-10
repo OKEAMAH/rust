@@ -28,13 +28,11 @@ pub enum _Unwind_Reason_Code {
     _URC_FAILURE = 9, // used only by ARM EHABI
 }
 pub use _Unwind_Reason_Code::*;
-
-pub use unwinding::abi::UnwindContext;
-pub use unwinding::abi::UnwindException;
+pub use unwinding::abi::{UnwindContext, UnwindException};
 pub enum _Unwind_Context {}
 
 pub use unwinding::custom_eh_frame_finder::{
-    set_custom_eh_frame_finder, EhFrameFinder, FrameInfo, FrameInfoKind,
+    EhFrameFinder, FrameInfo, FrameInfoKind, set_custom_eh_frame_finder,
 };
 
 pub type _Unwind_Exception_Class = u64;

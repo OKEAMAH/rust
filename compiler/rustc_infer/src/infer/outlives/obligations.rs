@@ -59,25 +59,26 @@
 //! might later infer `?U` to something like `&'b u32`, which would
 //! imply that `'b: 'a`.
 
-use crate::infer::outlives::components::{push_outlives_components, Component};
+use rustc_data_structures::undo_log::UndoLogs;
+use rustc_middle::bug;
+use rustc_middle::mir::ConstraintCategory;
+use rustc_middle::traits::query::NoSolution;
+use rustc_middle::ty::{
+    self, GenericArgKind, GenericArgsRef, PolyTypeOutlivesPredicate, Region, Ty, TyCtxt,
+    TypeFoldable as _, TypeVisitableExt,
+};
+use rustc_span::DUMMY_SP;
+use rustc_type_ir::outlives::{Component, push_outlives_components};
+use smallvec::smallvec;
+use tracing::{debug, instrument};
+
+use super::env::OutlivesEnvironment;
 use crate::infer::outlives::env::RegionBoundPairs;
 use crate::infer::outlives::verify::VerifyBoundCx;
 use crate::infer::resolve::OpportunisticRegionResolver;
 use crate::infer::snapshot::undo_log::UndoLog;
 use crate::infer::{self, GenericKind, InferCtxt, RegionObligation, SubregionOrigin, VerifyBound};
 use crate::traits::{ObligationCause, ObligationCauseCode};
-use rustc_data_structures::undo_log::UndoLogs;
-use rustc_middle::bug;
-use rustc_middle::mir::ConstraintCategory;
-use rustc_middle::traits::query::NoSolution;
-use rustc_middle::ty::{
-    self, GenericArgsRef, Region, Ty, TyCtxt, TypeFoldable as _, TypeVisitableExt,
-};
-use rustc_middle::ty::{GenericArgKind, PolyTypeOutlivesPredicate};
-use rustc_span::DUMMY_SP;
-use smallvec::smallvec;
-
-use super::env::OutlivesEnvironment;
 
 impl<'tcx> InferCtxt<'tcx> {
     /// Registers that the given region obligation must be resolved
@@ -100,19 +101,15 @@ impl<'tcx> InferCtxt<'tcx> {
     ) {
         debug!(?sup_type, ?sub_region, ?cause);
         let origin = SubregionOrigin::from_obligation_cause(cause, || {
-            infer::RelateParamBound(
-                cause.span,
-                sup_type,
-                match cause.code().peel_derives() {
-                    ObligationCauseCode::WhereClause(_, span)
-                    | ObligationCauseCode::WhereClauseInExpr(_, span, ..)
-                        if !span.is_dummy() =>
-                    {
-                        Some(*span)
-                    }
-                    _ => None,
-                },
-            )
+            infer::RelateParamBound(cause.span, sup_type, match cause.code().peel_derives() {
+                ObligationCauseCode::WhereClause(_, span)
+                | ObligationCauseCode::WhereClauseInExpr(_, span, ..)
+                    if !span.is_dummy() =>
+                {
+                    Some(*span)
+                }
+                _ => None,
+            })
         });
 
         self.register_region_obligation(RegionObligation { sup_type, sub_region, origin });
@@ -291,7 +288,7 @@ where
     fn components_must_outlive(
         &mut self,
         origin: infer::SubregionOrigin<'tcx>,
-        components: &[Component<'tcx>],
+        components: &[Component<TyCtxt<'tcx>>],
         region: ty::Region<'tcx>,
         category: ConstraintCategory<'tcx>,
     ) {
@@ -399,11 +396,12 @@ where
         // 'a` in the environment but `trait Foo<'b> { type Item: 'b
         // }` in the trait definition.
         approx_env_bounds.retain(|bound_outlives| {
-            // OK to skip binder because we only manipulate and compare against other
-            // values from the same binder. e.g. if we have (e.g.) `for<'a> <T as Trait<'a>>::Item: 'a`
-            // in `bound`, the `'a` will be a `^1` (bound, debruijn index == innermost) region.
-            // If the declaration is `trait Trait<'b> { type Item: 'b; }`, then `projection_declared_bounds_from_trait`
-            // will be invoked with `['b => ^1]` and so we will get `^1` returned.
+            // OK to skip binder because we only manipulate and compare against other values from
+            // the same binder. e.g. if we have (e.g.) `for<'a> <T as Trait<'a>>::Item: 'a` in
+            // `bound`, the `'a` will be a `^1` (bound, debruijn index == innermost) region. If the
+            // declaration is `trait Trait<'b> { type Item: 'b; }`, then
+            // `projection_declared_bounds_from_trait` will be invoked with `['b => ^1]` and so we
+            // will get `^1` returned.
             let bound = bound_outlives.skip_binder();
             let ty::Alias(_, alias_ty) = bound.0.kind() else { bug!("expected AliasTy") };
             self.verify_bound.declared_bounds_from_definition(*alias_ty).all(|r| r != bound.1)
@@ -471,7 +469,7 @@ where
         // projection outlive; in some cases, this may add insufficient
         // edges into the inference graph, leading to inference failures
         // even though a satisfactory solution exists.
-        let verify_bound = self.verify_bound.alias_bound(alias_ty, &mut Default::default());
+        let verify_bound = self.verify_bound.alias_bound(alias_ty);
         debug!("alias_must_outlive: pushing {:?}", verify_bound);
         self.delegate.push_verify(origin, GenericKind::Alias(alias_ty), region, verify_bound);
     }

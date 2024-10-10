@@ -1,3 +1,4 @@
+use clippy_config::Conf;
 use clippy_config::msrvs::{self, Msrv};
 use clippy_utils::diagnostics::span_lint_and_sugg;
 use rustc_ast::ast::{Expr, ExprKind};
@@ -40,9 +41,10 @@ pub struct RedundantFieldNames {
 }
 
 impl RedundantFieldNames {
-    #[must_use]
-    pub fn new(msrv: Msrv) -> Self {
-        Self { msrv }
+    pub fn new(conf: &'static Conf) -> Self {
+        Self {
+            msrv: conf.msrv.clone(),
+        }
     }
 }
 

@@ -19,15 +19,13 @@
 
 use rustc_ast::Attribute;
 use rustc_data_structures::fx::FxHashMap;
-use rustc_hir::def_id::DefId;
 use rustc_hir::HirId;
+use rustc_hir::def_id::DefId;
 use rustc_index::{IndexSlice, IndexVec};
-use rustc_middle::{
-    mir::*,
-    span_bug,
-    thir::*,
-    ty::{ParamEnv, Ty, TyCtxt},
-};
+use rustc_middle::mir::*;
+use rustc_middle::span_bug;
+use rustc_middle::thir::*;
+use rustc_middle::ty::{ParamEnv, Ty, TyCtxt};
 use rustc_span::Span;
 
 mod parse;
@@ -56,13 +54,13 @@ pub(super) fn build_custom_mir<'tcx>(
         spread_arg: None,
         var_debug_info: Vec::new(),
         span,
-        required_consts: Vec::new(),
-        mentioned_items: Vec::new(),
+        required_consts: None,
+        mentioned_items: None,
         is_polymorphic: false,
         tainted_by_errors: None,
         injection_phase: None,
         pass_count: 0,
-        coverage_branch_info: None,
+        coverage_info_hi: None,
         function_coverage_info: None,
     };
 
@@ -136,13 +134,12 @@ fn parse_attribute(attr: &Attribute) -> MirPhase {
     MirPhase::parse(dialect, phase)
 }
 
-struct ParseCtxt<'tcx, 'body> {
+struct ParseCtxt<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
     param_env: ParamEnv<'tcx>,
-    thir: &'body Thir<'tcx>,
+    thir: &'a Thir<'tcx>,
     source_scope: SourceScope,
-
-    body: &'body mut Body<'tcx>,
+    body: &'a mut Body<'tcx>,
     local_map: FxHashMap<LocalVarId, Local>,
     block_map: FxHashMap<LocalVarId, BasicBlock>,
 }
@@ -153,7 +150,7 @@ struct ParseError {
     expected: String,
 }
 
-impl<'tcx, 'body> ParseCtxt<'tcx, 'body> {
+impl<'a, 'tcx> ParseCtxt<'a, 'tcx> {
     fn expr_error(&self, expr: ExprId, expected: &'static str) -> ParseError {
         let expr = &self.thir[expr];
         ParseError {

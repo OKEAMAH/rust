@@ -1,12 +1,13 @@
 use std::iter::{self, Peekable};
 
 use either::Either;
-use hir::{Adt, Crate, HasAttrs, HasSource, ModuleDef, Semantics};
+use hir::{sym, Adt, Crate, HasAttrs, ImportPathConfig, ModuleDef, Semantics};
+use ide_db::syntax_helpers::suggest_name;
 use ide_db::RootDatabase;
 use ide_db::{famous_defs::FamousDefs, helpers::mod_path_to_ast};
 use itertools::Itertools;
 use syntax::ast::edit_in_place::Removable;
-use syntax::ast::{self, make, AstNode, HasName, MatchArmList, MatchExpr, Pat};
+use syntax::ast::{self, make, AstNode, MatchArmList, MatchExpr, Pat};
 
 use crate::{utils, AssistContext, AssistId, AssistKind, Assists};
 
@@ -71,6 +72,8 @@ pub(crate) fn add_missing_match_arms(acc: &mut Assists, ctx: &AssistContext<'_>)
         .filter(|pat| !matches!(pat, Pat::WildcardPat(_)))
         .collect();
 
+    let cfg = ctx.config.import_path_config();
+
     let module = ctx.sema.scope(expr.syntax())?.module();
     let (mut missing_pats, is_non_exhaustive, has_hidden_variants): (
         Peekable<Box<dyn Iterator<Item = (ast::Pat, bool)>>>,
@@ -88,13 +91,7 @@ pub(crate) fn add_missing_match_arms(acc: &mut Assists, ctx: &AssistContext<'_>)
             .into_iter()
             .filter_map(|variant| {
                 Some((
-                    build_pat(
-                        ctx.db(),
-                        module,
-                        variant,
-                        ctx.config.prefer_no_std,
-                        ctx.config.prefer_prelude,
-                    )?,
+                    build_pat(ctx, module, variant, cfg)?,
                     variant.should_be_hidden(ctx.db(), module.krate()),
                 ))
             })
@@ -145,15 +142,8 @@ pub(crate) fn add_missing_match_arms(acc: &mut Assists, ctx: &AssistContext<'_>)
                 let is_hidden = variants
                     .iter()
                     .any(|variant| variant.should_be_hidden(ctx.db(), module.krate()));
-                let patterns = variants.into_iter().filter_map(|variant| {
-                    build_pat(
-                        ctx.db(),
-                        module,
-                        variant,
-                        ctx.config.prefer_no_std,
-                        ctx.config.prefer_prelude,
-                    )
-                });
+                let patterns =
+                    variants.into_iter().filter_map(|variant| build_pat(ctx, module, variant, cfg));
 
                 (ast::Pat::from(make::tuple_pat(patterns)), is_hidden)
             })
@@ -184,15 +174,8 @@ pub(crate) fn add_missing_match_arms(acc: &mut Assists, ctx: &AssistContext<'_>)
                 let is_hidden = variants
                     .iter()
                     .any(|variant| variant.should_be_hidden(ctx.db(), module.krate()));
-                let patterns = variants.into_iter().filter_map(|variant| {
-                    build_pat(
-                        ctx.db(),
-                        module,
-                        variant,
-                        ctx.config.prefer_no_std,
-                        ctx.config.prefer_prelude,
-                    )
-                });
+                let patterns =
+                    variants.into_iter().filter_map(|variant| build_pat(ctx, module, variant, cfg));
                 (ast::Pat::from(make::slice_pat(patterns)), is_hidden)
             })
             .filter(|(variant_pat, _)| is_variant_missing(&top_lvl_pats, variant_pat));
@@ -393,7 +376,7 @@ impl ExtendedEnum {
     fn is_non_exhaustive(self, db: &RootDatabase, krate: Crate) -> bool {
         match self {
             ExtendedEnum::Enum(e) => {
-                e.attrs(db).by_key("non_exhaustive").exists() && e.module(db).krate() != krate
+                e.attrs(db).by_key(&sym::non_exhaustive).exists() && e.module(db).krate() != krate
             }
             _ => false,
         }
@@ -454,39 +437,39 @@ fn resolve_array_of_enum_def(
 }
 
 fn build_pat(
-    db: &RootDatabase,
+    ctx: &AssistContext<'_>,
     module: hir::Module,
     var: ExtendedVariant,
-    prefer_no_std: bool,
-    prefer_prelude: bool,
+    cfg: ImportPathConfig,
 ) -> Option<ast::Pat> {
+    let db = ctx.db();
     match var {
         ExtendedVariant::Variant(var) => {
-            let path = mod_path_to_ast(&module.find_use_path(
-                db,
-                ModuleDef::from(var),
-                prefer_no_std,
-                prefer_prelude,
-            )?);
-
-            // FIXME: use HIR for this; it doesn't currently expose struct vs. tuple vs. unit variants though
-            Some(match var.source(db)?.value.kind() {
-                ast::StructKind::Tuple(field_list) => {
-                    let pats =
-                        iter::repeat(make::wildcard_pat().into()).take(field_list.fields().count());
+            let edition = module.krate().edition(db);
+            let path = mod_path_to_ast(&module.find_path(db, ModuleDef::from(var), cfg)?, edition);
+            let fields = var.fields(db);
+            let pat = match var.kind(db) {
+                hir::StructKind::Tuple => {
+                    let mut name_generator = suggest_name::NameGenerator::new();
+                    let pats = fields.into_iter().map(|f| {
+                        let name = name_generator.for_type(&f.ty(db), db, edition);
+                        match name {
+                            Some(name) => make::ext::simple_ident_pat(make::name(&name)).into(),
+                            None => make::wildcard_pat().into(),
+                        }
+                    });
                     make::tuple_struct_pat(path, pats).into()
                 }
-                ast::StructKind::Record(field_list) => {
-                    let pats = field_list.fields().map(|f| {
-                        make::ext::simple_ident_pat(
-                            f.name().expect("Record field must have a name"),
-                        )
-                        .into()
-                    });
+                hir::StructKind::Record => {
+                    let pats = fields
+                        .into_iter()
+                        .map(|f| make::name(f.name(db).as_str()))
+                        .map(|name| make::ext::simple_ident_pat(name).into());
                     make::record_pat(path, pats).into()
                 }
-                ast::StructKind::Unit => make::path_pat(path),
-            })
+                hir::StructKind::Unit => make::path_pat(path),
+            };
+            Some(pat)
         }
         ExtendedVariant::True => Some(ast::Pat::from(make::literal_pat("true"))),
         ExtendedVariant::False => Some(ast::Pat::from(make::literal_pat("false"))),
@@ -1997,5 +1980,82 @@ fn a() {
     }
 }"#,
         )
+    }
+
+    #[test]
+    fn suggest_name_for_tuple_struct_patterns() {
+        // single tuple struct
+        check_assist(
+            add_missing_match_arms,
+            r#"
+struct S;
+
+pub enum E {
+    A
+    B(S),
+}
+
+fn f() {
+    let value = E::A;
+    match value {
+        $0
+    }
+}
+"#,
+            r#"
+struct S;
+
+pub enum E {
+    A
+    B(S),
+}
+
+fn f() {
+    let value = E::A;
+    match value {
+        $0E::A => todo!(),
+        E::B(s) => todo!(),
+    }
+}
+"#,
+        );
+
+        // multiple tuple struct patterns
+        check_assist(
+            add_missing_match_arms,
+            r#"
+struct S1;
+struct S2;
+
+pub enum E {
+    A
+    B(S1, S2),
+}
+
+fn f() {
+    let value = E::A;
+    match value {
+        $0
+    }
+}
+"#,
+            r#"
+struct S1;
+struct S2;
+
+pub enum E {
+    A
+    B(S1, S2),
+}
+
+fn f() {
+    let value = E::A;
+    match value {
+        $0E::A => todo!(),
+        E::B(s1, s2) => todo!(),
+    }
+}
+"#,
+        );
     }
 }

@@ -1,20 +1,24 @@
-use crate::spec::{cvs, Cc, DebuginfoKind, LinkerFlavor, Lld, SplitDebuginfo, TargetOptions};
 use std::borrow::Cow;
 
-pub fn opts() -> TargetOptions {
+use crate::spec::{Cc, DebuginfoKind, LinkerFlavor, Lld, SplitDebuginfo, TargetOptions, cvs};
+
+pub(crate) fn opts() -> TargetOptions {
     // We cannot use `-nodefaultlibs` because compiler-rt has to be passed
     // as a path since it's not added to linker search path by the default.
     // There were attempts to make it behave like libgcc (so one can just use -l<name>)
     // but LLVM maintainers rejected it: https://reviews.llvm.org/D51440
-    let pre_link_args = TargetOptions::link_args(
-        LinkerFlavor::Gnu(Cc::Yes, Lld::No),
-        &["-nolibc", "--unwindlib=none"],
-    );
+    let pre_link_args = TargetOptions::link_args(LinkerFlavor::Gnu(Cc::Yes, Lld::No), &[
+        "-nolibc",
+        "--unwindlib=none",
+    ]);
     // Order of `late_link_args*` does not matter with LLD.
-    let late_link_args = TargetOptions::link_args(
-        LinkerFlavor::Gnu(Cc::Yes, Lld::No),
-        &["-lmingw32", "-lmingwex", "-lmsvcrt", "-lkernel32", "-luser32"],
-    );
+    let late_link_args = TargetOptions::link_args(LinkerFlavor::Gnu(Cc::Yes, Lld::No), &[
+        "-lmingw32",
+        "-lmingwex",
+        "-lmsvcrt",
+        "-lkernel32",
+        "-luser32",
+    ]);
 
     TargetOptions {
         os: "windows".into(),

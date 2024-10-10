@@ -53,7 +53,7 @@ fn main() {
 use dep::io::stdin;
 
 fn main() {
-    stdin()$0
+    stdin();$0
 }
 "#,
     );
@@ -274,7 +274,7 @@ fn trait_function_fuzzy_completion() {
 use dep::test_mod::TestTrait;
 
 fn main() {
-    dep::test_mod::TestStruct::weird_function()$0
+    dep::test_mod::TestStruct::weird_function();$0
 }
 "#,
     );
@@ -368,7 +368,7 @@ use dep::test_mod::TestTrait;
 
 fn main() {
     let test_struct = dep::test_mod::TestStruct {};
-    test_struct.random_method()$0
+    test_struct.random_method();$0
 }
 "#,
     );
@@ -419,7 +419,7 @@ impl foo::TestTrait for fundamental::Box<TestStruct> {
 
 fn main() {
     let t = fundamental::Box(TestStruct);
-    t.some_method()$0
+    t.some_method();$0
 }
 "#,
     );
@@ -466,7 +466,48 @@ impl foo::TestTrait for &TestStruct {
 
 fn main() {
     let t = &TestStruct;
-    t.some_method()$0
+    t.some_method();$0
+}
+"#,
+    );
+}
+
+#[test]
+fn trait_completions_handle_associated_types() {
+    let fixture = r#"
+//- /foo.rs crate:foo
+pub trait NotInScope {
+    fn not_in_scope(&self);
+}
+
+pub trait Wrapper {
+    type Inner: NotInScope;
+    fn inner(&self) -> Self::Inner;
+}
+
+//- /main.rs crate:main deps:foo
+use foo::Wrapper;
+
+fn completion<T: Wrapper>(whatever: T) {
+    whatever.inner().$0
+}
+"#;
+
+    check(
+        fixture,
+        expect![[r#"
+        me not_in_scope() (use foo::NotInScope) fn(&self)
+    "#]],
+    );
+
+    check_edit(
+        "not_in_scope",
+        fixture,
+        r#"
+use foo::{NotInScope, Wrapper};
+
+fn completion<T: Wrapper>(whatever: T) {
+    whatever.inner().not_in_scope();$0
 }
 "#,
     );
@@ -538,7 +579,7 @@ fn main() {
 use dep::test_mod::TestTrait;
 
 fn main() {
-    dep::test_mod::TestAlias::random_method()$0
+    dep::test_mod::TestAlias::random_method();$0
 }
 "#,
     );
@@ -661,7 +702,7 @@ fn main() {
 use dep::test_mod::TestTrait;
 
 fn main() {
-    dep::test_mod::TestStruct::another_function()$0
+    dep::test_mod::TestStruct::another_function();$0
 }
 "#,
     );
@@ -726,8 +767,8 @@ fn main() {
 }
 "#,
         expect![[r#"
-            fn weird_function() (use dep::test_mod::TestTrait) fn() DEPRECATED
             ct SPECIAL_CONST (use dep::test_mod::TestTrait) u8 DEPRECATED
+            fn weird_function() (use dep::test_mod::TestTrait) fn() DEPRECATED
             me random_method(…) (use dep::test_mod::TestTrait) fn(&self) DEPRECATED
         "#]],
     );
@@ -822,6 +863,38 @@ mod foo {
 use foo::bar::Item;
 
 use crate::foo::bar;
+
+fn main() {
+    Item
+}"#,
+    );
+}
+
+#[test]
+fn config_prefer_absolute() {
+    let fixture = r#"
+//- /lib.rs crate:dep
+pub mod foo {
+    pub mod bar {
+        pub struct Item;
+    }
+}
+
+//- /main.rs crate:main deps:dep
+use ::dep::foo::bar;
+
+fn main() {
+    Ite$0
+}"#;
+    let mut config = TEST_CONFIG;
+    config.prefer_absolute = true;
+
+    check_edit_with_config(
+        config.clone(),
+        "Item",
+        fixture,
+        r#"
+use ::dep::foo::bar::{self, Item};
 
 fn main() {
     Item
@@ -1542,6 +1615,57 @@ pub struct FooStruct;
 "#,
         expect![[r#"
             tt FooTrait (use dep::FooTrait)
+        "#]],
+    );
+}
+
+#[test]
+fn primitive_mod() {
+    check(
+        r#"
+//- minicore: str
+fn main() {
+    str::from$0
+}
+"#,
+        expect![[r#"
+            fn from_utf8_unchecked(…) (use core::str) const unsafe fn(&[u8]) -> &str
+        "#]],
+    );
+}
+
+#[test]
+fn trait_impl_on_slice_method_on_deref_slice_type() {
+    check(
+        r#"
+//- minicore: deref, sized
+struct SliceDeref;
+impl core::ops::Deref for SliceDeref {
+    type Target = [()];
+
+    fn deref(&self) -> &Self::Target {
+        &[]
+    }
+}
+fn main() {
+    SliceDeref.choose$0();
+}
+mod module {
+    pub(super) trait SliceRandom {
+        type Item;
+
+        fn choose(&self);
+    }
+
+    impl<T> SliceRandom for [T] {
+        type Item = T;
+
+        fn choose(&self) {}
+    }
+}
+"#,
+        expect![[r#"
+            me choose (use module::SliceRandom) fn(&self)
         "#]],
     );
 }

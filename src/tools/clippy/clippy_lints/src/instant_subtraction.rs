@@ -1,3 +1,4 @@
+use clippy_config::Conf;
 use clippy_config::msrvs::{self, Msrv};
 use clippy_utils::diagnostics::span_lint_and_sugg;
 use clippy_utils::source::snippet_with_context;
@@ -68,9 +69,10 @@ pub struct InstantSubtraction {
 }
 
 impl InstantSubtraction {
-    #[must_use]
-    pub fn new(msrv: Msrv) -> Self {
-        Self { msrv }
+    pub fn new(conf: &'static Conf) -> Self {
+        Self {
+            msrv: conf.msrv.clone(),
+        }
     }
 }
 
@@ -85,16 +87,19 @@ impl LateLintPass<'_> for InstantSubtraction {
             lhs,
             rhs,
         ) = expr.kind
+            && let typeck = cx.typeck_results()
+            && ty::is_type_diagnostic_item(cx, typeck.expr_ty(lhs), sym::Instant)
         {
+            let rhs_ty = typeck.expr_ty(rhs);
+
             if is_instant_now_call(cx, lhs)
-                && is_an_instant(cx, rhs)
+                && ty::is_type_diagnostic_item(cx, rhs_ty, sym::Instant)
                 && let Some(sugg) = Sugg::hir_opt(cx, rhs)
             {
                 print_manual_instant_elapsed_sugg(cx, expr, sugg);
-            } else if !expr.span.from_expansion()
+            } else if ty::is_type_diagnostic_item(cx, rhs_ty, sym::Duration)
+                && !expr.span.from_expansion()
                 && self.msrv.meets(msrvs::TRY_FROM)
-                && is_an_instant(cx, lhs)
-                && is_a_duration(cx, rhs)
             {
                 print_unchecked_duration_subtraction_sugg(cx, lhs, rhs, expr);
             }
@@ -107,22 +112,12 @@ impl LateLintPass<'_> for InstantSubtraction {
 fn is_instant_now_call(cx: &LateContext<'_>, expr_block: &'_ Expr<'_>) -> bool {
     if let ExprKind::Call(fn_expr, []) = expr_block.kind
         && let Some(fn_id) = clippy_utils::path_def_id(cx, fn_expr)
-        && clippy_utils::match_def_path(cx, fn_id, &clippy_utils::paths::INSTANT_NOW)
+        && cx.tcx.is_diagnostic_item(sym::instant_now, fn_id)
     {
         true
     } else {
         false
     }
-}
-
-fn is_an_instant(cx: &LateContext<'_>, expr: &Expr<'_>) -> bool {
-    let expr_ty = cx.typeck_results().expr_ty(expr);
-    ty::is_type_diagnostic_item(cx, expr_ty, sym::Instant)
-}
-
-fn is_a_duration(cx: &LateContext<'_>, expr: &Expr<'_>) -> bool {
-    let expr_ty = cx.typeck_results().expr_ty(expr);
-    ty::is_type_diagnostic_item(cx, expr_ty, sym::Duration)
 }
 
 fn print_manual_instant_elapsed_sugg(cx: &LateContext<'_>, expr: &Expr<'_>, sugg: Sugg<'_>) {

@@ -17,18 +17,19 @@ mod item_list;
 mod pattern;
 mod predicate;
 mod proc_macros;
+mod raw_identifiers;
 mod record;
 mod special;
 mod type_pos;
 mod use_tree;
 mod visibility;
 
+use base_db::SourceDatabase;
 use expect_test::Expect;
 use hir::PrefixKind;
 use ide_db::{
-    base_db::{FileLoader, FilePosition},
     imports::insert_use::{ImportGranularity, InsertUseConfig},
-    RootDatabase, SnippetCap,
+    FilePosition, RootDatabase, SnippetCap,
 };
 use itertools::Itertools;
 use stdx::{format_to, trim_indent};
@@ -36,8 +37,8 @@ use test_fixture::ChangeFixture;
 use test_utils::assert_eq_text;
 
 use crate::{
-    resolve_completion_edits, CallableSnippets, CompletionConfig, CompletionItem,
-    CompletionItemKind,
+    resolve_completion_edits, CallableSnippets, CompletionConfig, CompletionFieldsToResolve,
+    CompletionItem, CompletionItemKind,
 };
 
 /// Lots of basic item definitions
@@ -66,11 +67,11 @@ pub(crate) const TEST_CONFIG: CompletionConfig = CompletionConfig {
     enable_self_on_the_fly: true,
     enable_private_editable: false,
     enable_term_search: true,
+    term_search_fuel: 200,
     full_function_signatures: false,
     callable: Some(CallableSnippets::FillArguments),
+    add_semicolon_to_unit: true,
     snippet_cap: SnippetCap::new(true),
-    prefer_no_std: false,
-    prefer_prelude: true,
     insert_use: InsertUseConfig {
         granularity: ImportGranularity::Crate,
         prefix_kind: PrefixKind::Plain,
@@ -78,9 +79,12 @@ pub(crate) const TEST_CONFIG: CompletionConfig = CompletionConfig {
         group: true,
         skip_glob_imports: true,
     },
+    prefer_no_std: false,
+    prefer_prelude: true,
+    prefer_absolute: false,
     snippets: Vec::new(),
     limit: None,
-    term_search_fuel: 200,
+    fields_to_resolve: CompletionFieldsToResolve::empty(),
 };
 
 pub(crate) fn completion_list(ra_fixture: &str) -> String {
@@ -104,22 +108,35 @@ pub(crate) fn completion_list_with_trigger_character(
     completion_list_with_config(TEST_CONFIG, ra_fixture, true, trigger_character)
 }
 
+fn completion_list_with_config_raw(
+    config: CompletionConfig,
+    ra_fixture: &str,
+    include_keywords: bool,
+    trigger_character: Option<char>,
+) -> Vec<CompletionItem> {
+    // filter out all but one built-in type completion for smaller test outputs
+    let items = get_all_items(config, ra_fixture, trigger_character);
+    items
+        .into_iter()
+        .filter(|it| it.kind != CompletionItemKind::BuiltinType || it.label == "u32")
+        .filter(|it| include_keywords || it.kind != CompletionItemKind::Keyword)
+        .filter(|it| include_keywords || it.kind != CompletionItemKind::Snippet)
+        .sorted_by_key(|it| (it.kind, it.label.clone(), it.detail.as_ref().map(ToOwned::to_owned)))
+        .collect()
+}
+
 fn completion_list_with_config(
     config: CompletionConfig,
     ra_fixture: &str,
     include_keywords: bool,
     trigger_character: Option<char>,
 ) -> String {
-    // filter out all but one built-in type completion for smaller test outputs
-    let items = get_all_items(config, ra_fixture, trigger_character);
-    let items = items
-        .into_iter()
-        .filter(|it| it.kind != CompletionItemKind::BuiltinType || it.label == "u32")
-        .filter(|it| include_keywords || it.kind != CompletionItemKind::Keyword)
-        .filter(|it| include_keywords || it.kind != CompletionItemKind::Snippet)
-        .sorted_by_key(|it| (it.kind, it.label.clone(), it.detail.as_ref().map(ToOwned::to_owned)))
-        .collect();
-    render_completion_list(items)
+    render_completion_list(completion_list_with_config_raw(
+        config,
+        ra_fixture,
+        include_keywords,
+        trigger_character,
+    ))
 }
 
 /// Creates analysis from a multi-file fixture, returns positions marked with $0.
@@ -130,7 +147,7 @@ pub(crate) fn position(ra_fixture: &str) -> (RootDatabase, FilePosition) {
     database.apply_change(change_fixture.change);
     let (file_id, range_or_offset) = change_fixture.file_position.expect("expected a marker ($0)");
     let offset = range_or_offset.expect_offset();
-    (database, FilePosition { file_id, offset })
+    (database, FilePosition { file_id: file_id.file_id(), offset })
 }
 
 pub(crate) fn do_completion(code: &str, kind: CompletionItemKind) -> Vec<CompletionItem> {

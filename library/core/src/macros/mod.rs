@@ -14,6 +14,12 @@ macro_rules! panic {
 
 /// Asserts that two expressions are equal to each other (using [`PartialEq`]).
 ///
+/// Assertions are always checked in both debug and release builds, and cannot
+/// be disabled. See [`debug_assert_eq!`] for assertions that are disabled in
+/// release builds by default.
+///
+/// [`debug_assert_eq!`]: crate::debug_assert_eq
+///
 /// On panic, this macro will print the values of the expressions with their
 /// debug representations.
 ///
@@ -63,6 +69,12 @@ macro_rules! assert_eq {
 }
 
 /// Asserts that two expressions are not equal to each other (using [`PartialEq`]).
+///
+/// Assertions are always checked in both debug and release builds, and cannot
+/// be disabled. See [`debug_assert_ne!`] for assertions that are disabled in
+/// release builds by default.
+///
+/// [`debug_assert_ne!`]: crate::debug_assert_ne
 ///
 /// On panic, this macro will print the values of the expressions with their
 /// debug representations.
@@ -121,6 +133,12 @@ macro_rules! assert_ne {
 /// The pattern syntax is exactly the same as found in a match arm and the `matches!` macro. The
 /// optional if guard can be used to add additional checks that must be true for the matched value,
 /// otherwise this macro will panic.
+///
+/// Assertions are always checked in both debug and release builds, and cannot
+/// be disabled. See [`debug_assert_matches!`] for assertions that are disabled in
+/// release builds by default.
+///
+/// [`debug_assert_matches!`]: crate::assert_matches::debug_assert_matches
 ///
 /// On panic, this macro will print the value of the expression with its debug representation.
 ///
@@ -211,8 +229,8 @@ pub macro assert_matches {
 pub macro cfg_match {
     // with a final wildcard
     (
-        $(cfg($initial_meta:meta) => { $($initial_tokens:item)* })+
-        _ => { $($extra_tokens:item)* }
+        $(cfg($initial_meta:meta) => { $($initial_tokens:tt)* })+
+        _ => { $($extra_tokens:tt)* }
     ) => {
         cfg_match! {
             @__items ();
@@ -223,7 +241,7 @@ pub macro cfg_match {
 
     // without a final wildcard
     (
-        $(cfg($extra_meta:meta) => { $($extra_tokens:item)* })*
+        $(cfg($extra_meta:meta) => { $($extra_tokens:tt)* })*
     ) => {
         cfg_match! {
             @__items ();
@@ -238,7 +256,7 @@ pub macro cfg_match {
     (@__items ($($_:meta,)*);) => {},
     (
         @__items ($($no:meta,)*);
-        (($($yes:meta)?) ($($tokens:item)*)),
+        (($($yes:meta)?) ($($tokens:tt)*)),
         $($rest:tt,)*
     ) => {
         // Emit all items within one block, applying an appropriate #[cfg]. The
@@ -261,7 +279,7 @@ pub macro cfg_match {
 
     // Internal macro to make __apply work out right for different match types,
     // because of how macros match/expand stuff.
-    (@__identity $($tokens:item)*) => {
+    (@__identity $($tokens:tt)*) => {
         $($tokens)*
     }
 }
@@ -633,7 +651,7 @@ macro_rules! write {
     };
 }
 
-/// Write formatted data into a buffer, with a newline appended.
+/// Writes formatted data into a buffer, with a newline appended.
 ///
 /// On all platforms, the newline is the LINE FEED character (`\n`/`U+000A`) alone
 /// (no additional CARRIAGE RETURN (`\r`/`U+000D`).
@@ -1054,7 +1072,7 @@ pub(crate) mod builtin {
     /// If the environment variable is not defined, then a compilation error
     /// will be emitted. To not emit a compile error, use the [`option_env!`]
     /// macro instead. A compilation error will also be emitted if the
-    /// environment variable is not a vaild Unicode string.
+    /// environment variable is not a valid Unicode string.
     ///
     /// # Examples
     ///
@@ -1569,7 +1587,12 @@ pub(crate) mod builtin {
     #[rustc_builtin_macro]
     #[macro_export]
     #[rustc_diagnostic_item = "assert_macro"]
-    #[allow_internal_unstable(panic_internals, edition_panic, generic_assert_internals)]
+    #[allow_internal_unstable(
+        core_intrinsics,
+        panic_internals,
+        edition_panic,
+        generic_assert_internals
+    )]
     macro_rules! assert {
         ($cond:expr $(,)?) => {{ /* compiler built-in */ }};
         ($cond:expr, $($arg:tt)+) => {{ /* compiler built-in */ }};

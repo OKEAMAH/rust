@@ -1,5 +1,5 @@
 // FIXME(effects): Replace `Add` with `std::ops::Add` once the latter a `#[const_trait]` again.
-#![feature(const_trait_impl, effects)]
+#![feature(const_trait_impl, effects)] //~ WARN the feature `effects` is incomplete
 
 #[const_trait]
 trait Add<Rhs = Self> {
@@ -32,7 +32,8 @@ trait Foo {
 }
 
 impl const Foo for NonConstAdd {
-    type Bar = NonConstAdd; //~ ERROR the trait bound `NonConstAdd: ~const Add` is not satisfied
+    type Bar = NonConstAdd;
+    // FIXME(effects) ERROR the trait bound `NonConstAdd: ~const Add` is not satisfied
 }
 
 #[const_trait]

@@ -1,10 +1,11 @@
-use crate::abi::{self, Abi, Align, FieldsShape, Size};
-use crate::abi::{HasDataLayout, TyAbiInterface, TyAndLayout};
-use crate::spec::{self, HasTargetSpec, HasWasmCAbiOpt};
-use rustc_macros::HashStable_Generic;
-use rustc_span::Symbol;
 use std::fmt;
 use std::str::FromStr;
+
+use rustc_macros::HashStable_Generic;
+use rustc_span::Symbol;
+
+use crate::abi::{self, Abi, Align, FieldsShape, HasDataLayout, Size, TyAbiInterface, TyAndLayout};
+use crate::spec::{self, HasTargetSpec, HasWasmCAbiOpt, WasmCAbi};
 
 mod aarch64;
 mod amdgpu;
@@ -29,6 +30,7 @@ mod wasm;
 mod x86;
 mod x86_64;
 mod x86_win64;
+mod xtensa;
 
 #[derive(Clone, PartialEq, Eq, Hash, Debug, HashStable_Generic)]
 pub enum PassMode {
@@ -62,7 +64,7 @@ pub enum PassMode {
     /// (which ensures that padding is preserved and that we do not rely on LLVM's struct layout),
     /// and will use the alignment specified in `attrs.pointee_align` (if `Some`) or the type's
     /// alignment (if `None`). This means that the alignment will not always
-    /// match the Rust type's alignment; see documentation of `make_indirect_byval` for more info.
+    /// match the Rust type's alignment; see documentation of `pass_by_stack_offset` for more info.
     ///
     /// `on_stack` cannot be true for unsized arguments, i.e., when `meta_attrs` is `Some`.
     Indirect { attrs: ArgAttributes, meta_attrs: Option<ArgAttributes>, on_stack: bool },
@@ -186,7 +188,7 @@ impl ArgAttributes {
         if self.arg_ext != other.arg_ext {
             return false;
         }
-        return true;
+        true
     }
 }
 
@@ -236,8 +238,10 @@ impl Reg {
                 _ => panic!("unsupported integer: {self:?}"),
             },
             RegKind::Float => match self.size.bits() {
+                16 => dl.f16_align.abi,
                 32 => dl.f32_align.abi,
                 64 => dl.f64_align.abi,
+                128 => dl.f128_align.abi,
                 _ => panic!("unsupported float: {self:?}"),
             },
             RegKind::Vector => dl.vector_align(self.size).abi,
@@ -338,7 +342,9 @@ impl CastTarget {
         }
     }
 
-    pub fn size<C: HasDataLayout>(&self, _cx: &C) -> Size {
+    /// When you only access the range containing valid data, you can use this unaligned size;
+    /// otherwise, use the safer `size` method.
+    pub fn unaligned_size<C: HasDataLayout>(&self, _cx: &C) -> Size {
         // Prefix arguments are passed in specific designated registers
         let prefix_size = self
             .prefix
@@ -350,6 +356,10 @@ impl CastTarget {
             self.rest.unit.size * self.rest.total.bytes().div_ceil(self.rest.unit.size.bytes());
 
         prefix_size + rest_size
+    }
+
+    pub fn size<C: HasDataLayout>(&self, cx: &C) -> Size {
+        self.unaligned_size(cx).align_to(self.align(cx))
     }
 
     pub fn align<C: HasDataLayout>(&self, cx: &C) -> Align {
@@ -622,12 +632,12 @@ impl<'a, Ty> ArgAbi<'a, Ty> {
             PassMode::Indirect { .. } => {
                 self.mode = PassMode::Direct(ArgAttributes::new());
             }
-            PassMode::Ignore | PassMode::Direct(_) | PassMode::Pair(_, _) => return, // already direct
+            PassMode::Ignore | PassMode::Direct(_) | PassMode::Pair(_, _) => {} // already direct
             _ => panic!("Tried to make {:?} direct", self.mode),
         }
     }
 
-    /// Pass this argument indirectly, by passing a (thin or fat) pointer to the argument instead.
+    /// Pass this argument indirectly, by passing a (thin or wide) pointer to the argument instead.
     /// This is valid for both sized and unsized arguments.
     pub fn make_indirect(&mut self) {
         match self.mode {
@@ -636,9 +646,22 @@ impl<'a, Ty> ArgAbi<'a, Ty> {
             }
             PassMode::Indirect { attrs: _, meta_attrs: _, on_stack: false } => {
                 // already indirect
-                return;
             }
             _ => panic!("Tried to make {:?} indirect", self.mode),
+        }
+    }
+
+    /// Same as `make_indirect`, but for arguments that are ignored. Only needed for ABIs that pass
+    /// ZSTs indirectly.
+    pub fn make_indirect_from_ignore(&mut self) {
+        match self.mode {
+            PassMode::Ignore => {
+                self.mode = Self::indirect_pass_mode(&self.layout);
+            }
+            PassMode::Indirect { attrs: _, meta_attrs: _, on_stack: false } => {
+                // already indirect
+            }
+            _ => panic!("Tried to make {:?} indirect (expected `PassMode::Ignore`)", self.mode),
         }
     }
 
@@ -658,7 +681,7 @@ impl<'a, Ty> ArgAbi<'a, Ty> {
     /// either in the caller (if the type's alignment is lower than the byval alignment)
     /// or in the callee (if the type's alignment is higher than the byval alignment),
     /// to ensure that Rust code never sees an underaligned pointer.
-    pub fn make_indirect_byval(&mut self, byval_align: Option<Align>) {
+    pub fn pass_by_stack_offset(&mut self, byval_align: Option<Align>) {
         assert!(!self.layout.is_unsized(), "used byval ABI for unsized layout");
         self.make_indirect();
         match self.mode {
@@ -720,10 +743,25 @@ impl<'a, Ty> ArgAbi<'a, Ty> {
 
     /// Checks if these two `ArgAbi` are equal enough to be considered "the same for all
     /// function call ABIs".
-    pub fn eq_abi(&self, other: &Self) -> bool {
+    pub fn eq_abi(&self, other: &Self) -> bool
+    where
+        Ty: PartialEq,
+    {
         // Ideally we'd just compare the `mode`, but that is not enough -- for some modes LLVM will look
         // at the type.
-        self.layout.eq_abi(&other.layout) && self.mode.eq_abi(&other.mode)
+        self.layout.eq_abi(&other.layout) && self.mode.eq_abi(&other.mode) && {
+            // `fn_arg_sanity_check` accepts `PassMode::Direct` for some aggregates.
+            // That elevates any type difference to an ABI difference since we just use the
+            // full Rust type as the LLVM argument/return type.
+            if matches!(self.mode, PassMode::Direct(..))
+                && matches!(self.layout.abi, Abi::Aggregate { .. })
+            {
+                // For aggregates in `Direct` mode to be compatible, the types need to be equal.
+                self.layout.ty == other.layout.ty
+            } else {
+                true
+            }
+        }
     }
 }
 
@@ -741,6 +779,7 @@ pub enum Conv {
     // Target-specific calling conventions.
     ArmAapcs,
     CCmseNonSecureCall,
+    CCmseNonSecureEntry,
 
     Msp430Intr,
 
@@ -841,13 +880,13 @@ impl<'a, Ty> FnAbi<'a, Ty> {
     {
         if abi == spec::abi::Abi::X86Interrupt {
             if let Some(arg) = self.args.first_mut() {
-                // FIXME(pcwalton): This probably should use the x86 `byval` ABI...
-                arg.make_indirect_byval(None);
+                arg.pass_by_stack_offset(None);
             }
             return Ok(());
         }
 
-        match &cx.target_spec().arch[..] {
+        let spec = cx.target_spec();
+        match &spec.arch[..] {
             "x86" => {
                 let flavor = if let spec::abi::Abi::Fastcall { .. }
                 | spec::abi::Abi::Vectorcall { .. } = abi
@@ -860,10 +899,10 @@ impl<'a, Ty> FnAbi<'a, Ty> {
             }
             "x86_64" => match abi {
                 spec::abi::Abi::SysV64 { .. } => x86_64::compute_abi_info(cx, self),
-                spec::abi::Abi::Win64 { .. } => x86_win64::compute_abi_info(self),
+                spec::abi::Abi::Win64 { .. } => x86_win64::compute_abi_info(cx, self),
                 _ => {
                     if cx.target_spec().is_like_windows {
-                        x86_win64::compute_abi_info(self)
+                        x86_win64::compute_abi_info(cx, self)
                     } else {
                         x86_64::compute_abi_info(cx, self)
                     }
@@ -887,30 +926,30 @@ impl<'a, Ty> FnAbi<'a, Ty> {
             "csky" => csky::compute_abi_info(self),
             "mips" | "mips32r6" => mips::compute_abi_info(cx, self),
             "mips64" | "mips64r6" => mips64::compute_abi_info(cx, self),
-            "powerpc" => powerpc::compute_abi_info(self),
+            "powerpc" => powerpc::compute_abi_info(cx, self),
             "powerpc64" => powerpc64::compute_abi_info(cx, self),
             "s390x" => s390x::compute_abi_info(cx, self),
             "msp430" => msp430::compute_abi_info(self),
             "sparc" => sparc::compute_abi_info(cx, self),
             "sparc64" => sparc64::compute_abi_info(cx, self),
             "nvptx64" => {
-                if cx.target_spec().adjust_abi(cx, abi, self.c_variadic)
-                    == spec::abi::Abi::PtxKernel
-                {
+                if cx.target_spec().adjust_abi(abi, self.c_variadic) == spec::abi::Abi::PtxKernel {
                     nvptx64::compute_ptx_kernel_abi_info(cx, self)
                 } else {
                     nvptx64::compute_abi_info(self)
                 }
             }
             "hexagon" => hexagon::compute_abi_info(self),
+            "xtensa" => xtensa::compute_abi_info(cx, self),
             "riscv32" | "riscv64" => riscv::compute_abi_info(cx, self),
-            "wasm32" | "wasm64" => {
-                if cx.target_spec().adjust_abi(cx, abi, self.c_variadic) == spec::abi::Abi::Wasm {
+            "wasm32" => {
+                if spec.os == "unknown" && cx.wasm_c_abi_opt() == WasmCAbi::Legacy {
                     wasm::compute_wasm_abi_info(self)
                 } else {
                     wasm::compute_c_abi_info(cx, self)
                 }
             }
+            "wasm64" => wasm::compute_c_abi_info(cx, self),
             "bpf" => bpf::compute_abi_info(self),
             arch => {
                 return Err(AdjustForForeignAbiError::Unsupported {
@@ -934,6 +973,7 @@ impl FromStr for Conv {
             "RustCold" => Ok(Conv::Rust),
             "ArmAapcs" => Ok(Conv::ArmAapcs),
             "CCmseNonSecureCall" => Ok(Conv::CCmseNonSecureCall),
+            "CCmseNonSecureEntry" => Ok(Conv::CCmseNonSecureEntry),
             "Msp430Intr" => Ok(Conv::Msp430Intr),
             "PtxKernel" => Ok(Conv::PtxKernel),
             "X86Fastcall" => Ok(Conv::X86Fastcall),
@@ -959,8 +999,9 @@ impl FromStr for Conv {
 // Some types are used a lot. Make sure they don't unintentionally get bigger.
 #[cfg(target_pointer_width = "64")]
 mod size_asserts {
-    use super::*;
     use rustc_data_structures::static_assert_size;
+
+    use super::*;
     // tidy-alphabetical-start
     static_assert_size!(ArgAbi<'_, usize>, 56);
     static_assert_size!(FnAbi<'_, usize>, 80);

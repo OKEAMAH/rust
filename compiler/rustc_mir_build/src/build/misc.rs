@@ -1,12 +1,13 @@
 //! Miscellaneous builder routines that are not specific to building any particular
 //! kind of thing.
 
-use crate::build::Builder;
-
 use rustc_middle::mir::*;
 use rustc_middle::ty::{self, Ty};
 use rustc_span::Span;
 use rustc_trait_selection::infer::InferCtxtExt;
+use tracing::debug;
+
+use crate::build::Builder;
 
 impl<'a, 'tcx> Builder<'a, 'tcx> {
     /// Adds a new temporary value of type `ty` storing the result of
@@ -44,16 +45,11 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
     ) -> Place<'tcx> {
         let usize_ty = self.tcx.types.usize;
         let temp = self.temp(usize_ty, source_info.span);
-        self.cfg.push_assign_constant(
-            block,
-            source_info,
-            temp,
-            ConstOperand {
-                span: source_info.span,
-                user_ty: None,
-                const_: Const::from_usize(self.tcx, value),
-            },
-        );
+        self.cfg.push_assign_constant(block, source_info, temp, ConstOperand {
+            span: source_info.span,
+            user_ty: None,
+            const_: Const::from_usize(self.tcx, value),
+        });
         temp
     }
 

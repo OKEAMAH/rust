@@ -8,7 +8,6 @@
 
 #![feature(rustc_private)]
 #![feature(assert_matches)]
-#![feature(control_flow_enum)]
 #![feature(ascii_char, ascii_char_variants)]
 
 extern crate rustc_hir;
@@ -53,6 +52,21 @@ fn test_stable_mir() -> ControlFlow<()> {
     // Test variadic function.
     let variadic_fn = *get_item(&items, (ItemKind::Fn, "variadic_fn")).unwrap();
     check_variadic(variadic_fn);
+
+    // Extract function pointers.
+    let fn_ptr_holder = *get_item(&items, (ItemKind::Fn, "fn_ptr_holder")).unwrap();
+    let fn_ptr_holder_instance = Instance::try_from(fn_ptr_holder).unwrap();
+    let body = fn_ptr_holder_instance.body().unwrap();
+    let args = body.arg_locals();
+
+    // Test fn_abi of function pointer version.
+    let ptr_fn_abi = args[0].ty.kind().fn_sig().unwrap().fn_ptr_abi().unwrap();
+    assert_eq!(ptr_fn_abi, fn_abi);
+
+    // Test variadic_fn of function pointer version.
+    let ptr_variadic_fn_abi = args[1].ty.kind().fn_sig().unwrap().fn_ptr_abi().unwrap();
+    assert!(ptr_variadic_fn_abi.c_variadic);
+    assert_eq!(ptr_variadic_fn_abi.args.len(), 1);
 
     ControlFlow::Continue(())
 }
@@ -163,6 +177,14 @@ fn generate_input(path: &str) -> std::io::Result<()> {
 
         pub unsafe extern "C" fn variadic_fn(n: usize, mut args: ...) -> usize {{
             0
+        }}
+
+        pub type ComplexFn = fn([u8; 0], char, NonZero<u8>) -> Result<usize, &'static str>;
+        pub type VariadicFn = unsafe extern "C" fn(usize, ...) -> usize;
+
+        pub fn fn_ptr_holder(complex_fn: ComplexFn, variadic_fn: VariadicFn) {{
+            // We only care about the signature.
+            todo!()
         }}
         "#
     )?;

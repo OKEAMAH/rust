@@ -4,18 +4,18 @@
 
 #![stable(feature = "rust1", since = "1.0.0")]
 
-use super::platform::fs::MetadataExt as _;
-use crate::fs::{self, OpenOptions, Permissions};
-use crate::io;
-use crate::os::unix::io::{AsFd, AsRawFd};
-use crate::path::Path;
-use crate::sys;
-use crate::sys_common::{AsInner, AsInnerMut, FromInner};
-// Used for `File::read` on intra-doc links
-use crate::ffi::OsStr;
-use crate::sealed::Sealed;
 #[allow(unused_imports)]
 use io::{Read, Write};
+
+use super::platform::fs::MetadataExt as _;
+// Used for `File::read` on intra-doc links
+use crate::ffi::OsStr;
+use crate::fs::{self, OpenOptions, Permissions};
+use crate::os::unix::io::{AsFd, AsRawFd};
+use crate::path::Path;
+use crate::sealed::Sealed;
+use crate::sys_common::{AsInner, AsInnerMut, FromInner};
+use crate::{io, sys};
 
 // Tests for this module
 #[cfg(test)]
@@ -334,6 +334,7 @@ pub trait PermissionsExt {
     /// assert_eq!(permissions.mode(), 0o644);
     /// ```
     #[stable(feature = "fs_ext", since = "1.1.0")]
+    #[cfg_attr(not(test), rustc_diagnostic_item = "permissions_from_mode")]
     fn from_mode(mode: u32) -> Self;
 }
 
@@ -1064,7 +1065,7 @@ pub fn lchown<P: AsRef<Path>>(dir: P, uid: Option<u32>, gid: Option<u32>) -> io:
 /// }
 /// ```
 #[stable(feature = "unix_chroot", since = "1.56.0")]
-#[cfg(not(any(target_os = "fuchsia", target_os = "vxworks")))]
+#[cfg(not(target_os = "fuchsia"))]
 pub fn chroot<P: AsRef<Path>>(dir: P) -> io::Result<()> {
     sys::fs::chroot(dir.as_ref())
 }

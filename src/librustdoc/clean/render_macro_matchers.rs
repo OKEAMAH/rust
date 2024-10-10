@@ -1,11 +1,11 @@
 use rustc_ast::token::{self, BinOpToken, Delimiter, IdentIsRaw};
 use rustc_ast::tokenstream::{TokenStream, TokenTree};
-use rustc_ast_pretty::pprust::state::State as Printer;
 use rustc_ast_pretty::pprust::PrintState;
+use rustc_ast_pretty::pprust::state::State as Printer;
 use rustc_middle::ty::TyCtxt;
 use rustc_session::parse::ParseSess;
-use rustc_span::symbol::{kw, Ident, Symbol};
 use rustc_span::Span;
+use rustc_span::symbol::{Ident, Symbol, kw};
 
 /// Render a macro matcher in a format suitable for displaying to the user
 /// as part of an item declaration.
@@ -65,7 +65,7 @@ fn snippet_equal_to_token(tcx: TyCtxt<'_>, matcher: &TokenTree) -> Option<String
     let psess = ParseSess::new(rustc_driver::DEFAULT_LOCALE_RESOURCES.to_vec());
     let file_name = source_map.span_to_filename(span);
     let mut parser =
-        match rustc_parse::maybe_new_parser_from_source_str(&psess, file_name, snippet.clone()) {
+        match rustc_parse::new_parser_from_source_str(&psess, file_name, snippet.clone()) {
             Ok(parser) => parser,
             Err(errs) => {
                 errs.into_iter().for_each(|err| err.cancel());

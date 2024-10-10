@@ -1,5 +1,8 @@
 //! Propagates [`#[doc(cfg(...))]`](https://github.com/rust-lang/rust/issues/43781) to child items.
+
 use std::sync::Arc;
+
+use rustc_hir::def_id::LocalDefId;
 
 use crate::clean::cfg::Cfg;
 use crate::clean::inline::{load_attrs, merge_attrs};
@@ -7,8 +10,6 @@ use crate::clean::{Crate, Item, ItemKind};
 use crate::core::DocContext;
 use crate::fold::DocFolder;
 use crate::passes::Pass;
-
-use rustc_hir::def_id::LocalDefId;
 
 pub(crate) const PROPAGATE_DOC_CFG: Pass = Pass {
     name: "propagate-doc-cfg",
@@ -30,7 +31,7 @@ impl<'a, 'tcx> CfgPropagator<'a, 'tcx> {
     // Some items need to merge their attributes with their parents' otherwise a few of them
     // (mostly `cfg` ones) will be missing.
     fn merge_with_parent_attributes(&mut self, item: &mut Item) {
-        let check_parent = match &*item.kind {
+        let check_parent = match &item.kind {
             // impl blocks can be in different modules with different cfg and we need to get them
             // as well.
             ItemKind::ImplItem(_) => false,

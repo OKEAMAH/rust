@@ -1,10 +1,9 @@
 #![allow(incomplete_features)]
-#![feature(const_mut_refs)]
-#![feature(adt_const_params)]
+#![feature(adt_const_params, unsized_const_params)]
 
 struct T<const B: &'static bool>;
 
-impl <const B: &'static bool> T<B> {
+impl<const B: &'static bool> T<B> {
     const fn set_false(&self) {
         unsafe {
             *(B as *const bool as *mut bool) = false;
@@ -14,7 +13,7 @@ impl <const B: &'static bool> T<B> {
 }
 
 const _: () = {
-    let x = T::<{&true}>;
+    let x = T::<{ &true }>;
     x.set_false();
 };
 

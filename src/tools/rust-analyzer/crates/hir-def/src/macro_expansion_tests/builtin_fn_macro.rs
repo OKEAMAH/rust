@@ -50,11 +50,7 @@ fn main() {
     let i: u64 = 3;
     let o: u64;
     unsafe {
-        builtin #asm ( {
-            $crate::format_args!("mov {0}, {1}");
-            $crate::format_args!("add {0}, 5");
-        }
-        );
+        builtin #asm ("mov {0}, {1}", "add {0}, 5", out (reg)o, in (reg)i, );
     }
 }
 "##]],
@@ -154,7 +150,7 @@ fn main() { file!(); }
 #[rustc_builtin_macro]
 macro_rules! file {() => {}}
 
-fn main() { ""; }
+fn main() { "file"; }
 "##]],
     );
 }
@@ -439,7 +435,7 @@ macro_rules! include_bytes {
     ($file:expr,) => {{ /* compiler built-in */ }};
 }
 
-fn main() { include_bytes("foo"); }
+fn main() { include_bytes("foo");include_bytes(r"foo"); }
 "#,
         expect![[r##"
 #[rustc_builtin_macro]
@@ -448,7 +444,7 @@ macro_rules! include_bytes {
     ($file:expr,) => {{ /* compiler built-in */ }};
 }
 
-fn main() { include_bytes("foo"); }
+fn main() { include_bytes("foo");include_bytes(r"foo"); }
 "##]],
     );
 }
@@ -460,13 +456,13 @@ fn test_concat_expand() {
 #[rustc_builtin_macro]
 macro_rules! concat {}
 
-fn main() { concat!("fo", "o", 0, r#"bar"#, "\n", false, '"', '\0'); }
+fn main() { concat!("fo", "o", 0, r#""bar""#, "\n", false, '"', '\0'); }
 "##,
         expect![[r##"
 #[rustc_builtin_macro]
 macro_rules! concat {}
 
-fn main() { "foo0bar\nfalse\"\u{0}"; }
+fn main() { "foo0\"bar\"\nfalse\"\u{0}"; }
 "##]],
     );
 }
@@ -478,13 +474,13 @@ fn test_concat_bytes_expand() {
 #[rustc_builtin_macro]
 macro_rules! concat_bytes {}
 
-fn main() { concat_bytes!(b'A', b"BC", [68, b'E', 70]); }
+fn main() { concat_bytes!(b'A', b"BC\"", [68, b'E', 70], br#"G""#,b'\0'); }
 "##,
         expect![[r#"
 #[rustc_builtin_macro]
 macro_rules! concat_bytes {}
 
-fn main() { [b'A', 66, 67, 68, b'E', 70]; }
+fn main() { b"ABC\"DEFG\"\x00"; }
 "#]],
     );
 }
@@ -529,6 +525,24 @@ fn main() { concat_idents!(foo, bar); }
 macro_rules! concat_idents {}
 
 fn main() { foobar; }
+"##]],
+    );
+}
+
+#[test]
+fn test_quote_string() {
+    check(
+        r##"
+#[rustc_builtin_macro]
+macro_rules! stringify {}
+
+fn main() { stringify!("hello"); }
+"##,
+        expect![[r##"
+#[rustc_builtin_macro]
+macro_rules! stringify {}
+
+fn main() { "\"hello\""; }
 "##]],
     );
 }

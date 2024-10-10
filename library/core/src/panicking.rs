@@ -1,7 +1,14 @@
 //! Panic support for core
 //!
-//! The core library cannot define panicking, but it does *declare* panicking. This
-//! means that the functions inside of core are allowed to panic, but to be
+//! In core, panicking is always done with a message, resulting in a `core::panic::PanicInfo`
+//! containing a `fmt::Arguments`. In std, however, panicking can be done with panic_any, which
+//! throws a `Box<dyn Any>` containing any type of value. Because of this,
+//! `std::panic::PanicHookInfo` is a different type, which contains a `&dyn Any` instead of a
+//! `fmt::Arguments`. std's panic handler will convert the `fmt::Arguments` to a `&dyn Any`
+//! containing either a `&'static str` or `String` containing the formatted message.
+//!
+//! The core library cannot define any panic handler, but it can invoke it.
+//! This means that the functions inside of core are allowed to panic, but to be
 //! useful an upstream crate must define panicking for core to use. The current
 //! interface for panicking is:
 //!
@@ -9,11 +16,6 @@
 //! fn panic_impl(pi: &core::panic::PanicInfo<'_>) -> !
 //! # { loop {} }
 //! ```
-//!
-//! This definition allows for panicking with any general message, but it does not
-//! allow for failing with a `Box<Any>` value. (`PanicInfo` just contains a `&(dyn Any + Send)`,
-//! for which we fill in a dummy value in `PanicInfo::internal_constructor`.)
-//! The reason for this is that core is not allowed to allocate.
 //!
 //! This module contains a few other panicking functions, but these are just the
 //! necessary lang items for the compiler. All panics are funneled through this
@@ -61,8 +63,8 @@ pub const fn panic_fmt(fmt: fmt::Arguments<'_>) -> ! {
         fn panic_impl(pi: &PanicInfo<'_>) -> !;
     }
 
-    let pi = PanicInfo::internal_constructor(
-        Some(&fmt),
+    let pi = PanicInfo::new(
+        &fmt,
         Location::caller(),
         /* can_unwind */ true,
         /* force_no_backtrace */ false,
@@ -99,8 +101,8 @@ pub const fn panic_nounwind_fmt(fmt: fmt::Arguments<'_>, force_no_backtrace: boo
         }
 
         // PanicInfo with the `can_unwind` flag set to false forces an abort.
-        let pi = PanicInfo::internal_constructor(
-            Some(&fmt),
+        let pi = PanicInfo::new(
+            &fmt,
             Location::caller(),
             /* can_unwind */ false,
             force_no_backtrace,
@@ -262,7 +264,7 @@ pub const fn panic_display<T: fmt::Display>(x: &T) -> ! {
     panic_fmt(format_args!("{}", *x));
 }
 
-#[cfg_attr(not(feature = "panic_immediate_abort"), inline(never), cold)]
+#[cfg_attr(not(feature = "panic_immediate_abort"), inline(never), cold, optimize(size))]
 #[cfg_attr(feature = "panic_immediate_abort", inline)]
 #[track_caller]
 #[lang = "panic_bounds_check"] // needed by codegen for panic on OOB array/slice access
@@ -274,7 +276,7 @@ fn panic_bounds_check(index: usize, len: usize) -> ! {
     panic!("index out of bounds: the len is {len} but the index is {index}")
 }
 
-#[cfg_attr(not(feature = "panic_immediate_abort"), inline(never), cold)]
+#[cfg_attr(not(feature = "panic_immediate_abort"), inline(never), cold, optimize(size))]
 #[cfg_attr(feature = "panic_immediate_abort", inline)]
 #[track_caller]
 #[lang = "panic_misaligned_pointer_dereference"] // needed by codegen for panic on misaligned pointer deref
@@ -292,13 +294,14 @@ fn panic_misaligned_pointer_dereference(required: usize, found: usize) -> ! {
     )
 }
 
-/// Panic because we cannot unwind out of a function.
+/// Panics because we cannot unwind out of a function.
 ///
 /// This is a separate function to avoid the codesize impact of each crate containing the string to
 /// pass to `panic_nounwind`.
+///
 /// This function is called directly by the codegen backend, and must not have
 /// any extra arguments (including those synthesized by track_caller).
-#[cfg_attr(not(feature = "panic_immediate_abort"), inline(never), cold)]
+#[cfg_attr(not(feature = "panic_immediate_abort"), inline(never), cold, optimize(size))]
 #[cfg_attr(feature = "panic_immediate_abort", inline)]
 #[lang = "panic_cannot_unwind"] // needed by codegen for panic in nounwind function
 #[rustc_nounwind]
@@ -307,13 +310,14 @@ fn panic_cannot_unwind() -> ! {
     panic_nounwind("panic in a function that cannot unwind")
 }
 
-/// Panic because we are unwinding out of a destructor during cleanup.
+/// Panics because we are unwinding out of a destructor during cleanup.
 ///
 /// This is a separate function to avoid the codesize impact of each crate containing the string to
 /// pass to `panic_nounwind`.
+///
 /// This function is called directly by the codegen backend, and must not have
 /// any extra arguments (including those synthesized by track_caller).
-#[cfg_attr(not(feature = "panic_immediate_abort"), inline(never), cold)]
+#[cfg_attr(not(feature = "panic_immediate_abort"), inline(never), cold, optimize(size))]
 #[cfg_attr(feature = "panic_immediate_abort", inline)]
 #[lang = "panic_in_cleanup"] // needed by codegen for panic in nounwind function
 #[rustc_nounwind]
@@ -346,7 +350,7 @@ pub enum AssertKind {
 }
 
 /// Internal function for `assert_eq!` and `assert_ne!` macros
-#[cfg_attr(not(feature = "panic_immediate_abort"), inline(never), cold)]
+#[cfg_attr(not(feature = "panic_immediate_abort"), inline(never), cold, optimize(size))]
 #[cfg_attr(feature = "panic_immediate_abort", inline)]
 #[track_caller]
 #[doc(hidden)]
@@ -364,7 +368,7 @@ where
 }
 
 /// Internal function for `assert_match!`
-#[cfg_attr(not(feature = "panic_immediate_abort"), inline(never), cold)]
+#[cfg_attr(not(feature = "panic_immediate_abort"), inline(never), cold, optimize(size))]
 #[cfg_attr(feature = "panic_immediate_abort", inline)]
 #[track_caller]
 #[doc(hidden)]
@@ -384,7 +388,7 @@ pub fn assert_matches_failed<T: fmt::Debug + ?Sized>(
 }
 
 /// Non-generic version of the above functions, to avoid code bloat.
-#[cfg_attr(not(feature = "panic_immediate_abort"), inline(never), cold)]
+#[cfg_attr(not(feature = "panic_immediate_abort"), inline(never), cold, optimize(size))]
 #[cfg_attr(feature = "panic_immediate_abort", inline)]
 #[track_caller]
 fn assert_failed_inner(

@@ -1,7 +1,9 @@
-use crate::middle::region::{Scope, ScopeData, ScopeTree};
 use rustc_hir as hir;
 use rustc_hir::ItemLocalMap;
 use rustc_macros::{HashStable, TyDecodable, TyEncodable};
+use tracing::debug;
+
+use crate::middle::region::{Scope, ScopeData, ScopeTree};
 
 /// `RvalueScopes` is a mapping from sub-expressions to _extended_ lifetime as determined by
 /// rules laid out in `rustc_hir_analysis::check::rvalue_scopes`.
@@ -39,7 +41,15 @@ impl RvalueScopes {
                     debug!("temporary_scope({expr_id:?}) = {id:?} [enclosing]");
                     return Some(id);
                 }
-                _ => id = p,
+                ScopeData::IfThenRescope => {
+                    debug!("temporary_scope({expr_id:?}) = {p:?} [enclosing]");
+                    return Some(p);
+                }
+                ScopeData::Node
+                | ScopeData::CallSite
+                | ScopeData::Arguments
+                | ScopeData::IfThen
+                | ScopeData::Remainder(_) => id = p,
             }
         }
 

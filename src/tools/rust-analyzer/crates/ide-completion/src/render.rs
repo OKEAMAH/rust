@@ -10,14 +10,14 @@ pub(crate) mod type_alias;
 pub(crate) mod union_literal;
 pub(crate) mod variant;
 
-use hir::{AsAssocItem, HasAttrs, HirDisplay, ModuleDef, ScopeDef, Type};
+use hir::{sym, AsAssocItem, HasAttrs, HirDisplay, ModuleDef, ScopeDef, Type};
 use ide_db::{
     documentation::{Documentation, HasDocs},
     helpers::item_name,
     imports::import_assets::LocatedImport,
     RootDatabase, SnippetCap, SymbolKind,
 };
-use syntax::{ast, format_smolstr, AstNode, SmolStr, SyntaxKind, TextRange};
+use syntax::{ast, format_smolstr, AstNode, Edition, SmolStr, SyntaxKind, TextRange, ToSmolStr};
 use text_edit::TextEdit;
 
 use crate::{
@@ -95,7 +95,7 @@ impl<'a> RenderContext<'a> {
 
     fn is_deprecated(&self, def: impl HasAttrs) -> bool {
         let attrs = def.attrs(self.db());
-        attrs.by_key("deprecated").exists()
+        attrs.by_key(&sym::deprecated).exists()
     }
 
     fn is_deprecated_assoc_item(&self, as_assoc_item: impl AsAssocItem) -> bool {
@@ -133,18 +133,22 @@ pub(crate) fn render_field(
     let db = ctx.db();
     let is_deprecated = ctx.is_deprecated(field);
     let name = field.name(db);
-    let (name, escaped_name) = (name.unescaped().to_smol_str(), name.to_smol_str());
+    let (name, escaped_name) = (
+        name.unescaped().display(db).to_smolstr(),
+        name.display_no_db(ctx.completion.edition).to_smolstr(),
+    );
     let mut item = CompletionItem::new(
         SymbolKind::Field,
         ctx.source_range(),
-        field_with_receiver(db, receiver.as_ref(), &name),
+        field_with_receiver(db, receiver.as_ref(), &name, ctx.completion.edition),
+        ctx.completion.edition,
     );
     item.set_relevance(CompletionRelevance {
         type_match: compute_type_match(ctx.completion, ty),
         exact_name_match: compute_exact_name_match(ctx.completion, name.as_str()),
         ..CompletionRelevance::default()
     });
-    item.detail(ty.display(db).to_string())
+    item.detail(ty.display(db, ctx.completion.edition).to_string())
         .set_documentation(field.docs(db))
         .set_deprecated(is_deprecated)
         .lookup_by(name);
@@ -158,7 +162,8 @@ pub(crate) fn render_field(
 
         builder.replace(
             ctx.source_range(),
-            field_with_receiver(db, receiver.as_ref(), &escaped_name).into(),
+            field_with_receiver(db, receiver.as_ref(), &escaped_name, ctx.completion.edition)
+                .into(),
         );
 
         let expected_fn_type =
@@ -182,7 +187,12 @@ pub(crate) fn render_field(
 
         item.text_edit(builder.finish());
     } else {
-        item.insert_text(field_with_receiver(db, receiver.as_ref(), &escaped_name));
+        item.insert_text(field_with_receiver(
+            db,
+            receiver.as_ref(),
+            &escaped_name,
+            ctx.completion.edition,
+        ));
     }
     if let Some(receiver) = &dot_access.receiver {
         if let Some(original) = ctx.completion.sema.original_ast_node(receiver.clone()) {
@@ -199,10 +209,11 @@ fn field_with_receiver(
     db: &RootDatabase,
     receiver: Option<&hir::Name>,
     field_name: &str,
+    edition: Edition,
 ) -> SmolStr {
     receiver.map_or_else(
         || field_name.into(),
-        |receiver| format_smolstr!("{}.{field_name}", receiver.display(db)),
+        |receiver| format_smolstr!("{}.{field_name}", receiver.display(db, edition)),
     )
 }
 
@@ -215,9 +226,16 @@ pub(crate) fn render_tuple_field(
     let mut item = CompletionItem::new(
         SymbolKind::Field,
         ctx.source_range(),
-        field_with_receiver(ctx.db(), receiver.as_ref(), &field.to_string()),
+        field_with_receiver(
+            ctx.db(),
+            receiver.as_ref(),
+            &field.to_string(),
+            ctx.completion.edition,
+        ),
+        ctx.completion.edition,
     );
-    item.detail(ty.display(ctx.db()).to_string()).lookup_by(field.to_string());
+    item.detail(ty.display(ctx.db(), ctx.completion.edition).to_string())
+        .lookup_by(field.to_string());
     item.build(ctx.db())
 }
 
@@ -225,9 +243,17 @@ pub(crate) fn render_type_inference(
     ty_string: String,
     ctx: &CompletionContext<'_>,
 ) -> CompletionItem {
-    let mut builder =
-        CompletionItem::new(CompletionItemKind::InferredType, ctx.source_range(), ty_string);
-    builder.set_relevance(CompletionRelevance { is_definite: true, ..Default::default() });
+    let mut builder = CompletionItem::new(
+        CompletionItemKind::InferredType,
+        ctx.source_range(),
+        ty_string,
+        ctx.edition,
+    );
+    builder.set_relevance(CompletionRelevance {
+        type_match: Some(CompletionRelevanceTypeMatch::Exact),
+        exact_name_match: true,
+        ..Default::default()
+    });
     builder.build(ctx.db)
 }
 
@@ -280,8 +306,7 @@ pub(crate) fn render_expr(
     let mut snippet_formatter = |ty: &hir::Type| {
         let arg_name = ty
             .as_adt()
-            .and_then(|adt| adt.name(ctx.db).as_text())
-            .map(|s| stdx::to_lower_snake_case(s.as_str()))
+            .map(|adt| stdx::to_lower_snake_case(adt.name(ctx.db).as_str()))
             .unwrap_or_else(|| String::from("_"));
         let res = format!("${{{i}:{arg_name}}}");
         i += 1;
@@ -290,19 +315,13 @@ pub(crate) fn render_expr(
 
     let mut label_formatter = |ty: &hir::Type| {
         ty.as_adt()
-            .and_then(|adt| adt.name(ctx.db).as_text())
-            .map(|s| stdx::to_lower_snake_case(s.as_str()))
+            .map(|adt| stdx::to_lower_snake_case(adt.name(ctx.db).as_str()))
             .unwrap_or_else(|| String::from("..."))
     };
 
-    let label = expr
-        .gen_source_code(
-            &ctx.scope,
-            &mut label_formatter,
-            ctx.config.prefer_no_std,
-            ctx.config.prefer_prelude,
-        )
-        .ok()?;
+    let cfg = ctx.config.import_path_config();
+
+    let label = expr.gen_source_code(&ctx.scope, &mut label_formatter, cfg, ctx.edition).ok()?;
 
     let source_range = match ctx.original_token.parent() {
         Some(node) => match node.ancestors().find_map(ast::Path::cast) {
@@ -312,17 +331,12 @@ pub(crate) fn render_expr(
         None => ctx.source_range(),
     };
 
-    let mut item = CompletionItem::new(CompletionItemKind::Expression, source_range, label);
+    let mut item =
+        CompletionItem::new(CompletionItemKind::Expression, source_range, label, ctx.edition);
 
     let snippet = format!(
         "{}$0",
-        expr.gen_source_code(
-            &ctx.scope,
-            &mut snippet_formatter,
-            ctx.config.prefer_no_std,
-            ctx.config.prefer_prelude
-        )
-        .ok()?
+        expr.gen_source_code(&ctx.scope, &mut snippet_formatter, cfg, ctx.edition).ok()?
     );
     let edit = TextEdit::replace(source_range, snippet);
     item.snippet_edit(ctx.config.snippet_cap?, edit);
@@ -333,12 +347,7 @@ pub(crate) fn render_expr(
     });
     for trait_ in expr.traits_used(ctx.db) {
         let trait_item = hir::ItemInNs::from(hir::ModuleDef::from(trait_));
-        let Some(path) = ctx.module.find_use_path(
-            ctx.db,
-            trait_item,
-            ctx.config.prefer_no_std,
-            ctx.config.prefer_prelude,
-        ) else {
+        let Some(path) = ctx.module.find_path(ctx.db, trait_item, cfg) else {
             continue;
         };
 
@@ -368,7 +377,7 @@ fn render_resolution_pat(
     import_to_add: Option<LocatedImport>,
     resolution: ScopeDef,
 ) -> Builder {
-    let _p = tracing::span!(tracing::Level::INFO, "render_resolution_pat").entered();
+    let _p = tracing::info_span!("render_resolution_pat").entered();
     use hir::ModuleDef::*;
 
     if let ScopeDef::ModuleDef(Macro(mac)) = resolution {
@@ -386,7 +395,7 @@ fn render_resolution_path(
     import_to_add: Option<LocatedImport>,
     resolution: ScopeDef,
 ) -> Builder {
-    let _p = tracing::span!(tracing::Level::INFO, "render_resolution_path").entered();
+    let _p = tracing::info_span!("render_resolution_path").entered();
     use hir::ModuleDef::*;
 
     match resolution {
@@ -415,10 +424,10 @@ fn render_resolution_path(
     let config = completion.config;
     let requires_import = import_to_add.is_some();
 
-    let name = local_name.to_smol_str();
+    let name = local_name.display_no_db(ctx.completion.edition).to_smolstr();
     let mut item = render_resolution_simple_(ctx, &local_name, import_to_add, resolution);
-    if local_name.is_escaped() {
-        item.insert_text(local_name.to_smol_str());
+    if local_name.is_escaped(completion.edition) {
+        item.insert_text(local_name.display_no_db(completion.edition).to_smolstr());
     }
     // Add `<>` for generic types
     let type_path_no_ty_args = matches!(
@@ -440,14 +449,17 @@ fn render_resolution_path(
                 item.lookup_by(name.clone())
                     .label(SmolStr::from_iter([&name, "<…>"]))
                     .trigger_call_info()
-                    .insert_snippet(cap, format!("{}<$0>", local_name.display(db)));
+                    .insert_snippet(
+                        cap,
+                        format!("{}<$0>", local_name.display(db, completion.edition)),
+                    );
             }
         }
     }
 
     let mut set_item_relevance = |ty: Type| {
         if !ty.is_unknown() {
-            item.detail(ty.display(db).to_string());
+            item.detail(ty.display(db, completion.edition).to_string());
         }
 
         item.set_relevance(CompletionRelevance {
@@ -494,14 +506,18 @@ fn render_resolution_simple_(
     import_to_add: Option<LocatedImport>,
     resolution: ScopeDef,
 ) -> Builder {
-    let _p = tracing::span!(tracing::Level::INFO, "render_resolution_simple_").entered();
+    let _p = tracing::info_span!("render_resolution_simple_").entered();
 
     let db = ctx.db();
     let ctx = ctx.import_to_add(import_to_add);
     let kind = res_to_kind(resolution);
 
-    let mut item =
-        CompletionItem::new(kind, ctx.source_range(), local_name.unescaped().to_smol_str());
+    let mut item = CompletionItem::new(
+        kind,
+        ctx.source_range(),
+        local_name.unescaped().display(db).to_smolstr(),
+        ctx.completion.edition,
+    );
     item.set_relevance(ctx.completion_relevance())
         .set_documentation(scope_def_docs(db, resolution))
         .set_deprecated(scope_def_is_deprecated(&ctx, resolution));
@@ -744,7 +760,7 @@ mod tests {
                     relevance.postfix_match == Some(CompletionRelevancePostfixMatch::Exact),
                     "snippet",
                 ),
-                (relevance.is_op_method, "op_method"),
+                (relevance.trait_.map_or(false, |it| it.is_op_method), "op_method"),
                 (relevance.requires_import, "requires_import"),
             ]
             .into_iter()
@@ -779,6 +795,7 @@ fn main() {
 "#,
             expect![[r#"
                 st dep::test_mod_b::Struct {…} [type_could_unify]
+                ex dep::test_mod_b::Struct {  } [type_could_unify]
                 st Struct (use dep::test_mod_b::Struct) [type_could_unify+requires_import]
                 fn main() []
                 fn test(…) []
@@ -854,6 +871,7 @@ fn main() {
 "#,
             expect![[r#"
                 ev dep::test_mod_b::Enum::variant [type_could_unify]
+                ex dep::test_mod_b::Enum::variant [type_could_unify]
                 en Enum (use dep::test_mod_b::Enum) [type_could_unify+requires_import]
                 fn main() []
                 fn test(…) []
@@ -891,6 +909,7 @@ fn main() {
 "#,
             expect![[r#"
                 ev dep::test_mod_b::Enum::Variant [type_could_unify]
+                ex dep::test_mod_b::Enum::Variant [type_could_unify]
                 fn main() []
                 fn test(…) []
                 md dep []
@@ -1166,7 +1185,7 @@ fn main() { fo$0 }
                         label: "main()",
                         source_range: 68..70,
                         delete: 68..70,
-                        insert: "main()$0",
+                        insert: "main();$0",
                         kind: SymbolKind(
                             Function,
                         ),
@@ -1225,7 +1244,7 @@ fn main() { let _: m::Spam = S$0 }
                         label: "main()",
                         source_range: 75..76,
                         delete: 75..76,
-                        insert: "main()$0",
+                        insert: "main();$0",
                         kind: SymbolKind(
                             Function,
                         ),
@@ -1257,14 +1276,11 @@ fn main() { let _: m::Spam = S$0 }
                                 Exact,
                             ),
                             is_local: false,
-                            is_item_from_trait: false,
-                            is_item_from_notable_trait: false,
+                            trait_: None,
                             is_name_already_imported: false,
                             requires_import: false,
-                            is_op_method: false,
                             is_private_editable: false,
                             postfix_match: None,
-                            is_definite: false,
                             function: None,
                         },
                         trigger_call_info: true,
@@ -1285,14 +1301,11 @@ fn main() { let _: m::Spam = S$0 }
                                 Exact,
                             ),
                             is_local: false,
-                            is_item_from_trait: false,
-                            is_item_from_notable_trait: false,
+                            trait_: None,
                             is_name_already_imported: false,
                             requires_import: false,
-                            is_op_method: false,
                             is_private_editable: false,
                             postfix_match: None,
-                            is_definite: false,
                             function: None,
                         },
                         trigger_call_info: true,
@@ -1318,7 +1331,7 @@ fn main() { som$0 }
                         label: "main()",
                         source_range: 56..59,
                         delete: 56..59,
-                        insert: "main()$0",
+                        insert: "main();$0",
                         kind: SymbolKind(
                             Function,
                         ),
@@ -1329,7 +1342,7 @@ fn main() { som$0 }
                         label: "something_deprecated()",
                         source_range: 56..59,
                         delete: 56..59,
-                        insert: "something_deprecated()$0",
+                        insert: "something_deprecated();$0",
                         kind: SymbolKind(
                             Function,
                         ),
@@ -1365,14 +1378,11 @@ fn foo() { A { the$0 } }
                                 CouldUnify,
                             ),
                             is_local: false,
-                            is_item_from_trait: false,
-                            is_item_from_notable_trait: false,
+                            trait_: None,
                             is_name_already_imported: false,
                             requires_import: false,
-                            is_op_method: false,
                             is_private_editable: false,
                             postfix_match: None,
-                            is_definite: false,
                             function: None,
                         },
                     },
@@ -1403,7 +1413,7 @@ impl S {
                         label: "bar()",
                         source_range: 94..94,
                         delete: 94..94,
-                        insert: "bar()$0",
+                        insert: "bar();$0",
                         kind: SymbolKind(
                             Method,
                         ),
@@ -1416,14 +1426,11 @@ impl S {
                             exact_name_match: false,
                             type_match: None,
                             is_local: false,
-                            is_item_from_trait: false,
-                            is_item_from_notable_trait: false,
+                            trait_: None,
                             is_name_already_imported: false,
                             requires_import: false,
-                            is_op_method: false,
                             is_private_editable: false,
                             postfix_match: None,
-                            is_definite: false,
                             function: Some(
                                 CompletionRelevanceFn {
                                     has_params: true,
@@ -1533,7 +1540,7 @@ fn foo(s: S) { s.$0 }
                         label: "the_method()",
                         source_range: 81..81,
                         delete: 81..81,
-                        insert: "the_method()$0",
+                        insert: "the_method();$0",
                         kind: SymbolKind(
                             Method,
                         ),
@@ -1543,14 +1550,11 @@ fn foo(s: S) { s.$0 }
                             exact_name_match: false,
                             type_match: None,
                             is_local: false,
-                            is_item_from_trait: false,
-                            is_item_from_notable_trait: false,
+                            trait_: None,
                             is_name_already_imported: false,
                             requires_import: false,
-                            is_op_method: false,
                             is_private_editable: false,
                             postfix_match: None,
-                            is_definite: false,
                             function: Some(
                                 CompletionRelevanceFn {
                                     has_params: true,
@@ -1759,14 +1763,11 @@ fn f() -> i32 {
                                 Exact,
                             ),
                             is_local: false,
-                            is_item_from_trait: false,
-                            is_item_from_notable_trait: false,
+                            trait_: None,
                             is_name_already_imported: false,
                             requires_import: false,
-                            is_op_method: false,
                             is_private_editable: false,
                             postfix_match: None,
-                            is_definite: false,
                             function: None,
                         },
                     },
@@ -1814,6 +1815,7 @@ fn go(world: &WorldSnapshot) { go(w$0) }
 "#,
             expect![[r#"
                 lc world [type+name+local]
+                ex world [type]
                 st WorldSnapshot {…} []
                 st &WorldSnapshot {…} [type]
                 st WorldSnapshot []
@@ -1853,7 +1855,6 @@ fn f() { A { bar: b$0 }; }
                 fn baz() [type]
                 ex baz() [type]
                 ex bar() [type]
-                ex A { bar: ... }.bar [type]
                 st A []
                 fn f() []
             "#]],
@@ -1992,7 +1993,6 @@ fn main() {
             "#,
             expect![[r#"
                 ex core::ops::Deref::deref(&t) (use core::ops::Deref) [type_could_unify]
-                ex core::ops::Deref::deref(&T(S)) (use core::ops::Deref) [type_could_unify]
                 lc m [local]
                 lc t [local]
                 lc &t [type+local]
@@ -2042,7 +2042,6 @@ fn main() {
             "#,
             expect![[r#"
                 ex core::ops::DerefMut::deref_mut(&mut t) (use core::ops::DerefMut) [type_could_unify]
-                ex core::ops::DerefMut::deref_mut(&mut T(S)) (use core::ops::DerefMut) [type_could_unify]
                 lc m [local]
                 lc t [local]
                 lc &mut t [type+local]
@@ -2146,7 +2145,6 @@ fn main() {
 }
 "#,
             expect![[r#"
-                ex core::ops::Deref::deref(&T(S)) (use core::ops::Deref) [type_could_unify]
                 ex core::ops::Deref::deref(&bar()) (use core::ops::Deref) [type_could_unify]
                 st S []
                 st &S [type]
@@ -2480,14 +2478,11 @@ fn foo(f: Foo) { let _: &u32 = f.b$0 }
                             exact_name_match: false,
                             type_match: None,
                             is_local: false,
-                            is_item_from_trait: false,
-                            is_item_from_notable_trait: false,
+                            trait_: None,
                             is_name_already_imported: false,
                             requires_import: false,
-                            is_op_method: false,
                             is_private_editable: false,
                             postfix_match: None,
-                            is_definite: false,
                             function: Some(
                                 CompletionRelevanceFn {
                                     has_params: true,
@@ -2562,14 +2557,11 @@ fn foo() {
                                 Exact,
                             ),
                             is_local: false,
-                            is_item_from_trait: false,
-                            is_item_from_notable_trait: false,
+                            trait_: None,
                             is_name_already_imported: false,
                             requires_import: false,
-                            is_op_method: false,
                             is_private_editable: false,
                             postfix_match: None,
-                            is_definite: false,
                             function: None,
                         },
                     },
@@ -2612,14 +2604,11 @@ fn main() {
                             exact_name_match: false,
                             type_match: None,
                             is_local: false,
-                            is_item_from_trait: false,
-                            is_item_from_notable_trait: false,
+                            trait_: None,
                             is_name_already_imported: false,
                             requires_import: false,
-                            is_op_method: false,
                             is_private_editable: false,
                             postfix_match: None,
-                            is_definite: false,
                             function: Some(
                                 CompletionRelevanceFn {
                                     has_params: false,
@@ -2800,7 +2789,7 @@ fn main() {
             r#"
 mod m { pub fn r#type {} }
 fn main() {
-    m::r#type()$0
+    m::r#type();$0
 }
 "#,
         )
@@ -2974,7 +2963,7 @@ fn main() {
                         label: "flush()",
                         source_range: 193..193,
                         delete: 193..193,
-                        insert: "flush()$0",
+                        insert: "flush();$0",
                         kind: SymbolKind(
                             Method,
                         ),
@@ -2984,14 +2973,16 @@ fn main() {
                             exact_name_match: false,
                             type_match: None,
                             is_local: false,
-                            is_item_from_trait: false,
-                            is_item_from_notable_trait: true,
+                            trait_: Some(
+                                CompletionRelevanceTraitInfo {
+                                    notable_trait: true,
+                                    is_op_method: false,
+                                },
+                            ),
                             is_name_already_imported: false,
                             requires_import: false,
-                            is_op_method: false,
                             is_private_editable: false,
                             postfix_match: None,
-                            is_definite: false,
                             function: None,
                         },
                     },
@@ -2999,7 +2990,7 @@ fn main() {
                         label: "write()",
                         source_range: 193..193,
                         delete: 193..193,
-                        insert: "write()$0",
+                        insert: "write();$0",
                         kind: SymbolKind(
                             Method,
                         ),
@@ -3009,14 +3000,16 @@ fn main() {
                             exact_name_match: false,
                             type_match: None,
                             is_local: false,
-                            is_item_from_trait: false,
-                            is_item_from_notable_trait: true,
+                            trait_: Some(
+                                CompletionRelevanceTraitInfo {
+                                    notable_trait: true,
+                                    is_op_method: false,
+                                },
+                            ),
                             is_name_already_imported: false,
                             requires_import: false,
-                            is_op_method: false,
                             is_private_editable: false,
                             postfix_match: None,
-                            is_definite: false,
                             function: None,
                         },
                     },

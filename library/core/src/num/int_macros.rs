@@ -183,6 +183,30 @@ macro_rules! int_impl {
             (self as $UnsignedT).trailing_ones()
         }
 
+        /// Returns the bit pattern of `self` reinterpreted as an unsigned integer of the same size.
+        ///
+        /// This produces the same result as an `as` cast, but ensures that the bit-width remains
+        /// the same.
+        ///
+        /// # Examples
+        ///
+        /// Basic usage:
+        ///
+        /// ```
+        /// #![feature(integer_sign_cast)]
+        ///
+        #[doc = concat!("let n = -1", stringify!($SelfT), ";")]
+        ///
+        #[doc = concat!("assert_eq!(n.cast_unsigned(), ", stringify!($UnsignedT), "::MAX);")]
+        /// ```
+        #[unstable(feature = "integer_sign_cast", issue = "125882")]
+        #[must_use = "this returns the result of the operation, \
+                      without modifying the original"]
+        #[inline(always)]
+        pub const fn cast_unsigned(self) -> $UnsignedT {
+            self as $UnsignedT
+        }
+
         /// Shifts the bits to the left by a specified amount, `n`,
         /// wrapping the truncated bits to the end of the resulting integer.
         ///
@@ -460,7 +484,7 @@ macro_rules! int_impl {
         #[track_caller]
         pub const fn strict_add(self, rhs: Self) -> Self {
             let (a, b) = self.overflowing_add(rhs);
-            if unlikely!(b) { overflow_panic::add() } else { a }
+            if b { overflow_panic::add() } else { a }
         }
 
         /// Unchecked integer addition. Computes `self + rhs`, assuming overflow
@@ -488,9 +512,19 @@ macro_rules! int_impl {
         #[inline(always)]
         #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
         pub const unsafe fn unchecked_add(self, rhs: Self) -> Self {
-            // SAFETY: the caller must uphold the safety contract for
-            // `unchecked_add`.
-            unsafe { intrinsics::unchecked_add(self, rhs) }
+            assert_unsafe_precondition!(
+                check_language_ub,
+                concat!(stringify!($SelfT), "::unchecked_add cannot overflow"),
+                (
+                    lhs: $SelfT = self,
+                    rhs: $SelfT = rhs,
+                ) => !lhs.overflowing_add(rhs).1,
+            );
+
+            // SAFETY: this is guaranteed to be safe by the caller.
+            unsafe {
+                intrinsics::unchecked_add(self, rhs)
+            }
         }
 
         /// Checked addition with an unsigned integer. Computes `self + rhs`,
@@ -546,7 +580,7 @@ macro_rules! int_impl {
         #[track_caller]
         pub const fn strict_add_unsigned(self, rhs: $UnsignedT) -> Self {
             let (a, b) = self.overflowing_add_unsigned(rhs);
-            if unlikely!(b) { overflow_panic::add() } else { a }
+            if b { overflow_panic::add() } else { a }
         }
 
         /// Checked integer subtraction. Computes `self - rhs`, returning `None` if
@@ -602,7 +636,7 @@ macro_rules! int_impl {
         #[track_caller]
         pub const fn strict_sub(self, rhs: Self) -> Self {
             let (a, b) = self.overflowing_sub(rhs);
-            if unlikely!(b) { overflow_panic::sub() } else { a }
+            if b { overflow_panic::sub() } else { a }
         }
 
         /// Unchecked integer subtraction. Computes `self - rhs`, assuming overflow
@@ -630,9 +664,19 @@ macro_rules! int_impl {
         #[inline(always)]
         #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
         pub const unsafe fn unchecked_sub(self, rhs: Self) -> Self {
-            // SAFETY: the caller must uphold the safety contract for
-            // `unchecked_sub`.
-            unsafe { intrinsics::unchecked_sub(self, rhs) }
+            assert_unsafe_precondition!(
+                check_language_ub,
+                concat!(stringify!($SelfT), "::unchecked_sub cannot overflow"),
+                (
+                    lhs: $SelfT = self,
+                    rhs: $SelfT = rhs,
+                ) => !lhs.overflowing_sub(rhs).1,
+            );
+
+            // SAFETY: this is guaranteed to be safe by the caller.
+            unsafe {
+                intrinsics::unchecked_sub(self, rhs)
+            }
         }
 
         /// Checked subtraction with an unsigned integer. Computes `self - rhs`,
@@ -688,7 +732,7 @@ macro_rules! int_impl {
         #[track_caller]
         pub const fn strict_sub_unsigned(self, rhs: $UnsignedT) -> Self {
             let (a, b) = self.overflowing_sub_unsigned(rhs);
-            if unlikely!(b) { overflow_panic::sub() } else { a }
+            if b { overflow_panic::sub() } else { a }
         }
 
         /// Checked integer multiplication. Computes `self * rhs`, returning `None` if
@@ -744,7 +788,7 @@ macro_rules! int_impl {
         #[track_caller]
         pub const fn strict_mul(self, rhs: Self) -> Self {
             let (a, b) = self.overflowing_mul(rhs);
-            if unlikely!(b) { overflow_panic::mul() } else { a }
+            if b { overflow_panic::mul() } else { a }
         }
 
         /// Unchecked integer multiplication. Computes `self * rhs`, assuming overflow
@@ -772,9 +816,19 @@ macro_rules! int_impl {
         #[inline(always)]
         #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
         pub const unsafe fn unchecked_mul(self, rhs: Self) -> Self {
-            // SAFETY: the caller must uphold the safety contract for
-            // `unchecked_mul`.
-            unsafe { intrinsics::unchecked_mul(self, rhs) }
+            assert_unsafe_precondition!(
+                check_language_ub,
+                concat!(stringify!($SelfT), "::unchecked_mul cannot overflow"),
+                (
+                    lhs: $SelfT = self,
+                    rhs: $SelfT = rhs,
+                ) => !lhs.overflowing_mul(rhs).1,
+            );
+
+            // SAFETY: this is guaranteed to be safe by the caller.
+            unsafe {
+                intrinsics::unchecked_mul(self, rhs)
+            }
         }
 
         /// Checked integer division. Computes `self / rhs`, returning `None` if `rhs == 0`
@@ -848,7 +902,7 @@ macro_rules! int_impl {
         #[track_caller]
         pub const fn strict_div(self, rhs: Self) -> Self {
             let (a, b) = self.overflowing_div(rhs);
-            if unlikely!(b) { overflow_panic::div() } else { a }
+            if b { overflow_panic::div() } else { a }
         }
 
         /// Checked Euclidean division. Computes `self.div_euclid(rhs)`,
@@ -922,7 +976,7 @@ macro_rules! int_impl {
         #[track_caller]
         pub const fn strict_div_euclid(self, rhs: Self) -> Self {
             let (a, b) = self.overflowing_div_euclid(rhs);
-            if unlikely!(b) { overflow_panic::div() } else { a }
+            if b { overflow_panic::div() } else { a }
         }
 
         /// Checked integer remainder. Computes `self % rhs`, returning `None` if
@@ -995,7 +1049,7 @@ macro_rules! int_impl {
         #[track_caller]
         pub const fn strict_rem(self, rhs: Self) -> Self {
             let (a, b) = self.overflowing_rem(rhs);
-            if unlikely!(b) { overflow_panic::rem() } else { a }
+            if b { overflow_panic::rem() } else { a }
         }
 
         /// Checked Euclidean remainder. Computes `self.rem_euclid(rhs)`, returning `None`
@@ -1068,7 +1122,7 @@ macro_rules! int_impl {
         #[track_caller]
         pub const fn strict_rem_euclid(self, rhs: Self) -> Self {
             let (a, b) = self.overflowing_rem_euclid(rhs);
-            if unlikely!(b) { overflow_panic::rem() } else { a }
+            if b { overflow_panic::rem() } else { a }
         }
 
         /// Checked negation. Computes `-self`, returning `None` if `self == MIN`.
@@ -1111,9 +1165,18 @@ macro_rules! int_impl {
         #[inline(always)]
         #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
         pub const unsafe fn unchecked_neg(self) -> Self {
-            // SAFETY: the caller must uphold the safety contract for
-            // `unchecked_neg`.
-            unsafe { intrinsics::unchecked_sub(0, self) }
+            assert_unsafe_precondition!(
+                check_language_ub,
+                concat!(stringify!($SelfT), "::unchecked_neg cannot overflow"),
+                (
+                    lhs: $SelfT = self,
+                ) => !lhs.overflowing_neg().1,
+            );
+
+            // SAFETY: this is guaranteed to be safe by the caller.
+            unsafe {
+                intrinsics::unchecked_sub(0, self)
+            }
         }
 
         /// Strict negation. Computes `-self`, panicking if `self == MIN`.
@@ -1147,7 +1210,7 @@ macro_rules! int_impl {
         #[track_caller]
         pub const fn strict_neg(self) -> Self {
             let (a, b) = self.overflowing_neg();
-            if unlikely!(b) { overflow_panic::neg() } else { a }
+            if b { overflow_panic::neg() } else { a }
         }
 
         /// Checked shift left. Computes `self << rhs`, returning `None` if `rhs` is larger
@@ -1160,6 +1223,7 @@ macro_rules! int_impl {
         /// ```
         #[doc = concat!("assert_eq!(0x1", stringify!($SelfT), ".checked_shl(4), Some(0x10));")]
         #[doc = concat!("assert_eq!(0x1", stringify!($SelfT), ".checked_shl(129), None);")]
+        #[doc = concat!("assert_eq!(0x10", stringify!($SelfT), ".checked_shl(", stringify!($BITS_MINUS_ONE), "), Some(0));")]
         /// ```
         #[stable(feature = "wrapping", since = "1.7.0")]
         #[rustc_const_stable(feature = "const_checked_int_methods", since = "1.47.0")]
@@ -1210,7 +1274,7 @@ macro_rules! int_impl {
         #[track_caller]
         pub const fn strict_shl(self, rhs: u32) -> Self {
             let (a, b) = self.overflowing_shl(rhs);
-            if unlikely!(b) { overflow_panic::shl() } else { a }
+            if b { overflow_panic::shl() } else { a }
         }
 
         /// Unchecked shift left. Computes `self << rhs`, assuming that
@@ -1234,9 +1298,46 @@ macro_rules! int_impl {
         #[inline(always)]
         #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
         pub const unsafe fn unchecked_shl(self, rhs: u32) -> Self {
-                // SAFETY: the caller must uphold the safety contract for
-                // `unchecked_shl`.
-                unsafe { intrinsics::unchecked_shl(self, rhs) }
+            assert_unsafe_precondition!(
+                check_language_ub,
+                concat!(stringify!($SelfT), "::unchecked_shl cannot overflow"),
+                (
+                    rhs: u32 = rhs,
+                ) => rhs < <$ActualT>::BITS,
+            );
+
+            // SAFETY: this is guaranteed to be safe by the caller.
+            unsafe {
+                intrinsics::unchecked_shl(self, rhs)
+            }
+        }
+
+        /// Unbounded shift left. Computes `self << rhs`, without bounding the value of `rhs`
+        ///
+        /// If `rhs` is larger or equal to the number of bits in `self`,
+        /// the entire value is shifted out, and `0` is returned.
+        ///
+        /// # Examples
+        ///
+        /// Basic usage:
+        /// ```
+        /// #![feature(unbounded_shifts)]
+        #[doc = concat!("assert_eq!(0x1", stringify!($SelfT), ".unbounded_shl(4), 0x10);")]
+        #[doc = concat!("assert_eq!(0x1", stringify!($SelfT), ".unbounded_shl(129), 0);")]
+        /// ```
+        #[unstable(feature = "unbounded_shifts", issue = "129375")]
+        #[rustc_const_unstable(feature = "const_unbounded_shifts", issue = "129375")]
+        #[must_use = "this returns the result of the operation, \
+                      without modifying the original"]
+        #[inline]
+        pub const fn unbounded_shl(self, rhs: u32) -> $SelfT{
+            if rhs < Self::BITS {
+                // SAFETY:
+                // rhs is just checked to be in-range above
+                unsafe { self.unchecked_shl(rhs) }
+            } else {
+                0
+            }
         }
 
         /// Checked shift right. Computes `self >> rhs`, returning `None` if `rhs` is
@@ -1299,7 +1400,7 @@ macro_rules! int_impl {
         #[track_caller]
         pub const fn strict_shr(self, rhs: u32) -> Self {
             let (a, b) = self.overflowing_shr(rhs);
-            if unlikely!(b) { overflow_panic::shr() } else { a }
+            if b { overflow_panic::shr() } else { a }
         }
 
         /// Unchecked shift right. Computes `self >> rhs`, assuming that
@@ -1323,9 +1424,52 @@ macro_rules! int_impl {
         #[inline(always)]
         #[cfg_attr(miri, track_caller)] // even without panics, this helps for Miri backtraces
         pub const unsafe fn unchecked_shr(self, rhs: u32) -> Self {
-            // SAFETY: the caller must uphold the safety contract for
-            // `unchecked_shr`.
-            unsafe { intrinsics::unchecked_shr(self, rhs) }
+            assert_unsafe_precondition!(
+                check_language_ub,
+                concat!(stringify!($SelfT), "::unchecked_shr cannot overflow"),
+                (
+                    rhs: u32 = rhs,
+                ) => rhs < <$ActualT>::BITS,
+            );
+
+            // SAFETY: this is guaranteed to be safe by the caller.
+            unsafe {
+                intrinsics::unchecked_shr(self, rhs)
+            }
+        }
+
+        /// Unbounded shift right. Computes `self >> rhs`, without bounding the value of `rhs`
+        ///
+        /// If `rhs` is larger or equal to the number of bits in `self`,
+        /// the entire value is shifted out, which yields `0` for a positive number,
+        /// and `-1` for a negative number.
+        ///
+        /// # Examples
+        ///
+        /// Basic usage:
+        /// ```
+        /// #![feature(unbounded_shifts)]
+        #[doc = concat!("assert_eq!(0x10", stringify!($SelfT), ".unbounded_shr(4), 0x1);")]
+        #[doc = concat!("assert_eq!(0x10", stringify!($SelfT), ".unbounded_shr(129), 0);")]
+        #[doc = concat!("assert_eq!(", stringify!($SelfT), "::MIN.unbounded_shr(129), -1);")]
+        /// ```
+        #[unstable(feature = "unbounded_shifts", issue = "129375")]
+        #[rustc_const_unstable(feature = "const_unbounded_shifts", issue = "129375")]
+        #[must_use = "this returns the result of the operation, \
+                      without modifying the original"]
+        #[inline]
+        pub const fn unbounded_shr(self, rhs: u32) -> $SelfT{
+            if rhs < Self::BITS {
+                // SAFETY:
+                // rhs is just checked to be in-range above
+                unsafe { self.unchecked_shr(rhs) }
+            } else {
+                // A shift by `Self::BITS-1` suffices for signed integers, because the sign bit is copied for each of the shifted bits.
+
+                // SAFETY:
+                // `Self::BITS-1` is guaranteed to be less than `Self::BITS`
+                unsafe { self.unchecked_shr(Self::BITS - 1) }
+            }
         }
 
         /// Checked absolute value. Computes `self.abs()`, returning `None` if
@@ -1414,18 +1558,17 @@ macro_rules! int_impl {
             let mut base = self;
             let mut acc: Self = 1;
 
-            while exp > 1 {
+            loop {
                 if (exp & 1) == 1 {
                     acc = try_opt!(acc.checked_mul(base));
+                    // since exp!=0, finally the exp must be 1.
+                    if exp == 1 {
+                        return Some(acc);
+                    }
                 }
                 exp /= 2;
                 base = try_opt!(base.checked_mul(base));
             }
-            // since exp!=0, finally the exp must be 1.
-            // Deal with the final bit of the exponent separately, since
-            // squaring the base afterwards is not necessary and may cause a
-            // needless overflow.
-            acc.checked_mul(base)
         }
 
         /// Strict exponentiation. Computes `self.pow(exp)`, panicking if
@@ -1465,18 +1608,17 @@ macro_rules! int_impl {
             let mut base = self;
             let mut acc: Self = 1;
 
-            while exp > 1 {
+            loop {
                 if (exp & 1) == 1 {
                     acc = acc.strict_mul(base);
+                    // since exp!=0, finally the exp must be 1.
+                    if exp == 1 {
+                        return acc;
+                    }
                 }
                 exp /= 2;
                 base = base.strict_mul(base);
             }
-            // since exp!=0, finally the exp must be 1.
-            // Deal with the final bit of the exponent separately, since
-            // squaring the base afterwards is not necessary and may cause a
-            // needless overflow.
-            acc.strict_mul(base)
         }
 
         /// Returns the square root of the number, rounded down.
@@ -1499,7 +1641,33 @@ macro_rules! int_impl {
             if self < 0 {
                 None
             } else {
-                Some((self as $UnsignedT).isqrt() as Self)
+                // SAFETY: Input is nonnegative in this `else` branch.
+                let result = unsafe {
+                    crate::num::int_sqrt::$ActualT(self as $ActualT) as $SelfT
+                };
+
+                // Inform the optimizer what the range of outputs is. If
+                // testing `core` crashes with no panic message and a
+                // `num::int_sqrt::i*` test failed, it's because your edits
+                // caused these assertions to become false.
+                //
+                // SAFETY: Integer square root is a monotonically nondecreasing
+                // function, which means that increasing the input will never
+                // cause the output to decrease. Thus, since the input for
+                // nonnegative signed integers is bounded by
+                // `[0, <$ActualT>::MAX]`, sqrt(n) will be bounded by
+                // `[sqrt(0), sqrt(<$ActualT>::MAX)]`.
+                unsafe {
+                    // SAFETY: `<$ActualT>::MAX` is nonnegative.
+                    const MAX_RESULT: $SelfT = unsafe {
+                        crate::num::int_sqrt::$ActualT(<$ActualT>::MAX) as $SelfT
+                    };
+
+                    crate::hint::assert_unchecked(result >= 0);
+                    crate::hint::assert_unchecked(result <= MAX_RESULT);
+                }
+
+                Some(result)
             }
         }
 
@@ -2093,6 +2261,7 @@ macro_rules! int_impl {
         #[must_use = "this returns the result of the operation, \
                       without modifying the original"]
         #[inline]
+        #[rustc_allow_const_fn_unstable(is_val_statically_known)]
         pub const fn wrapping_pow(self, mut exp: u32) -> Self {
             if exp == 0 {
                 return 1;
@@ -2100,25 +2269,43 @@ macro_rules! int_impl {
             let mut base = self;
             let mut acc: Self = 1;
 
-            while exp > 1 {
-                if (exp & 1) == 1 {
-                    acc = acc.wrapping_mul(base);
+            if intrinsics::is_val_statically_known(exp) {
+                while exp > 1 {
+                    if (exp & 1) == 1 {
+                        acc = acc.wrapping_mul(base);
+                    }
+                    exp /= 2;
+                    base = base.wrapping_mul(base);
                 }
-                exp /= 2;
-                base = base.wrapping_mul(base);
-            }
 
-            // since exp!=0, finally the exp must be 1.
-            // Deal with the final bit of the exponent separately, since
-            // squaring the base afterwards is not necessary and may cause a
-            // needless overflow.
-            acc.wrapping_mul(base)
+                // since exp!=0, finally the exp must be 1.
+                // Deal with the final bit of the exponent separately, since
+                // squaring the base afterwards is not necessary.
+                acc.wrapping_mul(base)
+            } else {
+                // This is faster than the above when the exponent is not known
+                // at compile time. We can't use the same code for the constant
+                // exponent case because LLVM is currently unable to unroll
+                // this loop.
+                loop {
+                    if (exp & 1) == 1 {
+                        acc = acc.wrapping_mul(base);
+                        // since exp!=0, finally the exp must be 1.
+                        if exp == 1 {
+                            return acc;
+                        }
+                    }
+                    exp /= 2;
+                    base = base.wrapping_mul(base);
+                }
+            }
         }
 
-        /// Calculates `self` + `rhs`
+        /// Calculates `self` + `rhs`.
         ///
-        /// Returns a tuple of the addition along with a boolean indicating whether an arithmetic overflow would
-        /// occur. If an overflow would have occurred then the wrapped value is returned.
+        /// Returns a tuple of the addition along with a boolean indicating
+        /// whether an arithmetic overflow would occur. If an overflow would have
+        /// occurred then the wrapped value is returned.
         ///
         /// # Examples
         ///
@@ -2196,7 +2383,7 @@ macro_rules! int_impl {
             (c, b != d)
         }
 
-        /// Calculates `self` + `rhs` with an unsigned `rhs`
+        /// Calculates `self` + `rhs` with an unsigned `rhs`.
         ///
         /// Returns a tuple of the addition along with a boolean indicating
         /// whether an arithmetic overflow would occur. If an overflow would
@@ -2519,6 +2706,7 @@ macro_rules! int_impl {
         /// ```
         #[doc = concat!("assert_eq!(0x1", stringify!($SelfT),".overflowing_shl(4), (0x10, false));")]
         /// assert_eq!(0x1i32.overflowing_shl(36), (0x10, true));
+        #[doc = concat!("assert_eq!(0x10", stringify!($SelfT), ".overflowing_shl(", stringify!($BITS_MINUS_ONE), "), (0, false));")]
         /// ```
         #[stable(feature = "wrapping", since = "1.7.0")]
         #[rustc_const_stable(feature = "const_int_methods", since = "1.32.0")]
@@ -2606,9 +2794,14 @@ macro_rules! int_impl {
             // Scratch space for storing results of overflowing_mul.
             let mut r;
 
-            while exp > 1 {
+            loop {
                 if (exp & 1) == 1 {
                     r = acc.overflowing_mul(base);
+                    // since exp!=0, finally the exp must be 1.
+                    if exp == 1 {
+                        r.1 |= overflown;
+                        return r;
+                    }
                     acc = r.0;
                     overflown |= r.1;
                 }
@@ -2617,14 +2810,6 @@ macro_rules! int_impl {
                 base = r.0;
                 overflown |= r.1;
             }
-
-            // since exp!=0, finally the exp must be 1.
-            // Deal with the final bit of the exponent separately, since
-            // squaring the base afterwards is not necessary and may cause a
-            // needless overflow.
-            r = acc.overflowing_mul(base);
-            r.1 |= overflown;
-            r
         }
 
         /// Raises self to the power of `exp`, using exponentiation by squaring.
@@ -2644,6 +2829,7 @@ macro_rules! int_impl {
                       without modifying the original"]
         #[inline]
         #[rustc_inherit_overflow_checks]
+        #[rustc_allow_const_fn_unstable(is_val_statically_known)]
         pub const fn pow(self, mut exp: u32) -> Self {
             if exp == 0 {
                 return 1;
@@ -2651,19 +2837,37 @@ macro_rules! int_impl {
             let mut base = self;
             let mut acc = 1;
 
-            while exp > 1 {
-                if (exp & 1) == 1 {
-                    acc = acc * base;
+            if intrinsics::is_val_statically_known(exp) {
+                while exp > 1 {
+                    if (exp & 1) == 1 {
+                        acc = acc * base;
+                    }
+                    exp /= 2;
+                    base = base * base;
                 }
-                exp /= 2;
-                base = base * base;
-            }
 
-            // since exp!=0, finally the exp must be 1.
-            // Deal with the final bit of the exponent separately, since
-            // squaring the base afterwards is not necessary and may cause a
-            // needless overflow.
-            acc * base
+                // since exp!=0, finally the exp must be 1.
+                // Deal with the final bit of the exponent separately, since
+                // squaring the base afterwards is not necessary and may cause a
+                // needless overflow.
+                acc * base
+            } else {
+                // This is faster than the above when the exponent is not known
+                // at compile time. We can't use the same code for the constant
+                // exponent case because LLVM is currently unable to unroll
+                // this loop.
+                loop {
+                    if (exp & 1) == 1 {
+                        acc = acc * base;
+                        // since exp!=0, finally the exp must be 1.
+                        if exp == 1 {
+                            return acc;
+                        }
+                    }
+                    exp /= 2;
+                    base = base * base;
+                }
+            }
         }
 
         /// Returns the square root of the number, rounded down.
@@ -2684,15 +2888,11 @@ macro_rules! int_impl {
         #[must_use = "this returns the result of the operation, \
                       without modifying the original"]
         #[inline]
+        #[track_caller]
         pub const fn isqrt(self) -> Self {
-            // I would like to implement it as
-            // ```
-            // self.checked_isqrt().expect("argument of integer square root must be non-negative")
-            // ```
-            // but `expect` is not yet stable as a `const fn`.
             match self.checked_isqrt() {
                 Some(sqrt) => sqrt,
-                None => panic!("argument of integer square root must be non-negative"),
+                None => crate::num::int_sqrt::panic_for_negative_argument(),
             }
         }
 
@@ -2703,13 +2903,15 @@ macro_rules! int_impl {
         ///
         /// In other words, the result is `self / rhs` rounded to the integer `q`
         /// such that `self >= q * rhs`.
-        /// If `self > 0`, this is equal to round towards zero (the default in Rust);
-        /// if `self < 0`, this is equal to round towards +/- infinity.
+        /// If `self > 0`, this is equal to rounding towards zero (the default in Rust);
+        /// if `self < 0`, this is equal to rounding away from zero (towards +/- infinity).
+        /// If `rhs > 0`, this is equal to rounding towards -infinity;
+        /// if `rhs < 0`, this is equal to rounding towards +infinity.
         ///
         /// # Panics
         ///
-        /// This function will panic if `rhs` is 0 or if `self` is -1 and `rhs` is
-        /// `Self::MIN`. This behavior is not affected by the `overflow-checks` flag.
+        /// This function will panic if `rhs` is 0 or if `self` is `Self::MIN`
+        /// and `rhs` is -1. This behavior is not affected by the `overflow-checks` flag.
         ///
         /// # Examples
         ///
@@ -2742,13 +2944,13 @@ macro_rules! int_impl {
         /// Calculates the least nonnegative remainder of `self (mod rhs)`.
         ///
         /// This is done as if by the Euclidean division algorithm -- given
-        /// `r = self.rem_euclid(rhs)`, `self = rhs * self.div_euclid(rhs) + r`, and
-        /// `0 <= r < abs(rhs)`.
+        /// `r = self.rem_euclid(rhs)`, the result satisfies
+        /// `self = rhs * self.div_euclid(rhs) + r` and `0 <= r < abs(rhs)`.
         ///
         /// # Panics
         ///
-        /// This function will panic if `rhs` is 0 or if `self` is -1 and `rhs` is
-        /// `Self::MIN`. This behavior is not affected by the `overflow-checks` flag.
+        /// This function will panic if `rhs` is 0 or if `self` is `Self::MIN` and
+        /// `rhs` is -1. This behavior is not affected by the `overflow-checks` flag.
         ///
         /// # Examples
         ///
@@ -2762,6 +2964,11 @@ macro_rules! int_impl {
         /// assert_eq!((-a).rem_euclid(b), 1);
         /// assert_eq!(a.rem_euclid(-b), 3);
         /// assert_eq!((-a).rem_euclid(-b), 1);
+        /// ```
+        ///
+        /// This will panic:
+        /// ```should_panic
+        #[doc = concat!("let _ = ", stringify!($SelfT), "::MIN.rem_euclid(-1);")]
         /// ```
         #[doc(alias = "modulo", alias = "mod")]
         #[stable(feature = "euclidean_division", since = "1.38.0")]
@@ -2791,8 +2998,8 @@ macro_rules! int_impl {
         ///
         /// # Panics
         ///
-        /// This function will panic if `rhs` is 0 or if `self` is -1 and `rhs` is
-        /// `Self::MIN`. This behavior is not affected by the `overflow-checks` flag.
+        /// This function will panic if `rhs` is 0 or if `self` is `Self::MIN`
+        /// and `rhs` is -1. This behavior is not affected by the `overflow-checks` flag.
         ///
         /// # Examples
         ///
@@ -2816,8 +3023,16 @@ macro_rules! int_impl {
         pub const fn div_floor(self, rhs: Self) -> Self {
             let d = self / rhs;
             let r = self % rhs;
-            if (r > 0 && rhs < 0) || (r < 0 && rhs > 0) {
-                d - 1
+
+            // If the remainder is non-zero, we need to subtract one if the
+            // signs of self and rhs differ, as this means we rounded upwards
+            // instead of downwards. We do this branchlessly by creating a mask
+            // which is all-ones iff the signs differ, and 0 otherwise. Then by
+            // adding this mask (which corresponds to the signed value -1), we
+            // get our correction.
+            let correction = (self ^ rhs) >> (Self::BITS - 1);
+            if r != 0 {
+                d + correction
             } else {
                 d
             }
@@ -2827,8 +3042,8 @@ macro_rules! int_impl {
         ///
         /// # Panics
         ///
-        /// This function will panic if `rhs` is 0 or if `self` is -1 and `rhs` is
-        /// `Self::MIN`. This behavior is not affected by the `overflow-checks` flag.
+        /// This function will panic if `rhs` is 0 or if `self` is `Self::MIN`
+        /// and `rhs` is -1. This behavior is not affected by the `overflow-checks` flag.
         ///
         /// # Examples
         ///
@@ -2852,8 +3067,12 @@ macro_rules! int_impl {
         pub const fn div_ceil(self, rhs: Self) -> Self {
             let d = self / rhs;
             let r = self % rhs;
-            if (r > 0 && rhs > 0) || (r < 0 && rhs < 0) {
-                d + 1
+
+            // When remainder is non-zero we have a.div_ceil(b) == 1 + a.div_floor(b),
+            // so we can re-use the algorithm from div_floor, just adding 1.
+            let correction = 1 + ((self ^ rhs) >> (Self::BITS - 1));
+            if r != 0 {
+                d + correction
             } else {
                 d
             }
@@ -3306,7 +3525,7 @@ macro_rules! int_impl {
         #[inline(always)]
         pub const fn is_negative(self) -> bool { self < 0 }
 
-        /// Return the memory representation of this integer as a byte array in
+        /// Returns the memory representation of this integer as a byte array in
         /// big-endian (network) byte order.
         ///
         #[doc = $to_xe_bytes_doc]
@@ -3326,7 +3545,7 @@ macro_rules! int_impl {
             self.to_be().to_ne_bytes()
         }
 
-        /// Return the memory representation of this integer as a byte array in
+        /// Returns the memory representation of this integer as a byte array in
         /// little-endian byte order.
         ///
         #[doc = $to_xe_bytes_doc]
@@ -3346,7 +3565,7 @@ macro_rules! int_impl {
             self.to_le().to_ne_bytes()
         }
 
-        /// Return the memory representation of this integer as a byte array in
+        /// Returns the memory representation of this integer as a byte array in
         /// native byte order.
         ///
         /// As the target platform's native endianness is used, portable code
@@ -3384,7 +3603,7 @@ macro_rules! int_impl {
             unsafe { mem::transmute(self) }
         }
 
-        /// Create an integer value from its representation as a byte array in
+        /// Creates an integer value from its representation as a byte array in
         /// big endian.
         ///
         #[doc = $from_xe_bytes_doc]
@@ -3413,7 +3632,7 @@ macro_rules! int_impl {
             Self::from_be(Self::from_ne_bytes(bytes))
         }
 
-        /// Create an integer value from its representation as a byte array in
+        /// Creates an integer value from its representation as a byte array in
         /// little endian.
         ///
         #[doc = $from_xe_bytes_doc]
@@ -3442,7 +3661,7 @@ macro_rules! int_impl {
             Self::from_le(Self::from_ne_bytes(bytes))
         }
 
-        /// Create an integer value from its memory representation as a byte
+        /// Creates an integer value from its memory representation as a byte
         /// array in native endianness.
         ///
         /// As the target platform's native endianness is used, portable code

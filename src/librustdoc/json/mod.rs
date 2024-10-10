@@ -8,27 +8,30 @@ mod conversions;
 mod import_finder;
 
 use std::cell::RefCell;
-use std::fs::{create_dir_all, File};
-use std::io::{BufWriter, Write};
+use std::fs::{File, create_dir_all};
+use std::io::{BufWriter, Write, stdout};
 use std::path::PathBuf;
 use std::rc::Rc;
 
-use rustc_data_structures::fx::FxHashMap;
 use rustc_hir::def_id::{DefId, DefIdSet};
 use rustc_middle::ty::TyCtxt;
 use rustc_session::Session;
 use rustc_span::def_id::LOCAL_CRATE;
-
 use rustdoc_json_types as types;
+// It's important to use the FxHashMap from rustdoc_json_types here, instead of
+// the one from rustc_data_structures, as they're different types due to sysroots.
+// See #110051 and #127456 for details
+use rustdoc_json_types::FxHashMap;
+use tracing::{debug, trace};
 
-use crate::clean::types::{ExternalCrate, ExternalLocation};
 use crate::clean::ItemKind;
+use crate::clean::types::{ExternalCrate, ExternalLocation};
 use crate::config::RenderOptions;
 use crate::docfs::PathError;
 use crate::error::Error;
-use crate::formats::cache::Cache;
 use crate::formats::FormatRenderer;
-use crate::json::conversions::{id_from_item, id_from_item_default, IntoWithTcx};
+use crate::formats::cache::Cache;
+use crate::json::conversions::{IntoWithTcx, id_from_item, id_from_item_default};
 use crate::{clean, try_err};
 
 #[derive(Clone)]
@@ -37,8 +40,10 @@ pub(crate) struct JsonRenderer<'tcx> {
     /// A mapping of IDs that contains all local items for this crate which gets output as a top
     /// level field of the JSON blob.
     index: Rc<RefCell<FxHashMap<types::Id, types::Item>>>,
-    /// The directory where the blob will be written to.
-    out_path: PathBuf,
+    /// The directory where the JSON blob should be written to.
+    ///
+    /// If this is `None`, the blob will be printed to `stdout` instead.
+    out_dir: Option<PathBuf>,
     cache: Rc<Cache>,
     imported_items: DefIdSet,
 }
@@ -80,7 +85,7 @@ impl<'tcx> JsonRenderer<'tcx> {
                         // document primitive items in an arbitrary crate by using
                         // `rustc_doc_primitive`.
                         let mut is_primitive_impl = false;
-                        if let clean::types::ItemKind::ImplItem(ref impl_) = *item.kind
+                        if let clean::types::ItemKind::ImplItem(ref impl_) = item.kind
                             && impl_.trait_.is_none()
                             && let clean::types::Type::Primitive(_) = impl_.for_
                         {
@@ -97,6 +102,22 @@ impl<'tcx> JsonRenderer<'tcx> {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    fn serialize_and_write<T: Write>(
+        &self,
+        output_crate: types::Crate,
+        mut writer: BufWriter<T>,
+        path: &str,
+    ) -> Result<(), Error> {
+        self.sess().time("rustdoc_json_serialize_and_write", || {
+            try_err!(
+                serde_json::ser::to_writer(&mut writer, &output_crate).map_err(|e| e.to_string()),
+                path
+            );
+            try_err!(writer.flush(), path);
+            Ok(())
+        })
     }
 }
 
@@ -121,7 +142,7 @@ impl<'tcx> FormatRenderer<'tcx> for JsonRenderer<'tcx> {
             JsonRenderer {
                 tcx,
                 index: Rc::new(RefCell::new(FxHashMap::default())),
-                out_path: options.output,
+                out_dir: if options.output_to_stdout { None } else { Some(options.output) },
                 cache: Rc::new(cache),
                 imported_items,
             },
@@ -143,7 +164,7 @@ impl<'tcx> FormatRenderer<'tcx> for JsonRenderer<'tcx> {
 
         // Flatten items that recursively store other items. We include orphaned items from
         // stripped modules and etc that are otherwise reachable.
-        if let ItemKind::StrippedItem(inner) = &*item.kind {
+        if let ItemKind::StrippedItem(inner) = &item.kind {
             inner.inner_items().for_each(|i| self.item(i.clone()).unwrap());
         }
 
@@ -176,7 +197,7 @@ impl<'tcx> FormatRenderer<'tcx> for JsonRenderer<'tcx> {
 
                 types::ItemEnum::Function(_)
                 | types::ItemEnum::Module(_)
-                | types::ItemEnum::Import(_)
+                | types::ItemEnum::Use(_)
                 | types::ItemEnum::AssocConst { .. }
                 | types::ItemEnum::AssocType { .. } => true,
                 types::ItemEnum::ExternCrate { .. }
@@ -185,10 +206,9 @@ impl<'tcx> FormatRenderer<'tcx> for JsonRenderer<'tcx> {
                 | types::ItemEnum::TraitAlias(_)
                 | types::ItemEnum::Impl(_)
                 | types::ItemEnum::TypeAlias(_)
-                | types::ItemEnum::OpaqueTy(_)
-                | types::ItemEnum::Constant(_)
+                | types::ItemEnum::Constant { .. }
                 | types::ItemEnum::Static(_)
-                | types::ItemEnum::ForeignType
+                | types::ItemEnum::ExternType
                 | types::ItemEnum::Macro(_)
                 | types::ItemEnum::ProcMacro(_) => false,
             };
@@ -218,38 +238,26 @@ impl<'tcx> FormatRenderer<'tcx> for JsonRenderer<'tcx> {
     fn after_krate(&mut self) -> Result<(), Error> {
         debug!("Done with crate");
 
-        debug!("Adding Primitive impls");
-        for primitive in Rc::clone(&self.cache).primitive_locations.values() {
-            self.get_impls(*primitive);
-        }
-
         let e = ExternalCrate { crate_num: LOCAL_CRATE };
-
         let index = (*self.index).clone().into_inner();
 
         debug!("Constructing Output");
-        // This needs to be the default HashMap for compatibility with the public interface for
-        // rustdoc-json-types
-        #[allow(rustc::default_hash_types)]
-        let output = types::Crate {
+        let output_crate = types::Crate {
             root: types::Id(format!("0:0:{}", e.name(self.tcx).as_u32())),
             crate_version: self.cache.crate_version.clone(),
             includes_private: self.cache.document_private,
-            index: index.into_iter().collect(),
+            index,
             paths: self
                 .cache
                 .paths
                 .iter()
                 .chain(&self.cache.external_paths)
                 .map(|(&k, &(ref path, kind))| {
-                    (
-                        id_from_item_default(k.into(), self.tcx),
-                        types::ItemSummary {
-                            crate_id: k.krate.as_u32(),
-                            path: path.iter().map(|s| s.to_string()).collect(),
-                            kind: kind.into_tcx(self.tcx),
-                        },
-                    )
+                    (id_from_item_default(k.into(), self.tcx), types::ItemSummary {
+                        crate_id: k.krate.as_u32(),
+                        path: path.iter().map(|s| s.to_string()).collect(),
+                        kind: kind.into_tcx(self.tcx),
+                    })
                 })
                 .collect(),
             external_crates: self
@@ -258,34 +266,32 @@ impl<'tcx> FormatRenderer<'tcx> for JsonRenderer<'tcx> {
                 .iter()
                 .map(|(crate_num, external_location)| {
                     let e = ExternalCrate { crate_num: *crate_num };
-                    (
-                        crate_num.as_u32(),
-                        types::ExternalCrate {
-                            name: e.name(self.tcx).to_string(),
-                            html_root_url: match external_location {
-                                ExternalLocation::Remote(s) => Some(s.clone()),
-                                _ => None,
-                            },
+                    (crate_num.as_u32(), types::ExternalCrate {
+                        name: e.name(self.tcx).to_string(),
+                        html_root_url: match external_location {
+                            ExternalLocation::Remote(s) => Some(s.clone()),
+                            _ => None,
                         },
-                    )
+                    })
                 })
                 .collect(),
             format_version: types::FORMAT_VERSION,
         };
-        let out_dir = self.out_path.clone();
-        try_err!(create_dir_all(&out_dir), out_dir);
+        if let Some(ref out_dir) = self.out_dir {
+            try_err!(create_dir_all(&out_dir), out_dir);
 
-        let mut p = out_dir;
-        p.push(output.index.get(&output.root).unwrap().name.clone().unwrap());
-        p.set_extension("json");
-        let mut file = BufWriter::new(try_err!(File::create(&p), p));
-        self.tcx
-            .sess
-            .time("rustdoc_json_serialization", || serde_json::ser::to_writer(&mut file, &output))
-            .unwrap();
-        try_err!(file.flush(), p);
+            let mut p = out_dir.clone();
+            p.push(output_crate.index.get(&output_crate.root).unwrap().name.clone().unwrap());
+            p.set_extension("json");
 
-        Ok(())
+            self.serialize_and_write(
+                output_crate,
+                try_err!(File::create_buffered(&p), p),
+                &p.display().to_string(),
+            )
+        } else {
+            self.serialize_and_write(output_crate, BufWriter::new(stdout().lock()), "<stdout>")
+        }
     }
 
     fn cache(&self) -> &Cache {

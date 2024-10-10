@@ -1,33 +1,36 @@
+// tidy-alphabetical-start
 #![allow(internal_features)]
 #![allow(rustc::diagnostic_outside_of_impl)]
-#![feature(rustdoc_internals)]
+#![cfg_attr(not(bootstrap), feature(unqualified_local_imports))]
+#![cfg_attr(not(bootstrap), warn(unqualified_local_imports))]
 #![doc(rust_logo)]
 #![feature(assert_matches)]
 #![feature(box_patterns)]
 #![feature(decl_macro)]
+#![feature(if_let_guard)]
 #![feature(let_chains)]
+#![feature(never_type)]
+#![feature(rustdoc_internals)]
 #![feature(slice_ptr_get)]
 #![feature(strict_provenance)]
-#![feature(never_type)]
 #![feature(trait_alias)]
 #![feature(try_blocks)]
 #![feature(yeet_expr)]
-#![feature(if_let_guard)]
+#![warn(unreachable_pub)]
+// tidy-alphabetical-end
 
-#[macro_use]
-extern crate tracing;
-
+pub mod check_consts;
 pub mod const_eval;
 mod errors;
 pub mod interpret;
-pub mod transform;
 pub mod util;
 
 use std::sync::atomic::AtomicBool;
 
-pub use errors::ReportErrorExt;
+use rustc_middle::ty;
+use rustc_middle::util::Providers;
 
-use rustc_middle::{ty, util::Providers};
+pub use self::errors::ReportErrorExt;
 
 rustc_fluent_macro::fluent_messages! { "../messages.ftl" }
 

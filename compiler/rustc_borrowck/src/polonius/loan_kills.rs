@@ -4,8 +4,12 @@ use rustc_middle::mir::{
     Terminator, TerminatorKind,
 };
 use rustc_middle::ty::TyCtxt;
+use tracing::debug;
 
-use crate::{borrow_set::BorrowSet, facts::AllFacts, location::LocationTable, places_conflict};
+use crate::borrow_set::BorrowSet;
+use crate::facts::AllFacts;
+use crate::location::LocationTable;
+use crate::places_conflict;
 
 /// Emit `loan_killed_at` and `cfg_edge` facts at the same time.
 pub(super) fn emit_loan_kills<'tcx>(
@@ -21,15 +25,15 @@ pub(super) fn emit_loan_kills<'tcx>(
     }
 }
 
-struct LoanKillsGenerator<'cx, 'tcx> {
+struct LoanKillsGenerator<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
-    all_facts: &'cx mut AllFacts,
-    location_table: &'cx LocationTable,
-    borrow_set: &'cx BorrowSet<'tcx>,
-    body: &'cx Body<'tcx>,
+    all_facts: &'a mut AllFacts,
+    location_table: &'a LocationTable,
+    borrow_set: &'a BorrowSet<'tcx>,
+    body: &'a Body<'tcx>,
 }
 
-impl<'cx, 'tcx> Visitor<'tcx> for LoanKillsGenerator<'cx, 'tcx> {
+impl<'a, 'tcx> Visitor<'tcx> for LoanKillsGenerator<'a, 'tcx> {
     fn visit_statement(&mut self, statement: &Statement<'tcx>, location: Location) {
         // Also record CFG facts here.
         self.all_facts.cfg_edge.push((

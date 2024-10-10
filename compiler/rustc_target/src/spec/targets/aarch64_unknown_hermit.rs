@@ -1,13 +1,13 @@
-use crate::spec::{base, StackProbeType, Target, TargetOptions};
+use crate::spec::{StackProbeType, Target, TargetOptions, base};
 
-pub fn target() -> Target {
+pub(crate) fn target() -> Target {
     Target {
         llvm_target: "aarch64-unknown-hermit".into(),
         metadata: crate::spec::TargetMetadata {
-            description: None,
-            tier: None,
-            host_tools: None,
-            std: None,
+            description: Some("ARM64 Hermit".into()),
+            tier: Some(3),
+            host_tools: Some(false),
+            std: Some(true),
         },
         pointer_width: 64,
         arch: "aarch64".into(),

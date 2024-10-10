@@ -3,9 +3,8 @@ use crate::io::{
     self, BorrowedBuf, BufReader, BufWriter, ErrorKind, IoSlice, LineWriter, SeekFrom,
 };
 use crate::mem::MaybeUninit;
-use crate::panic;
 use crate::sync::atomic::{AtomicUsize, Ordering};
-use crate::thread;
+use crate::{panic, thread};
 
 /// A dummy reader intended at testing short-reads propagation.
 pub struct ShortReader {
@@ -165,6 +164,7 @@ fn test_buffered_reader_stream_position() {
 }
 
 #[test]
+#[cfg_attr(not(panic = "unwind"), ignore = "test requires unwinding support")]
 fn test_buffered_reader_stream_position_panic() {
     let inner: &[u8] = &[5, 6, 7, 0, 1, 2, 3, 4];
     let mut reader = BufReader::with_capacity(4, io::Cursor::new(inner));
@@ -488,7 +488,7 @@ fn dont_panic_in_drop_on_panicked_flush() {
 }
 
 #[test]
-#[cfg_attr(target_os = "emscripten", ignore)]
+#[cfg_attr(any(target_os = "emscripten", target_os = "wasi"), ignore)] // no threads
 fn panic_in_write_doesnt_flush_in_drop() {
     static WRITES: AtomicUsize = AtomicUsize::new(0);
 
@@ -1066,4 +1066,14 @@ fn bufreader_full_initialize() {
     assert_eq!(buf.len(), 1);
     // But we initialized the whole buffer!
     assert_eq!(reader.initialized(), reader.capacity());
+}
+
+/// This is a regression test for https://github.com/rust-lang/rust/issues/127584.
+#[test]
+fn bufwriter_aliasing() {
+    use crate::io::{BufWriter, Cursor};
+    let mut v = vec![0; 1024];
+    let c = Cursor::new(&mut v);
+    let w = BufWriter::new(Box::new(c));
+    let _ = w.into_parts();
 }

@@ -1,29 +1,30 @@
-use rustc_data_structures::captures::Captures;
-use rustc_data_structures::fx::FxHashSet;
-use rustc_data_structures::graph::dominators::{self, Dominators};
-use rustc_data_structures::graph::{self, DirectedGraph, StartNode};
-use rustc_index::bit_set::BitSet;
-use rustc_index::IndexVec;
-use rustc_middle::bug;
-use rustc_middle::mir::{self, BasicBlock, Terminator, TerminatorKind};
-
 use std::cmp::Ordering;
 use std::collections::VecDeque;
 use std::ops::{Index, IndexMut};
 
+use rustc_data_structures::captures::Captures;
+use rustc_data_structures::fx::FxHashSet;
+use rustc_data_structures::graph::dominators::{self, Dominators};
+use rustc_data_structures::graph::{self, DirectedGraph, StartNode};
+use rustc_index::IndexVec;
+use rustc_index::bit_set::BitSet;
+use rustc_middle::bug;
+use rustc_middle::mir::{self, BasicBlock, Terminator, TerminatorKind};
+use tracing::debug;
+
 /// A coverage-specific simplification of the MIR control flow graph (CFG). The `CoverageGraph`s
 /// nodes are `BasicCoverageBlock`s, which encompass one or more MIR `BasicBlock`s.
 #[derive(Debug)]
-pub(super) struct CoverageGraph {
+pub(crate) struct CoverageGraph {
     bcbs: IndexVec<BasicCoverageBlock, BasicCoverageBlockData>,
     bb_to_bcb: IndexVec<BasicBlock, Option<BasicCoverageBlock>>,
-    pub successors: IndexVec<BasicCoverageBlock, Vec<BasicCoverageBlock>>,
-    pub predecessors: IndexVec<BasicCoverageBlock, Vec<BasicCoverageBlock>>,
+    pub(crate) successors: IndexVec<BasicCoverageBlock, Vec<BasicCoverageBlock>>,
+    pub(crate) predecessors: IndexVec<BasicCoverageBlock, Vec<BasicCoverageBlock>>,
     dominators: Option<Dominators<BasicCoverageBlock>>,
 }
 
 impl CoverageGraph {
-    pub fn from_mir(mir_body: &mir::Body<'_>) -> Self {
+    pub(crate) fn from_mir(mir_body: &mir::Body<'_>) -> Self {
         let (bcbs, bb_to_bcb) = Self::compute_basic_coverage_blocks(mir_body);
 
         // Pre-transform MIR `BasicBlock` successors and predecessors into the BasicCoverageBlock
@@ -86,7 +87,11 @@ impl CoverageGraph {
             for &bb in basic_blocks.iter() {
                 bb_to_bcb[bb] = Some(bcb);
             }
-            let bcb_data = BasicCoverageBlockData::from(basic_blocks);
+
+            let is_out_summable = basic_blocks.last().map_or(false, |&bb| {
+                bcb_filtered_successors(mir_body[bb].terminator()).is_out_summable()
+            });
+            let bcb_data = BasicCoverageBlockData { basic_blocks, is_out_summable };
             debug!("adding bcb{}: {:?}", bcb.index(), bcb_data);
             bcbs.push(bcb_data);
         };
@@ -135,44 +140,58 @@ impl CoverageGraph {
     }
 
     #[inline(always)]
-    pub fn iter_enumerated(
+    pub(crate) fn iter_enumerated(
         &self,
     ) -> impl Iterator<Item = (BasicCoverageBlock, &BasicCoverageBlockData)> {
         self.bcbs.iter_enumerated()
     }
 
     #[inline(always)]
-    pub fn bcb_from_bb(&self, bb: BasicBlock) -> Option<BasicCoverageBlock> {
+    pub(crate) fn bcb_from_bb(&self, bb: BasicBlock) -> Option<BasicCoverageBlock> {
         if bb.index() < self.bb_to_bcb.len() { self.bb_to_bcb[bb] } else { None }
     }
 
     #[inline(always)]
-    pub fn dominates(&self, dom: BasicCoverageBlock, node: BasicCoverageBlock) -> bool {
+    pub(crate) fn dominates(&self, dom: BasicCoverageBlock, node: BasicCoverageBlock) -> bool {
         self.dominators.as_ref().unwrap().dominates(dom, node)
     }
 
     #[inline(always)]
-    pub fn cmp_in_dominator_order(&self, a: BasicCoverageBlock, b: BasicCoverageBlock) -> Ordering {
+    pub(crate) fn cmp_in_dominator_order(
+        &self,
+        a: BasicCoverageBlock,
+        b: BasicCoverageBlock,
+    ) -> Ordering {
         self.dominators.as_ref().unwrap().cmp_in_dominator_order(a, b)
     }
 
-    /// Returns true if the given node has 2 or more in-edges, i.e. 2 or more
-    /// predecessors.
-    ///
-    /// This property is interesting to code that assigns counters to nodes and
-    /// edges, because if a node _doesn't_ have multiple in-edges, then there's
-    /// no benefit in having a separate counter for its in-edge, because it
-    /// would have the same value as the node's own counter.
-    ///
-    /// FIXME: That assumption might not be true for [`TerminatorKind::Yield`]?
-    #[inline(always)]
-    pub(super) fn bcb_has_multiple_in_edges(&self, bcb: BasicCoverageBlock) -> bool {
-        // Even though bcb0 conceptually has an extra virtual in-edge due to
-        // being the entry point, we've already asserted that it has no _other_
-        // in-edges, so there's no possibility of it having _multiple_ in-edges.
-        // (And since its virtual in-edge doesn't exist in the graph, that edge
-        // can't have a separate counter anyway.)
-        self.predecessors[bcb].len() > 1
+    /// Returns the source of this node's sole in-edge, if it has exactly one.
+    /// That edge can be assumed to have the same execution count as the node
+    /// itself (in the absence of panics).
+    pub(crate) fn sole_predecessor(
+        &self,
+        to_bcb: BasicCoverageBlock,
+    ) -> Option<BasicCoverageBlock> {
+        // Unlike `simple_successor`, there is no need for extra checks here.
+        if let &[from_bcb] = self.predecessors[to_bcb].as_slice() { Some(from_bcb) } else { None }
+    }
+
+    /// Returns the target of this node's sole out-edge, if it has exactly
+    /// one, but only if that edge can be assumed to have the same execution
+    /// count as the node itself (in the absence of panics).
+    pub(crate) fn simple_successor(
+        &self,
+        from_bcb: BasicCoverageBlock,
+    ) -> Option<BasicCoverageBlock> {
+        // If a node's count is the sum of its out-edges, and it has exactly
+        // one out-edge, then that edge has the same count as the node.
+        if self.bcbs[from_bcb].is_out_summable
+            && let &[to_bcb] = self.successors[from_bcb].as_slice()
+        {
+            Some(to_bcb)
+        } else {
+            None
+        }
     }
 }
 
@@ -212,7 +231,7 @@ impl graph::StartNode for CoverageGraph {
 impl graph::Successors for CoverageGraph {
     #[inline]
     fn successors(&self, node: Self::Node) -> impl Iterator<Item = Self::Node> {
-        self.successors[node].iter().cloned()
+        self.successors[node].iter().copied()
     }
 }
 
@@ -227,7 +246,7 @@ rustc_index::newtype_index! {
     /// A node in the control-flow graph of CoverageGraph.
     #[orderable]
     #[debug_format = "bcb{}"]
-    pub(super) struct BasicCoverageBlock {
+    pub(crate) struct BasicCoverageBlock {
         const START_BCB = 0;
     }
 }
@@ -259,23 +278,25 @@ rustc_index::newtype_index! {
 /// queries (`dominates()`, `predecessors`, `successors`, etc.) have branch (control flow)
 /// significance.
 #[derive(Debug, Clone)]
-pub(super) struct BasicCoverageBlockData {
-    pub basic_blocks: Vec<BasicBlock>,
+pub(crate) struct BasicCoverageBlockData {
+    pub(crate) basic_blocks: Vec<BasicBlock>,
+
+    /// If true, this node's execution count can be assumed to be the sum of the
+    /// execution counts of all of its **out-edges** (assuming no panics).
+    ///
+    /// Notably, this is false for a node ending with [`TerminatorKind::Yield`],
+    /// because the yielding coroutine might not be resumed.
+    pub(crate) is_out_summable: bool,
 }
 
 impl BasicCoverageBlockData {
-    pub fn from(basic_blocks: Vec<BasicBlock>) -> Self {
-        assert!(basic_blocks.len() > 0);
-        Self { basic_blocks }
-    }
-
     #[inline(always)]
-    pub fn leader_bb(&self) -> BasicBlock {
+    pub(crate) fn leader_bb(&self) -> BasicBlock {
         self.basic_blocks[0]
     }
 
     #[inline(always)]
-    pub fn last_bb(&self) -> BasicBlock {
+    pub(crate) fn last_bb(&self) -> BasicBlock {
         *self.basic_blocks.last().unwrap()
     }
 }
@@ -290,6 +311,9 @@ enum CoverageSuccessors<'a> {
     Chainable(BasicBlock),
     /// The block cannot be combined into the same BCB as its successor(s).
     NotChainable(&'a [BasicBlock]),
+    /// Yield terminators are not chainable, and their execution count can also
+    /// differ from the execution count of their out-edge.
+    Yield(BasicBlock),
 }
 
 impl CoverageSuccessors<'_> {
@@ -297,6 +321,17 @@ impl CoverageSuccessors<'_> {
         match self {
             Self::Chainable(_) => true,
             Self::NotChainable(_) => false,
+            Self::Yield(_) => false,
+        }
+    }
+
+    /// Returns true if the terminator itself is assumed to have the same
+    /// execution count as the sum of its out-edges (assuming no panics).
+    fn is_out_summable(&self) -> bool {
+        match self {
+            Self::Chainable(_) => true,
+            Self::NotChainable(_) => true,
+            Self::Yield(_) => false,
         }
     }
 }
@@ -307,7 +342,9 @@ impl IntoIterator for CoverageSuccessors<'_> {
 
     fn into_iter(self) -> Self::IntoIter {
         match self {
-            Self::Chainable(bb) => Some(bb).into_iter().chain((&[]).iter().copied()),
+            Self::Chainable(bb) | Self::Yield(bb) => {
+                Some(bb).into_iter().chain((&[]).iter().copied())
+            }
             Self::NotChainable(bbs) => None.into_iter().chain(bbs.iter().copied()),
         }
     }
@@ -326,7 +363,7 @@ fn bcb_filtered_successors<'a, 'tcx>(terminator: &'a Terminator<'tcx>) -> Covera
 
         // A yield terminator has exactly 1 successor, but should not be chained,
         // because its resume edge has a different execution count.
-        Yield { ref resume, .. } => CoverageSuccessors::NotChainable(std::slice::from_ref(resume)),
+        Yield { resume, .. } => CoverageSuccessors::Yield(resume),
 
         // These terminators have exactly one coverage-relevant successor,
         // and can be chained into it.
@@ -336,27 +373,30 @@ fn bcb_filtered_successors<'a, 'tcx>(terminator: &'a Terminator<'tcx>) -> Covera
         | FalseUnwind { real_target: target, .. }
         | Goto { target } => CoverageSuccessors::Chainable(target),
 
-        // A call terminator can normally be chained, except when they have no
-        // successor because they are known to diverge.
+        // A call terminator can normally be chained, except when it has no
+        // successor because it is known to diverge.
         Call { target: maybe_target, .. } => match maybe_target {
             Some(target) => CoverageSuccessors::Chainable(target),
             None => CoverageSuccessors::NotChainable(&[]),
         },
 
-        // An inline asm terminator can normally be chained, except when it diverges or uses asm
-        // goto.
+        // An inline asm terminator can normally be chained, except when it
+        // diverges or uses asm goto.
         InlineAsm { ref targets, .. } => {
-            if targets.len() == 1 {
-                CoverageSuccessors::Chainable(targets[0])
+            if let [target] = targets[..] {
+                CoverageSuccessors::Chainable(target)
             } else {
                 CoverageSuccessors::NotChainable(targets)
             }
         }
 
         // These terminators have no coverage-relevant successors.
-        CoroutineDrop | Return | Unreachable | UnwindResume | UnwindTerminate(_) => {
-            CoverageSuccessors::NotChainable(&[])
-        }
+        CoroutineDrop
+        | Return
+        | TailCall { .. }
+        | Unreachable
+        | UnwindResume
+        | UnwindTerminate(_) => CoverageSuccessors::NotChainable(&[]),
     }
 }
 
@@ -364,7 +404,7 @@ fn bcb_filtered_successors<'a, 'tcx>(terminator: &'a Terminator<'tcx>) -> Covera
 /// CoverageGraph outside all loops. This supports traversing the BCB CFG in a way that
 /// ensures a loop is completely traversed before processing Blocks after the end of the loop.
 #[derive(Debug)]
-pub(super) struct TraversalContext {
+struct TraversalContext {
     /// BCB with one or more incoming loop backedges, indicating which loop
     /// this context is for.
     ///
@@ -375,7 +415,7 @@ pub(super) struct TraversalContext {
     worklist: VecDeque<BasicCoverageBlock>,
 }
 
-pub(super) struct TraverseCoverageGraphWithLoops<'a> {
+pub(crate) struct TraverseCoverageGraphWithLoops<'a> {
     basic_coverage_blocks: &'a CoverageGraph,
 
     backedges: IndexVec<BasicCoverageBlock, Vec<BasicCoverageBlock>>,
@@ -384,7 +424,7 @@ pub(super) struct TraverseCoverageGraphWithLoops<'a> {
 }
 
 impl<'a> TraverseCoverageGraphWithLoops<'a> {
-    pub(super) fn new(basic_coverage_blocks: &'a CoverageGraph) -> Self {
+    pub(crate) fn new(basic_coverage_blocks: &'a CoverageGraph) -> Self {
         let backedges = find_loop_backedges(basic_coverage_blocks);
 
         let worklist = VecDeque::from([basic_coverage_blocks.start_node()]);
@@ -400,7 +440,7 @@ impl<'a> TraverseCoverageGraphWithLoops<'a> {
 
     /// For each loop on the loop context stack (top-down), yields a list of BCBs
     /// within that loop that have an outgoing edge back to the loop header.
-    pub(super) fn reloop_bcbs_per_loop(&self) -> impl Iterator<Item = &[BasicCoverageBlock]> {
+    pub(crate) fn reloop_bcbs_per_loop(&self) -> impl Iterator<Item = &[BasicCoverageBlock]> {
         self.context_stack
             .iter()
             .rev()
@@ -408,39 +448,38 @@ impl<'a> TraverseCoverageGraphWithLoops<'a> {
             .map(|header_bcb| self.backedges[header_bcb].as_slice())
     }
 
-    pub(super) fn next(&mut self) -> Option<BasicCoverageBlock> {
+    pub(crate) fn next(&mut self) -> Option<BasicCoverageBlock> {
         debug!(
             "TraverseCoverageGraphWithLoops::next - context_stack: {:?}",
             self.context_stack.iter().rev().collect::<Vec<_>>()
         );
 
         while let Some(context) = self.context_stack.last_mut() {
-            if let Some(bcb) = context.worklist.pop_front() {
-                if !self.visited.insert(bcb) {
-                    debug!("Already visited: {bcb:?}");
-                    continue;
-                }
-                debug!("Visiting {bcb:?}");
-
-                if self.backedges[bcb].len() > 0 {
-                    debug!("{bcb:?} is a loop header! Start a new TraversalContext...");
-                    self.context_stack.push(TraversalContext {
-                        loop_header: Some(bcb),
-                        worklist: VecDeque::new(),
-                    });
-                }
-                self.add_successors_to_worklists(bcb);
-                return Some(bcb);
-            } else {
-                // Strip contexts with empty worklists from the top of the stack
+            let Some(bcb) = context.worklist.pop_front() else {
+                // This stack level is exhausted; pop it and try the next one.
                 self.context_stack.pop();
+                continue;
+            };
+
+            if !self.visited.insert(bcb) {
+                debug!("Already visited: {bcb:?}");
+                continue;
             }
+            debug!("Visiting {bcb:?}");
+
+            if self.backedges[bcb].len() > 0 {
+                debug!("{bcb:?} is a loop header! Start a new TraversalContext...");
+                self.context_stack
+                    .push(TraversalContext { loop_header: Some(bcb), worklist: VecDeque::new() });
+            }
+            self.add_successors_to_worklists(bcb);
+            return Some(bcb);
         }
 
         None
     }
 
-    pub fn add_successors_to_worklists(&mut self, bcb: BasicCoverageBlock) {
+    fn add_successors_to_worklists(&mut self, bcb: BasicCoverageBlock) {
         let successors = &self.basic_coverage_blocks.successors[bcb];
         debug!("{:?} has {} successors:", bcb, successors.len());
 
@@ -494,11 +533,11 @@ impl<'a> TraverseCoverageGraphWithLoops<'a> {
         }
     }
 
-    pub fn is_complete(&self) -> bool {
+    pub(crate) fn is_complete(&self) -> bool {
         self.visited.count() == self.visited.domain_size()
     }
 
-    pub fn unvisited(&self) -> Vec<BasicCoverageBlock> {
+    pub(crate) fn unvisited(&self) -> Vec<BasicCoverageBlock> {
         let mut unvisited_set: BitSet<BasicCoverageBlock> =
             BitSet::new_filled(self.visited.domain_size());
         unvisited_set.subtract(&self.visited);
@@ -506,7 +545,7 @@ impl<'a> TraverseCoverageGraphWithLoops<'a> {
     }
 }
 
-pub(super) fn find_loop_backedges(
+fn find_loop_backedges(
     basic_coverage_blocks: &CoverageGraph,
 ) -> IndexVec<BasicCoverageBlock, Vec<BasicCoverageBlock>> {
     let num_bcbs = basic_coverage_blocks.num_nodes();

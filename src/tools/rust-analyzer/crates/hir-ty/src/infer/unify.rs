@@ -9,19 +9,21 @@ use chalk_ir::{
 use chalk_solve::infer::ParameterEnaVariableExt;
 use either::Either;
 use ena::unify::UnifyKey;
-use hir_expand::name;
+use hir_def::{lang_item::LangItem, AdtId};
+use hir_expand::name::Name;
+use intern::sym;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use triomphe::Arc;
 
 use super::{InferOk, InferResult, InferenceContext, TypeError};
 use crate::{
-    consteval::unknown_const, db::HirDatabase, error_lifetime, fold_generic_args,
-    fold_tys_and_consts, to_chalk_trait_id, traits::FnTrait, AliasEq, AliasTy, BoundVar, Canonical,
-    Const, ConstValue, DebruijnIndex, DomainGoal, GenericArg, GenericArgData, Goal, GoalData,
-    Guidance, InEnvironment, InferenceVar, Interner, Lifetime, OpaqueTyId, ParamKind, ProjectionTy,
-    ProjectionTyExt, Scalar, Solution, Substitution, TraitEnvironment, Ty, TyBuilder, TyExt,
-    TyKind, VariableKind, WhereClause,
+    consteval::unknown_const, db::HirDatabase, fold_generic_args, fold_tys_and_consts,
+    to_chalk_trait_id, traits::FnTrait, AliasEq, AliasTy, BoundVar, Canonical, Const, ConstValue,
+    DebruijnIndex, DomainGoal, GenericArg, GenericArgData, Goal, GoalData, Guidance, InEnvironment,
+    InferenceVar, Interner, Lifetime, OpaqueTyId, ParamKind, ProjectionTy, ProjectionTyExt, Scalar,
+    Solution, Substitution, TraitEnvironment, TraitRef, Ty, TyBuilder, TyExt, TyKind, VariableKind,
+    WhereClause,
 };
 
 impl InferenceContext<'_> {
@@ -104,7 +106,7 @@ impl<T: HasInterner<Interner = Interner>> Canonicalized<T> {
                 VariableKind::Ty(TyVariableKind::Float) => ctx.new_float_var().cast(Interner),
                 // Chalk can sometimes return new lifetime variables. We just replace them by errors
                 // for now.
-                VariableKind::Lifetime => error_lifetime().cast(Interner),
+                VariableKind::Lifetime => ctx.new_lifetime_var().cast(Interner),
                 VariableKind::Const(ty) => ctx.new_const_var(ty.clone()).cast(Interner),
             }),
         );
@@ -223,7 +225,7 @@ type ChalkInferenceTable = chalk_solve::infer::InferenceTable<Interner>;
 pub(crate) struct InferenceTable<'a> {
     pub(crate) db: &'a dyn HirDatabase,
     pub(crate) trait_env: Arc<TraitEnvironment>,
-    pub(crate) atpit_coercion_table: Option<FxHashMap<OpaqueTyId, Ty>>,
+    pub(crate) tait_coercion_table: Option<FxHashMap<OpaqueTyId, Ty>>,
     var_unification_table: ChalkInferenceTable,
     type_variable_table: SmallVec<[TypeVariableFlags; 16]>,
     pending_obligations: Vec<Canonicalized<InEnvironment<Goal>>>,
@@ -243,7 +245,7 @@ impl<'a> InferenceTable<'a> {
         InferenceTable {
             db,
             trait_env,
-            atpit_coercion_table: None,
+            tait_coercion_table: None,
             var_unification_table: ChalkInferenceTable::new(),
             type_variable_table: SmallVec::new(),
             pending_obligations: Vec::new(),
@@ -264,14 +266,16 @@ impl<'a> InferenceTable<'a> {
             }
             let v = InferenceVar::from(i as u32);
             let root = self.var_unification_table.inference_var_root(v);
-            if let Some(data) = self.type_variable_table.get_mut(root.index() as usize) {
-                *data |= TypeVariableFlags::DIVERGING;
-            }
+            self.modify_type_variable_flag(root, |f| {
+                *f |= TypeVariableFlags::DIVERGING;
+            });
         }
     }
 
     pub(super) fn set_diverging(&mut self, iv: InferenceVar, diverging: bool) {
-        self.type_variable_table[iv.index() as usize].set(TypeVariableFlags::DIVERGING, diverging);
+        self.modify_type_variable_flag(iv, |f| {
+            f.set(TypeVariableFlags::DIVERGING, diverging);
+        });
     }
 
     fn fallback_value(&self, iv: InferenceVar, kind: TyVariableKind) -> Ty {
@@ -368,6 +372,18 @@ impl<'a> InferenceTable<'a> {
         var
     }
 
+    fn modify_type_variable_flag<F>(&mut self, var: InferenceVar, cb: F)
+    where
+        F: FnOnce(&mut TypeVariableFlags),
+    {
+        let idx = var.index() as usize;
+        if self.type_variable_table.len() <= idx {
+            self.extend_type_variable_table(idx);
+        }
+        if let Some(f) = self.type_variable_table.get_mut(idx) {
+            cb(f);
+        }
+    }
     fn extend_type_variable_table(&mut self, to_index: usize) {
         let count = to_index - self.type_variable_table.len() + 1;
         self.type_variable_table.extend(iter::repeat(TypeVariableFlags::default()).take(count));
@@ -613,8 +629,7 @@ impl<'a> InferenceTable<'a> {
     }
 
     pub(crate) fn resolve_obligations_as_possible(&mut self) {
-        let _span =
-            tracing::span!(tracing::Level::INFO, "resolve_obligations_as_possible").entered();
+        let _span = tracing::info_span!("resolve_obligations_as_possible").entered();
         let mut changed = true;
         let mut obligations = mem::take(&mut self.resolve_obligations_buffer);
         while mem::take(&mut changed) {
@@ -782,7 +797,8 @@ impl<'a> InferenceTable<'a> {
         let krate = self.trait_env.krate;
         let fn_once_trait = FnTrait::FnOnce.get_id(self.db, krate)?;
         let trait_data = self.db.trait_data(fn_once_trait);
-        let output_assoc_type = trait_data.associated_type_by_name(&name![Output])?;
+        let output_assoc_type =
+            trait_data.associated_type_by_name(&Name::new_symbol_root(sym::Output.clone()))?;
 
         let mut arg_tys = Vec::with_capacity(num_args);
         let arg_ty = TyBuilder::tuple(num_args)
@@ -797,19 +813,22 @@ impl<'a> InferenceTable<'a> {
             })
             .build();
 
-        let projection = {
-            let b = TyBuilder::subst_for_def(self.db, fn_once_trait, None);
-            if b.remaining() != 2 {
-                return None;
-            }
-            let fn_once_subst = b.push(ty.clone()).push(arg_ty).build();
+        let b = TyBuilder::trait_ref(self.db, fn_once_trait);
+        if b.remaining() != 2 {
+            return None;
+        }
+        let mut trait_ref = b.push(ty.clone()).push(arg_ty).build();
 
-            TyBuilder::assoc_type_projection(self.db, output_assoc_type, Some(fn_once_subst))
-                .build()
+        let projection = {
+            TyBuilder::assoc_type_projection(
+                self.db,
+                output_assoc_type,
+                Some(trait_ref.substitution.clone()),
+            )
+            .build()
         };
 
         let trait_env = self.trait_env.env.clone();
-        let mut trait_ref = projection.trait_ref(self.db);
         let obligation = InEnvironment {
             goal: trait_ref.clone().cast(Interner),
             environment: trait_env.clone(),
@@ -893,6 +912,37 @@ impl<'a> InferenceTable<'a> {
             },
             _ => c,
         }
+    }
+
+    /// Check if given type is `Sized` or not
+    pub(crate) fn is_sized(&mut self, ty: &Ty) -> bool {
+        // Early return for some obvious types
+        if matches!(ty.kind(Interner), TyKind::Scalar(..) | TyKind::Ref(..) | TyKind::Raw(..)) {
+            return true;
+        }
+        if let Some((AdtId::StructId(id), subst)) = ty.as_adt() {
+            let struct_data = self.db.struct_data(id);
+            if let Some((last_field, _)) = struct_data.variant_data.fields().iter().last() {
+                let last_field_ty =
+                    self.db.field_types(id.into())[last_field].clone().substitute(Interner, subst);
+                // Structs can have DST as its last field and such cases are not handled
+                // as unsized by the chalk, so we do this manually
+                return self.is_sized(&last_field_ty);
+            }
+        }
+        let Some(sized) = self
+            .db
+            .lang_item(self.trait_env.krate, LangItem::Sized)
+            .and_then(|sized| sized.as_trait())
+        else {
+            return false;
+        };
+        let sized_pred = WhereClause::Implemented(TraitRef {
+            trait_id: to_chalk_trait_id(sized),
+            substitution: Substitution::from1(Interner, ty.clone()),
+        });
+        let goal = GoalData::DomainGoal(chalk_ir::DomainGoal::Holds(sized_pred)).intern(Interner);
+        matches!(self.try_obligation(goal), Some(Solution::Unique(_)))
     }
 }
 

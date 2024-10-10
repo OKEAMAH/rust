@@ -1,3 +1,5 @@
+//@ compile-flags: -Znext-solver
+#![allow(incomplete_features)]
 #![feature(const_trait_impl, effects)]
 
 #[const_trait]
@@ -23,7 +25,7 @@ pub const fn add_i32(a: i32, b: i32) -> i32 {
 
 pub const fn add_u32(a: u32, b: u32) -> u32 {
     a.plus(b)
-    //~^ ERROR the trait bound
+    //~^ ERROR the trait bound `u32: ~const Plus`
 }
 
 fn main() {}

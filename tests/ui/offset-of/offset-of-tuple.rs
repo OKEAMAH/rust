@@ -1,4 +1,3 @@
-#![feature(offset_of_nested)]
 #![feature(builtin_syntax)]
 
 use std::mem::offset_of;
@@ -29,6 +28,7 @@ type ComplexTup = (((u8, u8), u8), u8);
 
 fn nested() {
     offset_of!(((u8, u16), (u32, u16, u8)), 0.2); //~ ERROR no field `2`
+    offset_of!(((u8, u16), (u32, u16, u8)), 0.1e2); //~ ERROR no field `1e2`
     offset_of!(((u8, u16), (u32, u16, u8)), 1.2);
     offset_of!(((u8, u16), (u32, u16, u8)), 1.2.0); //~ ERROR no field `0`
 

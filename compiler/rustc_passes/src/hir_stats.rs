@@ -2,18 +2,16 @@
 // pieces of AST and HIR. The resulting numbers are good approximations but not
 // completely accurate (some things might be counted twice, others missed).
 
-use rustc_ast::visit as ast_visit;
 use rustc_ast::visit::BoundKind;
-use rustc_ast::{self as ast, AttrId, NodeId};
+use rustc_ast::{self as ast, AttrId, NodeId, visit as ast_visit};
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_hir as hir;
-use rustc_hir::intravisit as hir_visit;
-use rustc_hir::HirId;
+use rustc_hir::{HirId, intravisit as hir_visit};
 use rustc_middle::hir::map::Map;
 use rustc_middle::ty::TyCtxt;
 use rustc_middle::util::common::to_readable_str;
-use rustc_span::def_id::LocalDefId;
 use rustc_span::Span;
+use rustc_span::def_id::LocalDefId;
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash)]
 enum Id {
@@ -221,32 +219,28 @@ impl<'v> hir_visit::Visitor<'v> for StatCollector<'v> {
     }
 
     fn visit_item(&mut self, i: &'v hir::Item<'v>) {
-        record_variants!(
-            (self, i, i.kind, Id::Node(i.hir_id()), hir, Item, ItemKind),
-            [
-                ExternCrate,
-                Use,
-                Static,
-                Const,
-                Fn,
-                Macro,
-                Mod,
-                ForeignMod,
-                GlobalAsm,
-                TyAlias,
-                OpaqueTy,
-                Enum,
-                Struct,
-                Union,
-                Trait,
-                TraitAlias,
-                Impl
-            ]
-        );
+        record_variants!((self, i, i.kind, Id::Node(i.hir_id()), hir, Item, ItemKind), [
+            ExternCrate,
+            Use,
+            Static,
+            Const,
+            Fn,
+            Macro,
+            Mod,
+            ForeignMod,
+            GlobalAsm,
+            TyAlias,
+            Enum,
+            Struct,
+            Union,
+            Trait,
+            TraitAlias,
+            Impl
+        ]);
         hir_visit::walk_item(self, i)
     }
 
-    fn visit_body(&mut self, b: &'v hir::Body<'v>) {
+    fn visit_body(&mut self, b: &hir::Body<'v>) {
         self.record("Body", Id::None, b);
         hir_visit::walk_body(self, b);
     }
@@ -275,10 +269,9 @@ impl<'v> hir_visit::Visitor<'v> for StatCollector<'v> {
     }
 
     fn visit_stmt(&mut self, s: &'v hir::Stmt<'v>) {
-        record_variants!(
-            (self, s, s.kind, Id::Node(s.hir_id), hir, Stmt, StmtKind),
-            [Let, Item, Expr, Semi]
-        );
+        record_variants!((self, s, s.kind, Id::Node(s.hir_id), hir, Stmt, StmtKind), [
+            Let, Item, Expr, Semi
+        ]);
         hir_visit::walk_stmt(self, s)
     }
 
@@ -288,26 +281,23 @@ impl<'v> hir_visit::Visitor<'v> for StatCollector<'v> {
     }
 
     fn visit_pat(&mut self, p: &'v hir::Pat<'v>) {
-        record_variants!(
-            (self, p, p.kind, Id::Node(p.hir_id), hir, Pat, PatKind),
-            [
-                Wild,
-                Binding,
-                Struct,
-                TupleStruct,
-                Or,
-                Never,
-                Path,
-                Tuple,
-                Box,
-                Deref,
-                Ref,
-                Lit,
-                Range,
-                Slice,
-                Err
-            ]
-        );
+        record_variants!((self, p, p.kind, Id::Node(p.hir_id), hir, Pat, PatKind), [
+            Wild,
+            Binding,
+            Struct,
+            TupleStruct,
+            Or,
+            Never,
+            Path,
+            Tuple,
+            Box,
+            Deref,
+            Ref,
+            Lit,
+            Range,
+            Slice,
+            Err
+        ]);
         hir_visit::walk_pat(self, p)
     }
 
@@ -317,15 +307,11 @@ impl<'v> hir_visit::Visitor<'v> for StatCollector<'v> {
     }
 
     fn visit_expr(&mut self, e: &'v hir::Expr<'v>) {
-        record_variants!(
-            (self, e, e.kind, Id::Node(e.hir_id), hir, Expr, ExprKind),
-            [
-                ConstBlock, Array, Call, MethodCall, Tup, Binary, Unary, Lit, Cast, Type,
-                DropTemps, Let, If, Loop, Match, Closure, Block, Assign, AssignOp, Field, Index,
-                Path, AddrOf, Break, Continue, Ret, Become, InlineAsm, OffsetOf, Struct, Repeat,
-                Yield, Err
-            ]
-        );
+        record_variants!((self, e, e.kind, Id::Node(e.hir_id), hir, Expr, ExprKind), [
+            ConstBlock, Array, Call, MethodCall, Tup, Binary, Unary, Lit, Cast, Type, DropTemps,
+            Let, If, Loop, Match, Closure, Block, Assign, AssignOp, Field, Index, Path, AddrOf,
+            Break, Continue, Ret, Become, InlineAsm, OffsetOf, Struct, Repeat, Yield, Err
+        ]);
         hir_visit::walk_expr(self, e)
     }
 
@@ -335,27 +321,24 @@ impl<'v> hir_visit::Visitor<'v> for StatCollector<'v> {
     }
 
     fn visit_ty(&mut self, t: &'v hir::Ty<'v>) {
-        record_variants!(
-            (self, t, t.kind, Id::Node(t.hir_id), hir, Ty, TyKind),
-            [
-                InferDelegation,
-                Slice,
-                Array,
-                Ptr,
-                Ref,
-                BareFn,
-                Never,
-                Tup,
-                AnonAdt,
-                Path,
-                OpaqueDef,
-                TraitObject,
-                Typeof,
-                Infer,
-                Pat,
-                Err
-            ]
-        );
+        record_variants!((self, t, t.kind, Id::Node(t.hir_id), hir, Ty, TyKind), [
+            InferDelegation,
+            Slice,
+            Array,
+            Ptr,
+            Ref,
+            BareFn,
+            Never,
+            Tup,
+            AnonAdt,
+            Path,
+            OpaqueDef,
+            TraitObject,
+            Typeof,
+            Infer,
+            Pat,
+            Err
+        ]);
         hir_visit::walk_ty(self, t)
     }
 
@@ -370,10 +353,11 @@ impl<'v> hir_visit::Visitor<'v> for StatCollector<'v> {
     }
 
     fn visit_where_predicate(&mut self, p: &'v hir::WherePredicate<'v>) {
-        record_variants!(
-            (self, p, p, Id::None, hir, WherePredicate, WherePredicate),
-            [BoundPredicate, RegionPredicate, EqPredicate]
-        );
+        record_variants!((self, p, p, Id::None, hir, WherePredicate, WherePredicate), [
+            BoundPredicate,
+            RegionPredicate,
+            EqPredicate
+        ]);
         hir_visit::walk_where_predicate(self, p)
     }
 
@@ -427,10 +411,9 @@ impl<'v> hir_visit::Visitor<'v> for StatCollector<'v> {
     }
 
     fn visit_param_bound(&mut self, b: &'v hir::GenericBound<'v>) {
-        record_variants!(
-            (self, b, b, Id::None, hir, GenericBound, GenericBound),
-            [Trait, Outlives]
-        );
+        record_variants!((self, b, b, Id::None, hir, GenericBound, GenericBound), [
+            Trait, Outlives, Use
+        ]);
         hir_visit::walk_param_bound(self, b)
     }
 
@@ -445,14 +428,13 @@ impl<'v> hir_visit::Visitor<'v> for StatCollector<'v> {
     }
 
     fn visit_generic_arg(&mut self, ga: &'v hir::GenericArg<'v>) {
-        record_variants!(
-            (self, ga, ga, Id::Node(ga.hir_id()), hir, GenericArg, GenericArg),
-            [Lifetime, Type, Const, Infer]
-        );
+        record_variants!((self, ga, ga, Id::Node(ga.hir_id()), hir, GenericArg, GenericArg), [
+            Lifetime, Type, Const, Infer
+        ]);
         match ga {
             hir::GenericArg::Lifetime(lt) => self.visit_lifetime(lt),
             hir::GenericArg::Type(ty) => self.visit_ty(ty),
-            hir::GenericArg::Const(ct) => self.visit_anon_const(&ct.value),
+            hir::GenericArg::Const(ct) => self.visit_const_arg(ct),
             hir::GenericArg::Infer(inf) => self.visit_infer(inf),
         }
     }
@@ -477,9 +459,9 @@ impl<'v> hir_visit::Visitor<'v> for StatCollector<'v> {
         hir_visit::walk_generic_args(self, ga)
     }
 
-    fn visit_assoc_type_binding(&mut self, type_binding: &'v hir::TypeBinding<'v>) {
-        self.record("TypeBinding", Id::Node(type_binding.hir_id), type_binding);
-        hir_visit::walk_assoc_type_binding(self, type_binding)
+    fn visit_assoc_item_constraint(&mut self, constraint: &'v hir::AssocItemConstraint<'v>) {
+        self.record("AssocItemConstraint", Id::Node(constraint.hir_id), constraint);
+        hir_visit::walk_assoc_item_constraint(self, constraint)
     }
 
     fn visit_attribute(&mut self, attr: &'v ast::Attribute) {
@@ -494,38 +476,34 @@ impl<'v> hir_visit::Visitor<'v> for StatCollector<'v> {
 
 impl<'v> ast_visit::Visitor<'v> for StatCollector<'v> {
     fn visit_foreign_item(&mut self, i: &'v ast::ForeignItem) {
-        record_variants!(
-            (self, i, i.kind, Id::None, ast, ForeignItem, ForeignItemKind),
-            [Static, Fn, TyAlias, MacCall]
-        );
+        record_variants!((self, i, i.kind, Id::None, ast, ForeignItem, ForeignItemKind), [
+            Static, Fn, TyAlias, MacCall
+        ]);
         ast_visit::walk_item(self, i)
     }
 
     fn visit_item(&mut self, i: &'v ast::Item) {
-        record_variants!(
-            (self, i, i.kind, Id::None, ast, Item, ItemKind),
-            [
-                ExternCrate,
-                Use,
-                Static,
-                Const,
-                Fn,
-                Mod,
-                ForeignMod,
-                GlobalAsm,
-                TyAlias,
-                Enum,
-                Struct,
-                Union,
-                Trait,
-                TraitAlias,
-                Impl,
-                MacCall,
-                MacroDef,
-                Delegation,
-                DelegationMac
-            ]
-        );
+        record_variants!((self, i, i.kind, Id::None, ast, Item, ItemKind), [
+            ExternCrate,
+            Use,
+            Static,
+            Const,
+            Fn,
+            Mod,
+            ForeignMod,
+            GlobalAsm,
+            TyAlias,
+            Enum,
+            Struct,
+            Union,
+            Trait,
+            TraitAlias,
+            Impl,
+            MacCall,
+            MacroDef,
+            Delegation,
+            DelegationMac
+        ]);
         ast_visit::walk_item(self, i)
     }
 
@@ -540,10 +518,9 @@ impl<'v> ast_visit::Visitor<'v> for StatCollector<'v> {
     }
 
     fn visit_stmt(&mut self, s: &'v ast::Stmt) {
-        record_variants!(
-            (self, s, s.kind, Id::None, ast, Stmt, StmtKind),
-            [Let, Item, Expr, Semi, Empty, MacCall]
-        );
+        record_variants!((self, s, s.kind, Id::None, ast, Stmt, StmtKind), [
+            Let, Item, Expr, Semi, Empty, MacCall
+        ]);
         ast_visit::walk_stmt(self, s)
     }
 
@@ -558,29 +535,26 @@ impl<'v> ast_visit::Visitor<'v> for StatCollector<'v> {
     }
 
     fn visit_pat(&mut self, p: &'v ast::Pat) {
-        record_variants!(
-            (self, p, p.kind, Id::None, ast, Pat, PatKind),
-            [
-                Wild,
-                Ident,
-                Struct,
-                TupleStruct,
-                Or,
-                Path,
-                Tuple,
-                Box,
-                Deref,
-                Ref,
-                Lit,
-                Range,
-                Slice,
-                Rest,
-                Never,
-                Paren,
-                MacCall,
-                Err
-            ]
-        );
+        record_variants!((self, p, p.kind, Id::None, ast, Pat, PatKind), [
+            Wild,
+            Ident,
+            Struct,
+            TupleStruct,
+            Or,
+            Path,
+            Tuple,
+            Box,
+            Deref,
+            Ref,
+            Lit,
+            Range,
+            Slice,
+            Rest,
+            Never,
+            Paren,
+            MacCall,
+            Err
+        ]);
         ast_visit::walk_pat(self, p)
     }
 
@@ -600,32 +574,29 @@ impl<'v> ast_visit::Visitor<'v> for StatCollector<'v> {
     }
 
     fn visit_ty(&mut self, t: &'v ast::Ty) {
-        record_variants!(
-            (self, t, t.kind, Id::None, ast, Ty, TyKind),
-            [
-                Slice,
-                Array,
-                Ptr,
-                Ref,
-                BareFn,
-                Never,
-                Tup,
-                AnonStruct,
-                AnonUnion,
-                Path,
-                Pat,
-                TraitObject,
-                ImplTrait,
-                Paren,
-                Typeof,
-                Infer,
-                ImplicitSelf,
-                MacCall,
-                CVarArgs,
-                Dummy,
-                Err
-            ]
-        );
+        record_variants!((self, t, t.kind, Id::None, ast, Ty, TyKind), [
+            Slice,
+            Array,
+            Ptr,
+            Ref,
+            BareFn,
+            Never,
+            Tup,
+            AnonStruct,
+            AnonUnion,
+            Path,
+            Pat,
+            TraitObject,
+            ImplTrait,
+            Paren,
+            Typeof,
+            Infer,
+            ImplicitSelf,
+            MacCall,
+            CVarArgs,
+            Dummy,
+            Err
+        ]);
 
         ast_visit::walk_ty(self, t)
     }
@@ -636,10 +607,11 @@ impl<'v> ast_visit::Visitor<'v> for StatCollector<'v> {
     }
 
     fn visit_where_predicate(&mut self, p: &'v ast::WherePredicate) {
-        record_variants!(
-            (self, p, p, Id::None, ast, WherePredicate, WherePredicate),
-            [BoundPredicate, RegionPredicate, EqPredicate]
-        );
+        record_variants!((self, p, p, Id::None, ast, WherePredicate, WherePredicate), [
+            BoundPredicate,
+            RegionPredicate,
+            EqPredicate
+        ]);
         ast_visit::walk_where_predicate(self, p)
     }
 
@@ -649,18 +621,21 @@ impl<'v> ast_visit::Visitor<'v> for StatCollector<'v> {
     }
 
     fn visit_assoc_item(&mut self, i: &'v ast::AssocItem, ctxt: ast_visit::AssocCtxt) {
-        record_variants!(
-            (self, i, i.kind, Id::None, ast, AssocItem, AssocItemKind),
-            [Const, Fn, Type, MacCall, Delegation, DelegationMac]
-        );
+        record_variants!((self, i, i.kind, Id::None, ast, AssocItem, AssocItemKind), [
+            Const,
+            Fn,
+            Type,
+            MacCall,
+            Delegation,
+            DelegationMac
+        ]);
         ast_visit::walk_assoc_item(self, i, ctxt);
     }
 
     fn visit_param_bound(&mut self, b: &'v ast::GenericBound, _ctxt: BoundKind) {
-        record_variants!(
-            (self, b, b, Id::None, ast, GenericBound, GenericBound),
-            [Trait, Outlives]
-        );
+        record_variants!((self, b, b, Id::None, ast, GenericBound, GenericBound), [
+            Trait, Outlives, Use
+        ]);
         ast_visit::walk_param_bound(self, b)
     }
 
@@ -688,23 +663,23 @@ impl<'v> ast_visit::Visitor<'v> for StatCollector<'v> {
         ast_visit::walk_path_segment(self, path_segment)
     }
 
-    // `GenericArgs` has one inline use (in `ast::AssocConstraint::gen_args`) and one
+    // `GenericArgs` has one inline use (in `ast::AssocItemConstraint::gen_args`) and one
     // non-inline use (in `ast::PathSegment::args`). The latter case is more
     // common, so we implement `visit_generic_args` and tolerate the double
     // counting in the former case.
     fn visit_generic_args(&mut self, g: &'v ast::GenericArgs) {
-        record_variants!(
-            (self, g, g, Id::None, ast, GenericArgs, GenericArgs),
-            [AngleBracketed, Parenthesized]
-        );
+        record_variants!((self, g, g, Id::None, ast, GenericArgs, GenericArgs), [
+            AngleBracketed,
+            Parenthesized,
+            ParenthesizedElided
+        ]);
         ast_visit::walk_generic_args(self, g)
     }
 
     fn visit_attribute(&mut self, attr: &'v ast::Attribute) {
-        record_variants!(
-            (self, attr, attr.kind, Id::None, ast, Attribute, AttrKind),
-            [Normal, DocComment]
-        );
+        record_variants!((self, attr, attr.kind, Id::None, ast, Attribute, AttrKind), [
+            Normal, DocComment
+        ]);
         ast_visit::walk_attribute(self, attr)
     }
 

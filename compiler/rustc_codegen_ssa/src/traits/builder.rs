@@ -1,30 +1,31 @@
-use super::abi::AbiBuilderMethods;
-use super::asm::AsmBuilderMethods;
-use super::consts::ConstMethods;
-use super::coverageinfo::CoverageInfoBuilderMethods;
-use super::debuginfo::DebugInfoBuilderMethods;
-use super::intrinsic::IntrinsicCallMethods;
-use super::misc::MiscMethods;
-use super::type_::{ArgAbiMethods, BaseTypeMethods, LayoutTypeMethods};
-use super::{HasCodegen, StaticBuilderMethods};
-
-use crate::common::{
-    AtomicOrdering, AtomicRmwBinOp, IntPredicate, RealPredicate, SynchronizationScope, TypeKind,
-};
-use crate::mir::operand::{OperandRef, OperandValue};
-use crate::mir::place::{PlaceRef, PlaceValue};
-use crate::MemFlags;
+use std::assert_matches::assert_matches;
+use std::ops::Deref;
 
 use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrs;
-use rustc_middle::ty::layout::{HasParamEnv, TyAndLayout};
+use rustc_middle::ty::layout::{FnAbiOf, LayoutOf, TyAndLayout};
 use rustc_middle::ty::{Instance, Ty};
 use rustc_session::config::OptLevel;
 use rustc_span::Span;
 use rustc_target::abi::call::FnAbi;
 use rustc_target::abi::{Abi, Align, Scalar, Size, WrappingRange};
-use rustc_target::spec::HasTargetSpec;
 
-#[derive(Copy, Clone)]
+use super::abi::AbiBuilderMethods;
+use super::asm::AsmBuilderMethods;
+use super::consts::ConstCodegenMethods;
+use super::coverageinfo::CoverageInfoBuilderMethods;
+use super::debuginfo::DebugInfoBuilderMethods;
+use super::intrinsic::IntrinsicCallBuilderMethods;
+use super::misc::MiscCodegenMethods;
+use super::type_::{ArgAbiBuilderMethods, BaseTypeCodegenMethods, LayoutTypeCodegenMethods};
+use super::{CodegenMethods, StaticBuilderMethods};
+use crate::MemFlags;
+use crate::common::{
+    AtomicOrdering, AtomicRmwBinOp, IntPredicate, RealPredicate, SynchronizationScope, TypeKind,
+};
+use crate::mir::operand::{OperandRef, OperandValue};
+use crate::mir::place::{PlaceRef, PlaceValue};
+
+#[derive(Copy, Clone, Debug)]
 pub enum OverflowOp {
     Add,
     Sub,
@@ -32,17 +33,34 @@ pub enum OverflowOp {
 }
 
 pub trait BuilderMethods<'a, 'tcx>:
-    HasCodegen<'tcx>
+    Sized
+    + LayoutOf<'tcx, LayoutOfResult = TyAndLayout<'tcx>>
+    + FnAbiOf<'tcx, FnAbiOfResult = &'tcx FnAbi<'tcx, Ty<'tcx>>>
+    + Deref<Target = Self::CodegenCx>
     + CoverageInfoBuilderMethods<'tcx>
     + DebugInfoBuilderMethods
-    + ArgAbiMethods<'tcx>
+    + ArgAbiBuilderMethods<'tcx>
     + AbiBuilderMethods<'tcx>
-    + IntrinsicCallMethods<'tcx>
+    + IntrinsicCallBuilderMethods<'tcx>
     + AsmBuilderMethods<'tcx>
     + StaticBuilderMethods
-    + HasParamEnv<'tcx>
-    + HasTargetSpec
 {
+    // `BackendTypes` is a supertrait of both `CodegenMethods` and
+    // `BuilderMethods`. This bound ensures all impls agree on the associated
+    // types within.
+    type CodegenCx: CodegenMethods<
+            'tcx,
+            Value = Self::Value,
+            Metadata = Self::Metadata,
+            Function = Self::Function,
+            BasicBlock = Self::BasicBlock,
+            Type = Self::Type,
+            Funclet = Self::Funclet,
+            DIScope = Self::DIScope,
+            DILocation = Self::DILocation,
+            DIVariable = Self::DIVariable,
+        >;
+
     fn build(cx: &'a Self::CodegenCx, llbb: Self::BasicBlock) -> Self;
 
     fn cx(&self) -> &Self::CodegenCx;
@@ -110,8 +128,16 @@ pub trait BuilderMethods<'a, 'tcx>:
     fn frem(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value;
     fn frem_fast(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value;
     fn frem_algebraic(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value;
+    /// Generate a left-shift. Both operands must have the same size. The right operand must be
+    /// interpreted as unsigned and can be assumed to be less than the size of the left operand.
     fn shl(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value;
+    /// Generate a logical right-shift. Both operands must have the same size. The right operand
+    /// must be interpreted as unsigned and can be assumed to be less than the size of the left
+    /// operand.
     fn lshr(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value;
+    /// Generate an arithmetic right-shift. Both operands must have the same size. The right operand
+    /// must be interpreted as unsigned and can be assumed to be less than the size of the left
+    /// operand.
     fn ashr(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value;
     fn unchecked_sadd(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value;
     fn unchecked_uadd(&mut self, lhs: Self::Value, rhs: Self::Value) -> Self::Value;
@@ -157,7 +183,7 @@ pub trait BuilderMethods<'a, 'tcx>:
         size: Size,
     ) -> Self::Value;
     fn load_from_place(&mut self, ty: Self::Type, place: PlaceValue<Self::Value>) -> Self::Value {
-        debug_assert_eq!(place.llextra, None);
+        assert_eq!(place.llextra, None);
         self.load(ty, place.llval, place.align)
     }
     fn load_operand(&mut self, place: PlaceRef<'tcx, Self::Value>)
@@ -176,7 +202,7 @@ pub trait BuilderMethods<'a, 'tcx>:
 
     fn store(&mut self, val: Self::Value, ptr: Self::Value, align: Align) -> Self::Value;
     fn store_to_place(&mut self, val: Self::Value, place: PlaceValue<Self::Value>) -> Self::Value {
-        debug_assert_eq!(place.llextra, None);
+        assert_eq!(place.llextra, None);
         self.store(val, place.llval, place.align)
     }
     fn store_with_flags(
@@ -192,7 +218,7 @@ pub trait BuilderMethods<'a, 'tcx>:
         place: PlaceValue<Self::Value>,
         flags: MemFlags,
     ) -> Self::Value {
-        debug_assert_eq!(place.llextra, None);
+        assert_eq!(place.llextra, None);
         self.store_with_flags(val, place.llval, place.align, flags)
     }
     fn atomic_store(
@@ -247,10 +273,10 @@ pub trait BuilderMethods<'a, 'tcx>:
         } else {
             (in_ty, dest_ty)
         };
-        assert!(matches!(
+        assert_matches!(
             self.cx().type_kind(float_ty),
             TypeKind::Half | TypeKind::Float | TypeKind::Double | TypeKind::FP128
-        ));
+        );
         assert_eq!(self.cx().type_kind(int_ty), TypeKind::Integer);
 
         if let Some(false) = self.cx().sess().opts.unstable_opts.saturating_float_casts {
@@ -312,9 +338,9 @@ pub trait BuilderMethods<'a, 'tcx>:
         layout: TyAndLayout<'tcx>,
         flags: MemFlags,
     ) {
-        debug_assert!(layout.is_sized(), "cannot typed-copy an unsigned type");
-        debug_assert!(src.llextra.is_none(), "cannot directly copy from unsized values");
-        debug_assert!(dst.llextra.is_none(), "cannot directly copy into unsized values");
+        assert!(layout.is_sized(), "cannot typed-copy an unsigned type");
+        assert!(src.llextra.is_none(), "cannot directly copy from unsized values");
+        assert!(dst.llextra.is_none(), "cannot directly copy into unsized values");
         if flags.contains(MemFlags::NONTEMPORAL) {
             // HACK(nox): This is inefficient but there is no nontemporal memcpy.
             let ty = self.backend_type(layout);

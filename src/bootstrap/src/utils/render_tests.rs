@@ -6,15 +6,21 @@
 //! and rustc) libtest doesn't include the rendered human-readable output as a JSON field. We had
 //! to reimplement all the rendering logic in this module because of that.
 
-use crate::core::builder::Builder;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::process::{ChildStdout, Command, Stdio};
+use std::process::{ChildStdout, Stdio};
 use std::time::Duration;
+
 use termcolor::{Color, ColorSpec, WriteColor};
+
+use crate::core::builder::Builder;
+use crate::utils::exec::BootstrapCommand;
 
 const TERSE_TESTS_PER_LINE: usize = 88;
 
-pub(crate) fn add_flags_and_try_run_tests(builder: &Builder<'_>, cmd: &mut Command) -> bool {
+pub(crate) fn add_flags_and_try_run_tests(
+    builder: &Builder<'_>,
+    cmd: &mut BootstrapCommand,
+) -> bool {
     if !cmd.get_args().any(|arg| arg == "--") {
         cmd.arg("--");
     }
@@ -23,8 +29,13 @@ pub(crate) fn add_flags_and_try_run_tests(builder: &Builder<'_>, cmd: &mut Comma
     try_run_tests(builder, cmd, false)
 }
 
-pub(crate) fn try_run_tests(builder: &Builder<'_>, cmd: &mut Command, stream: bool) -> bool {
+pub(crate) fn try_run_tests(
+    builder: &Builder<'_>,
+    cmd: &mut BootstrapCommand,
+    stream: bool,
+) -> bool {
     if builder.config.dry_run() {
+        cmd.mark_as_executed();
         return true;
     }
 
@@ -41,7 +52,8 @@ pub(crate) fn try_run_tests(builder: &Builder<'_>, cmd: &mut Command, stream: bo
     }
 }
 
-fn run_tests(builder: &Builder<'_>, cmd: &mut Command, stream: bool) -> bool {
+fn run_tests(builder: &Builder<'_>, cmd: &mut BootstrapCommand, stream: bool) -> bool {
+    let cmd = cmd.as_command_mut();
     cmd.stdout(Stdio::piped());
 
     builder.verbose(|| println!("running: {cmd:?}"));
@@ -76,6 +88,9 @@ struct Renderer<'a> {
     builder: &'a Builder<'a>,
     tests_count: Option<usize>,
     executed_tests: usize,
+    /// Number of tests that were skipped due to already being up-to-date
+    /// (i.e. no relevant changes occurred since they last ran).
+    up_to_date_tests: usize,
     terse_tests_in_line: usize,
 }
 
@@ -88,6 +103,7 @@ impl<'a> Renderer<'a> {
             builder,
             tests_count: None,
             executed_tests: 0,
+            up_to_date_tests: 0,
             terse_tests_in_line: 0,
         }
     }
@@ -115,6 +131,12 @@ impl<'a> Renderer<'a> {
                 }
             }
         }
+
+        if self.up_to_date_tests > 0 {
+            let n = self.up_to_date_tests;
+            let s = if n > 1 { "s" } else { "" };
+            println!("help: ignored {n} up-to-date test{s}; use `--force-rerun` to prevent this\n");
+        }
     }
 
     /// Renders the stdout characters one by one
@@ -136,6 +158,11 @@ impl<'a> Renderer<'a> {
 
     fn render_test_outcome(&mut self, outcome: Outcome<'_>, test: &TestOutcome) {
         self.executed_tests += 1;
+
+        // Keep this in sync with the "up-to-date" ignore message inserted by compiletest.
+        if let Outcome::Ignored { reason: Some("up-to-date") } = outcome {
+            self.up_to_date_tests += 1;
+        }
 
         #[cfg(feature = "build-metrics")]
         self.builder.metrics.record_test(

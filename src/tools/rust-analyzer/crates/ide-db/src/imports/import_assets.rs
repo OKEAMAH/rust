@@ -1,9 +1,9 @@
 //! Look up accessible paths for items.
 
 use hir::{
-    db::HirDatabase, AsAssocItem, AssocItem, AssocItemContainer, Crate, HasCrate, ItemInNs,
-    ModPath, Module, ModuleDef, Name, PathResolution, PrefixKind, ScopeDef, Semantics,
-    SemanticsScope, Trait, Type,
+    db::HirDatabase, AsAssocItem, AssocItem, AssocItemContainer, Crate, HasCrate, ImportPathConfig,
+    ItemInNs, ModPath, Module, ModuleDef, Name, PathResolution, PrefixKind, ScopeDef, Semantics,
+    SemanticsScope, Trait, TyFingerprint, Type,
 };
 use itertools::{EitherOrBoth, Itertools};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -15,7 +15,7 @@ use syntax::{
 use crate::{
     helpers::item_name,
     items_locator::{self, AssocSearchMode, DEFAULT_QUERY_SEARCH_LIMIT},
-    RootDatabase,
+    FxIndexSet, RootDatabase,
 };
 
 /// A candidate for import, derived during various IDE activities:
@@ -205,24 +205,21 @@ impl ImportAssets {
     pub fn search_for_imports(
         &self,
         sema: &Semantics<'_, RootDatabase>,
+        cfg: ImportPathConfig,
         prefix_kind: PrefixKind,
-        prefer_no_std: bool,
-        prefer_prelude: bool,
     ) -> impl Iterator<Item = LocatedImport> {
-        let _p = tracing::span!(tracing::Level::INFO, "ImportAssets::search_for_imports").entered();
-        self.search_for(sema, Some(prefix_kind), prefer_no_std, prefer_prelude)
+        let _p = tracing::info_span!("ImportAssets::search_for_imports").entered();
+        self.search_for(sema, Some(prefix_kind), cfg)
     }
 
     /// This may return non-absolute paths if a part of the returned path is already imported into scope.
     pub fn search_for_relative_paths(
         &self,
         sema: &Semantics<'_, RootDatabase>,
-        prefer_no_std: bool,
-        prefer_prelude: bool,
+        cfg: ImportPathConfig,
     ) -> impl Iterator<Item = LocatedImport> {
-        let _p = tracing::span!(tracing::Level::INFO, "ImportAssets::search_for_relative_paths")
-            .entered();
-        self.search_for(sema, None, prefer_no_std, prefer_prelude)
+        let _p = tracing::info_span!("ImportAssets::search_for_relative_paths").entered();
+        self.search_for(sema, None, cfg)
     }
 
     /// Requires imports to by prefix instead of fuzzily.
@@ -259,14 +256,13 @@ impl ImportAssets {
         &self,
         sema: &Semantics<'_, RootDatabase>,
         prefixed: Option<PrefixKind>,
-        prefer_no_std: bool,
-        prefer_prelude: bool,
+        cfg: ImportPathConfig,
     ) -> impl Iterator<Item = LocatedImport> {
-        let _p = tracing::span!(tracing::Level::INFO, "ImportAssets::search_for").entered();
+        let _p = tracing::info_span!("ImportAssets::search_for").entered();
 
         let scope = match sema.scope(&self.candidate_node) {
             Some(it) => it,
-            None => return <FxHashSet<_>>::default().into_iter(),
+            None => return <FxIndexSet<_>>::default().into_iter(),
         };
 
         let krate = self.module_with_candidate.krate();
@@ -277,8 +273,7 @@ impl ImportAssets {
                 item_for_path_search(sema.db, item)?,
                 &self.module_with_candidate,
                 prefixed,
-                prefer_no_std,
-                prefer_prelude,
+                cfg,
             )
             .filter(|path| path.len() > 1)
         };
@@ -307,7 +302,7 @@ impl ImportAssets {
     }
 
     fn scope_definitions(&self, sema: &Semantics<'_, RootDatabase>) -> FxHashSet<ScopeDef> {
-        let _p = tracing::span!(tracing::Level::INFO, "ImportAssets::scope_definitions").entered();
+        let _p = tracing::info_span!("ImportAssets::scope_definitions").entered();
         let mut scope_definitions = FxHashSet::default();
         if let Some(scope) = sema.scope(&self.candidate_node) {
             scope.process_all_names(&mut |_, scope_def| {
@@ -324,9 +319,8 @@ fn path_applicable_imports(
     path_candidate: &PathImportCandidate,
     mod_path: impl Fn(ItemInNs) -> Option<ModPath> + Copy,
     scope_filter: impl Fn(ItemInNs) -> bool + Copy,
-) -> FxHashSet<LocatedImport> {
-    let _p =
-        tracing::span!(tracing::Level::INFO, "ImportAssets::path_applicable_imports").entered();
+) -> FxIndexSet<LocatedImport> {
+    let _p = tracing::info_span!("ImportAssets::path_applicable_imports").entered();
 
     match &path_candidate.qualifier {
         None => {
@@ -373,7 +367,7 @@ fn import_for_item(
     original_item: ItemInNs,
     scope_filter: impl Fn(ItemInNs) -> bool,
 ) -> Option<LocatedImport> {
-    let _p = tracing::span!(tracing::Level::INFO, "ImportAssets::import_for_item").entered();
+    let _p = tracing::info_span!("ImportAssets::import_for_item").entered();
     let [first_segment, ..] = unresolved_qualifier else { return None };
 
     let item_as_assoc = item_as_assoc(db, original_item);
@@ -395,16 +389,16 @@ fn import_for_item(
     let mut import_path_candidate_segments = import_path_candidate.segments().iter().rev();
     let predicate = |it: EitherOrBoth<&SmolStr, &Name>| match it {
         // segments match, check next one
-        EitherOrBoth::Both(a, b) if b.as_str() == Some(&**a) => None,
+        EitherOrBoth::Both(a, b) if b.as_str() == &**a => None,
         // segments mismatch / qualifier is longer than the path, bail out
         EitherOrBoth::Both(..) | EitherOrBoth::Left(_) => Some(false),
         // all segments match and we have exhausted the qualifier, proceed
         EitherOrBoth::Right(_) => Some(true),
     };
     if item_as_assoc.is_none() {
-        let item_name = item_name(db, original_item)?.as_text()?;
+        let item_name = item_name(db, original_item)?;
         let last_segment = import_path_candidate_segments.next()?;
-        if last_segment.as_str() != Some(&*item_name) {
+        if *last_segment != item_name {
             return None;
         }
     }
@@ -465,7 +459,7 @@ fn find_import_for_segment(
     unresolved_first_segment: &str,
 ) -> Option<ItemInNs> {
     let segment_is_name = item_name(db, original_item)
-        .map(|name| name.to_smol_str() == unresolved_first_segment)
+        .map(|name| name.eq_ident(unresolved_first_segment))
         .unwrap_or(false);
 
     Some(if segment_is_name {
@@ -489,7 +483,7 @@ fn module_with_segment_name(
     };
     while let Some(module) = current_module {
         if let Some(module_name) = module.name(db) {
-            if module_name.to_smol_str() == segment_name {
+            if module_name.eq_ident(segment_name) {
                 return Some(module);
             }
         }
@@ -506,8 +500,8 @@ fn trait_applicable_items(
     trait_assoc_item: bool,
     mod_path: impl Fn(ItemInNs) -> Option<ModPath>,
     scope_filter: impl Fn(hir::Trait) -> bool,
-) -> FxHashSet<LocatedImport> {
-    let _p = tracing::span!(tracing::Level::INFO, "ImportAssets::trait_applicable_items").entered();
+) -> FxIndexSet<LocatedImport> {
+    let _p = tracing::info_span!("ImportAssets::trait_applicable_items").entered();
 
     let db = sema.db;
 
@@ -537,33 +531,63 @@ fn trait_applicable_items(
     })
     .collect();
 
-    trait_candidates.retain(|&candidate_trait_id| {
-        // we care about the following cases:
-        // 1. Trait's definition crate
-        // 2. Definition crates for all trait's generic arguments
-        //     a. This is recursive for fundamental types: `Into<Box<A>> for ()`` is OK, but
-        //        `Into<Vec<A>> for ()`` is *not*.
-        // 3. Receiver type definition crate
-        //    a. This is recursive for fundamental types
-        let defining_crate_for_trait = Trait::from(candidate_trait_id).krate(db);
-        let Some(receiver) = trait_candidate.receiver_ty.fingerprint_for_trait_impl() else {
-            return false;
-        };
-        let definitions_exist_in_trait_crate = db
-            .trait_impls_in_crate(defining_crate_for_trait.into())
-            .has_impls_for_trait_and_self_ty(candidate_trait_id, receiver);
+    let autoderef_method_receiver = {
+        let mut deref_chain = trait_candidate.receiver_ty.autoderef(db).collect::<Vec<_>>();
+        // As a last step, we can do array unsizing (that's the only unsizing that rustc does for method receivers!)
+        if let Some((ty, _len)) = deref_chain.last().and_then(|ty| ty.as_array(db)) {
+            let slice = Type::new_slice(ty);
+            deref_chain.push(slice);
+        }
+        deref_chain
+            .into_iter()
+            .filter_map(|ty| Some((ty.krate(db).into(), ty.fingerprint_for_trait_impl()?)))
+            .sorted()
+            .unique()
+            .collect::<Vec<_>>()
+    };
 
-        // this is a closure for laziness: if `definitions_exist_in_trait_crate` is true,
-        // we can avoid a second db lookup.
-        let definitions_exist_in_receiver_crate = || {
-            db.trait_impls_in_crate(trait_candidate.receiver_ty.krate(db).into())
-                .has_impls_for_trait_and_self_ty(candidate_trait_id, receiver)
-        };
+    // can be empty if the entire deref chain is has no valid trait impl fingerprints
+    if autoderef_method_receiver.is_empty() {
+        return Default::default();
+    }
 
-        definitions_exist_in_trait_crate || definitions_exist_in_receiver_crate()
-    });
+    // in order to handle implied bounds through an associated type, keep all traits if any
+    // type in the deref chain matches `TyFingerprint::Unnameable`. This fingerprint
+    // won't be in `TraitImpls` anyways, as `TraitImpls` only contains actual implementations.
+    if !autoderef_method_receiver
+        .iter()
+        .any(|(_, fingerprint)| matches!(fingerprint, TyFingerprint::Unnameable))
+    {
+        trait_candidates.retain(|&candidate_trait_id| {
+            // we care about the following cases:
+            // 1. Trait's definition crate
+            // 2. Definition crates for all trait's generic arguments
+            //     a. This is recursive for fundamental types: `Into<Box<A>> for ()`` is OK, but
+            //        `Into<Vec<A>> for ()`` is *not*.
+            // 3. Receiver type definition crate
+            //    a. This is recursive for fundamental types
+            let defining_crate_for_trait = Trait::from(candidate_trait_id).krate(db);
 
-    let mut located_imports = FxHashSet::default();
+            let trait_impls_in_crate = db.trait_impls_in_crate(defining_crate_for_trait.into());
+            let definitions_exist_in_trait_crate =
+                autoderef_method_receiver.iter().any(|&(_, fingerprint)| {
+                    trait_impls_in_crate
+                        .has_impls_for_trait_and_self_ty(candidate_trait_id, fingerprint)
+                });
+            // this is a closure for laziness: if `definitions_exist_in_trait_crate` is true,
+            // we can avoid a second db lookup.
+            let definitions_exist_in_receiver_crate = || {
+                autoderef_method_receiver.iter().any(|&(krate, fingerprint)| {
+                    db.trait_impls_in_crate(krate)
+                        .has_impls_for_trait_and_self_ty(candidate_trait_id, fingerprint)
+                })
+            };
+
+            definitions_exist_in_trait_crate || definitions_exist_in_receiver_crate()
+        });
+    }
+
+    let mut located_imports = FxIndexSet::default();
     let mut trait_import_paths = FxHashMap::default();
 
     if trait_assoc_item {
@@ -634,19 +658,12 @@ fn get_mod_path(
     item_to_search: ItemInNs,
     module_with_candidate: &Module,
     prefixed: Option<PrefixKind>,
-    prefer_no_std: bool,
-    prefer_prelude: bool,
+    cfg: ImportPathConfig,
 ) -> Option<ModPath> {
     if let Some(prefix_kind) = prefixed {
-        module_with_candidate.find_use_path_prefixed(
-            db,
-            item_to_search,
-            prefix_kind,
-            prefer_no_std,
-            prefer_prelude,
-        )
+        module_with_candidate.find_use_path(db, item_to_search, prefix_kind, cfg)
     } else {
-        module_with_candidate.find_use_path(db, item_to_search, prefer_no_std, prefer_prelude)
+        module_with_candidate.find_path(db, item_to_search, cfg)
     }
 }
 
@@ -707,7 +724,7 @@ fn path_import_candidate(
 ) -> Option<ImportCandidate> {
     Some(match qualifier {
         Some(qualifier) => match sema.resolve_path(&qualifier) {
-            None => {
+            Some(PathResolution::Def(ModuleDef::BuiltinType(_))) | None => {
                 if qualifier.first_qualifier().map_or(true, |it| sema.resolve_path(&it).is_none()) {
                     let qualifier = qualifier
                         .segments()

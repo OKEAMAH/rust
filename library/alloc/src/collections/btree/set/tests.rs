@@ -1,8 +1,9 @@
+use std::ops::Bound::{Excluded, Included};
+use std::panic::{AssertUnwindSafe, catch_unwind};
+
 use super::*;
 use crate::testing::crash_test::{CrashTestDummy, Panic};
 use crate::testing::rng::DeterministicRng;
-use std::ops::Bound::{Excluded, Included};
-use std::panic::{catch_unwind, AssertUnwindSafe};
 
 #[test]
 fn test_clone_eq() {
@@ -131,11 +132,9 @@ fn test_difference() {
     check_difference(&[1, 3, 5, 9, 11], &[3, 6, 9], &[1, 5, 11]);
     check_difference(&[1, 3, 5, 9, 11], &[0, 1], &[3, 5, 9, 11]);
     check_difference(&[1, 3, 5, 9, 11], &[11, 12], &[1, 3, 5, 9]);
-    check_difference(
-        &[-5, 11, 22, 33, 40, 42],
-        &[-12, -5, 14, 23, 34, 38, 39, 50],
-        &[11, 22, 33, 40, 42],
-    );
+    check_difference(&[-5, 11, 22, 33, 40, 42], &[-12, -5, 14, 23, 34, 38, 39, 50], &[
+        11, 22, 33, 40, 42,
+    ]);
 
     if cfg!(miri) {
         // Miri is too slow
@@ -251,11 +250,9 @@ fn test_union() {
     check_union(&[], &[], &[]);
     check_union(&[1, 2, 3], &[2], &[1, 2, 3]);
     check_union(&[2], &[1, 2, 3], &[1, 2, 3]);
-    check_union(
-        &[1, 3, 5, 9, 11, 16, 19, 24],
-        &[-2, 1, 5, 9, 13, 19],
-        &[-2, 1, 3, 5, 9, 11, 13, 16, 19, 24],
-    );
+    check_union(&[1, 3, 5, 9, 11, 16, 19, 24], &[-2, 1, 5, 9, 13, 19], &[
+        -2, 1, 3, 5, 9, 11, 13, 16, 19, 24,
+    ]);
 }
 
 #[test]
@@ -705,9 +702,9 @@ fn test_ord_absence() {
     }
 
     fn set_debug<K: Debug>(set: BTreeSet<K>) {
-        format!("{set:?}");
-        format!("{:?}", set.iter());
-        format!("{:?}", set.into_iter());
+        let _ = format!("{set:?}");
+        let _ = format!("{:?}", set.iter());
+        let _ = format!("{:?}", set.into_iter());
     }
 
     fn set_clone<K: Clone>(mut set: BTreeSet<K>) {

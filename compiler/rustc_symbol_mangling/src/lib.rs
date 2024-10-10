@@ -87,16 +87,18 @@
 //! virtually impossible. Thus, symbol hash generation exclusively relies on
 //! DefPaths which are much more robust in the face of changes to the code base.
 
+// tidy-alphabetical-start
+#![allow(internal_features)]
 #![doc(html_root_url = "https://doc.rust-lang.org/nightly/nightly-rustc/")]
 #![doc(rust_logo)]
-#![feature(rustdoc_internals)]
 #![feature(let_chains)]
-#![allow(internal_features)]
+#![feature(rustdoc_internals)]
+#![warn(unreachable_pub)]
+// tidy-alphabetical-end
 
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::{CrateNum, LOCAL_CRATE};
-use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags;
-use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrs;
+use rustc_middle::middle::codegen_fn_attrs::{CodegenFnAttrFlags, CodegenFnAttrs};
 use rustc_middle::mir::mono::{InstantiationMode, MonoItem};
 use rustc_middle::query::Providers;
 use rustc_middle::ty::{self, Instance, TyCtxt};
@@ -225,7 +227,11 @@ fn compute_symbol_name<'tcx>(
     // and we want to be sure to avoid any symbol conflicts here.
     let is_globally_shared_function = matches!(
         tcx.def_kind(instance.def_id()),
-        DefKind::Fn | DefKind::AssocFn | DefKind::Closure | DefKind::Ctor(..)
+        DefKind::Fn
+            | DefKind::AssocFn
+            | DefKind::Closure
+            | DefKind::SyntheticCoroutineBody
+            | DefKind::Ctor(..)
     ) && matches!(
         MonoItem::Fn(instance).instantiation_mode(tcx),
         InstantiationMode::GloballyShared { may_conflict: true }

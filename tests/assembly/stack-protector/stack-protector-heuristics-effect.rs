@@ -1,6 +1,6 @@
 //@ revisions: all strong basic none missing
 //@ assembly-output: emit-asm
-//@ ignore-macos slightly different policy on stack protection of arrays
+//@ ignore-apple slightly different policy on stack protection of arrays
 //@ ignore-msvc stack check code uses different function names
 //@ ignore-nvptx64 stack protector is not supported
 //@ ignore-wasm32-bare
@@ -9,7 +9,6 @@
 //@ [basic] compile-flags: -Z stack-protector=basic
 //@ [none] compile-flags: -Z stack-protector=none
 //@ compile-flags: -C opt-level=2 -Z merge-functions=disabled
-//@ min-llvm-version: 17.0.2
 
 // NOTE: the heuristics for stack smash protection inappropriately rely on types in LLVM IR,
 // despite those types having no semantic meaning. This means that the `basic` and `strong`
@@ -17,11 +16,8 @@
 // See comments on https://github.com/rust-lang/rust/issues/114903.
 
 #![crate_type = "lib"]
-
 #![allow(incomplete_features)]
-
 #![feature(unsized_locals, unsized_fn_params)]
-
 
 // CHECK-LABEL: emptyfn:
 #[no_mangle]
@@ -146,7 +142,6 @@ pub fn local_var_addr_used_indirectly(f: fn(bool)) {
     // missing-NOT: __stack_chk_fail
 }
 
-
 // CHECK-LABEL: local_string_addr_taken
 #[no_mangle]
 pub fn local_string_addr_taken(f: fn(&String)) {
@@ -197,7 +192,7 @@ pub struct Gigastruct {
     not: u64,
     have: u64,
     array: u64,
-    members: u64
+    members: u64,
 }
 
 // CHECK-LABEL: local_large_var_moved
@@ -258,7 +253,6 @@ pub fn local_large_var_cloned(f: fn(Gigastruct)) {
     // missing-NOT: __stack_chk_fail
 }
 
-
 extern "C" {
     // A call to an external `alloca` function is *not* recognized as an
     // `alloca(3)` operation. This function is a compiler built-in, as the
@@ -311,7 +305,6 @@ pub fn alloca_large_compile_time_constant_arg(f: fn(*mut ())) {
     // missing-NOT: __stack_chk_fail
 }
 
-
 // CHECK-LABEL: alloca_dynamic_arg
 #[no_mangle]
 pub fn alloca_dynamic_arg(f: fn(*mut ()), n: usize) {
@@ -331,7 +324,6 @@ pub fn alloca_dynamic_arg(f: fn(*mut ()), n: usize) {
 // this is support for the "unsized locals" unstable feature:
 // https://doc.rust-lang.org/unstable-book/language-features/unsized-locals.html.
 
-
 // CHECK-LABEL: unsized_fn_param
 #[no_mangle]
 pub fn unsized_fn_param(s: [u8], l: bool, f: fn([u8])) {
@@ -344,7 +336,6 @@ pub fn unsized_fn_param(s: [u8], l: bool, f: fn([u8])) {
     // accepted &[u8]). This function therefore doesn't need dynamic array
     // alloca, and is therefore not protected by the `strong` or `basic`
     // heuristics.
-
 
     // all: __stack_chk_fail
     // strong-NOT: __stack_chk_fail

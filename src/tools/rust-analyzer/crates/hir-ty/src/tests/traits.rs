@@ -1448,14 +1448,20 @@ fn foo<X>() -> Foo<impl Future<Output = ()>> {
 fn dyn_trait() {
     check_infer(
         r#"
-//- minicore: sized
+//- minicore: deref, dispatch_from_dyn
 trait Trait<T> {
     fn foo(&self) -> T;
     fn foo2(&self) -> i64;
 }
-fn bar() -> dyn Trait<u64> {}
 
-fn test(x: dyn Trait<u64>, y: &dyn Trait<u64>) {
+struct Box<T: ?Sized> {}
+impl<T: ?Sized> core::ops::Deref for Box<T> {
+    type Target = T;
+}
+
+fn bar() -> Box<dyn Trait<u64>> {}
+
+fn test(x: Box<dyn Trait<u64>>, y: &dyn Trait<u64>) {
     x;
     y;
     let z = bar();
@@ -1469,27 +1475,27 @@ fn test(x: dyn Trait<u64>, y: &dyn Trait<u64>) {
         expect![[r#"
             29..33 'self': &'? Self
             54..58 'self': &'? Self
-            97..99 '{}': dyn Trait<u64>
-            109..110 'x': dyn Trait<u64>
-            128..129 'y': &'? dyn Trait<u64>
-            148..265 '{     ...2(); }': ()
-            154..155 'x': dyn Trait<u64>
-            161..162 'y': &'? dyn Trait<u64>
-            172..173 'z': dyn Trait<u64>
-            176..179 'bar': fn bar() -> dyn Trait<u64>
-            176..181 'bar()': dyn Trait<u64>
-            187..188 'x': dyn Trait<u64>
-            187..194 'x.foo()': u64
-            200..201 'y': &'? dyn Trait<u64>
-            200..207 'y.foo()': u64
-            213..214 'z': dyn Trait<u64>
-            213..220 'z.foo()': u64
-            226..227 'x': dyn Trait<u64>
-            226..234 'x.foo2()': i64
-            240..241 'y': &'? dyn Trait<u64>
-            240..248 'y.foo2()': i64
-            254..255 'z': dyn Trait<u64>
-            254..262 'z.foo2()': i64
+            198..200 '{}': Box<dyn Trait<u64>>
+            210..211 'x': Box<dyn Trait<u64>>
+            234..235 'y': &'? dyn Trait<u64>
+            254..371 '{     ...2(); }': ()
+            260..261 'x': Box<dyn Trait<u64>>
+            267..268 'y': &'? dyn Trait<u64>
+            278..279 'z': Box<dyn Trait<u64>>
+            282..285 'bar': fn bar() -> Box<dyn Trait<u64>>
+            282..287 'bar()': Box<dyn Trait<u64>>
+            293..294 'x': Box<dyn Trait<u64>>
+            293..300 'x.foo()': u64
+            306..307 'y': &'? dyn Trait<u64>
+            306..313 'y.foo()': u64
+            319..320 'z': Box<dyn Trait<u64>>
+            319..326 'z.foo()': u64
+            332..333 'x': Box<dyn Trait<u64>>
+            332..340 'x.foo2()': i64
+            346..347 'y': &'? dyn Trait<u64>
+            346..354 'y.foo2()': i64
+            360..361 'z': Box<dyn Trait<u64>>
+            360..368 'z.foo2()': i64
         "#]],
     );
 }
@@ -1534,7 +1540,7 @@ fn test(s: S<u32, i32>) {
 fn dyn_trait_bare() {
     check_infer(
         r#"
-//- minicore: sized
+//- minicore: sized, dispatch_from_dyn
 trait Trait {
     fn foo(&self) -> u64;
 }
@@ -1570,7 +1576,7 @@ fn test(x: Trait, y: &Trait) -> u64 {
 
     check_infer_with_mismatches(
         r#"
-//- minicore: fn, coerce_unsized
+//- minicore: fn, coerce_unsized, dispatch_from_dyn
 struct S;
 impl S {
     fn foo(&self) {}
@@ -3106,7 +3112,7 @@ fn dyn_fn_param_informs_call_site_closure_signature() {
     cov_mark::check!(dyn_fn_param_informs_call_site_closure_signature);
     check_types(
         r#"
-//- minicore: fn, coerce_unsized
+//- minicore: fn, coerce_unsized, dispatch_from_dyn
 struct S;
 impl S {
     fn inherent(&self) -> u8 { 0 }
@@ -3151,7 +3157,7 @@ fn infer_box_fn_arg() {
     // The type mismatch is because we don't define Unsize and CoerceUnsized
     check_infer_with_mismatches(
         r#"
-//- minicore: fn, deref, option
+//- minicore: fn, deref, option, dispatch_from_dyn
 #[lang = "owned_box"]
 pub struct Box<T: ?Sized> {
     inner: *mut T,
@@ -4692,119 +4698,6 @@ fn f<T: Send, U>() {
 }
 
 #[test]
-fn associated_type_impl_trait() {
-    check_types(
-        r#"
-trait Foo {}
-struct S1;
-impl Foo for S1 {}
-
-trait Bar {
-    type Item;
-    fn bar(&self) -> Self::Item;
-}
-struct S2;
-impl Bar for S2 {
-    type Item = impl Foo;
-    fn bar(&self) -> Self::Item {
-        S1
-    }
-}
-
-fn test() {
-    let x = S2.bar();
-      //^ impl Foo + ?Sized
-}
-        "#,
-    );
-}
-
-#[test]
-fn associated_type_impl_traits_complex() {
-    check_types(
-        r#"
-struct Unary<T>(T);
-struct Binary<T, U>(T, U);
-
-trait Foo {}
-struct S1;
-impl Foo for S1 {}
-
-trait Bar {
-    type Item;
-    fn bar(&self) -> Unary<Self::Item>;
-}
-struct S2;
-impl Bar for S2 {
-    type Item = Unary<impl Foo>;
-    fn bar(&self) -> Unary<<Self as Bar>::Item> {
-        Unary(Unary(S1))
-    }
-}
-
-trait Baz {
-    type Target1;
-    type Target2;
-    fn baz(&self) -> Binary<Self::Target1, Self::Target2>;
-}
-struct S3;
-impl Baz for S3 {
-    type Target1 = impl Foo;
-    type Target2 = Unary<impl Bar>;
-    fn baz(&self) -> Binary<Self::Target1, Self::Target2> {
-        Binary(S1, Unary(S2))
-    }
-}
-
-fn test() {
-    let x = S3.baz();
-      //^ Binary<impl Foo + ?Sized, Unary<impl Bar + ?Sized>>
-    let y = x.1.0.bar();
-      //^ Unary<Bar::Item<impl Bar + ?Sized>>
-}
-        "#,
-    );
-}
-
-#[test]
-fn associated_type_with_impl_trait_in_tuple() {
-    check_no_mismatches(
-        r#"
-pub trait Iterator {
-    type Item;
-}
-
-pub trait Value {}
-
-fn bar<I: Iterator<Item = (usize, impl Value)>>() {}
-
-fn foo() {
-    bar();
-}
-"#,
-    );
-}
-
-#[test]
-fn associated_type_with_impl_trait_in_nested_tuple() {
-    check_no_mismatches(
-        r#"
-pub trait Iterator {
-    type Item;
-}
-
-pub trait Value {}
-
-fn bar<I: Iterator<Item = ((impl Value, usize), u32)>>() {}
-
-fn foo() {
-    bar();
-}
-"#,
-    );
-}
-
-#[test]
 fn dyn_trait_with_lifetime_in_rpit() {
     check_types(
         r#"
@@ -4822,5 +4715,78 @@ fn foo() {
   //^^^^^^^^^^^impl Future<Output = Box<dyn Trait>> + ?Sized
 }
 "#,
+    )
+}
+
+#[test]
+fn nested_impl_traits() {
+    check_infer(
+        r#"
+//- minicore: fn
+trait Foo {}
+
+trait Bar<T> {}
+
+trait Baz {
+    type Assoc;
+}
+
+struct Qux<T> {
+    qux: T,
+}
+
+struct S;
+
+impl Foo for S {}
+
+fn not_allowed1(f: impl Fn(impl Foo)) {
+    let foo = S;
+    f(foo);
+}
+
+// This caused stack overflow in #17498
+fn not_allowed2(f: impl Fn(&impl Foo)) {
+    let foo = S;
+    f(&foo);
+}
+
+fn not_allowed3(bar: impl Bar<impl Foo>) {}
+
+// This also caused stack overflow
+fn not_allowed4(bar: impl Bar<&impl Foo>) {}
+
+fn allowed1(baz: impl Baz<Assoc = impl Foo>) {}
+
+fn allowed2<'a>(baz: impl Baz<Assoc = &'a (impl Foo + 'a)>) {}
+
+fn allowed3(baz: impl Baz<Assoc = Qux<impl Foo>>) {}
+"#,
+        expect![[r#"
+            139..140 'f': impl Fn({unknown}) + ?Sized
+            161..193 '{     ...oo); }': ()
+            171..174 'foo': S
+            177..178 'S': S
+            184..185 'f': impl Fn({unknown}) + ?Sized
+            184..190 'f(foo)': ()
+            186..189 'foo': S
+            251..252 'f': impl Fn(&'? {unknown}) + ?Sized
+            274..307 '{     ...oo); }': ()
+            284..287 'foo': S
+            290..291 'S': S
+            297..298 'f': impl Fn(&'? {unknown}) + ?Sized
+            297..304 'f(&foo)': ()
+            299..303 '&foo': &'? S
+            300..303 'foo': S
+            325..328 'bar': impl Bar<{unknown}> + ?Sized
+            350..352 '{}': ()
+            405..408 'bar': impl Bar<&'? {unknown}> + ?Sized
+            431..433 '{}': ()
+            447..450 'baz': impl Baz<Assoc = impl Foo + ?Sized> + ?Sized
+            480..482 '{}': ()
+            500..503 'baz': impl Baz<Assoc = &'a impl Foo + 'a + ?Sized> + ?Sized
+            544..546 '{}': ()
+            560..563 'baz': impl Baz<Assoc = Qux<impl Foo + ?Sized>> + ?Sized
+            598..600 '{}': ()
+        "#]],
     )
 }

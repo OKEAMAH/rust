@@ -1,21 +1,26 @@
 //! Parsing and validation of builtin attributes
 
-use rustc_abi::Align;
-use rustc_ast::{self as ast, attr};
-use rustc_ast::{Attribute, LitKind, MetaItem, MetaItemKind, MetaItemLit, NestedMetaItem, NodeId};
-use rustc_ast_pretty::pprust;
-use rustc_errors::ErrorGuaranteed;
-use rustc_feature::{find_gated_cfg, is_builtin_attr_name, Features, GatedCfg};
-use rustc_macros::{Decodable, Encodable, HashStable_Generic};
-use rustc_session::config::ExpectedValues;
-use rustc_session::lint::builtin::UNEXPECTED_CFGS;
-use rustc_session::lint::BuiltinLintDiag;
-use rustc_session::parse::feature_err;
-use rustc_session::{RustcVersion, Session};
-use rustc_span::hygiene::Transparency;
-use rustc_span::{symbol::sym, symbol::Symbol, Span};
 use std::num::NonZero;
 
+use rustc_abi::Align;
+use rustc_ast::{
+    self as ast, Attribute, LitKind, MetaItem, MetaItemInner, MetaItemKind, MetaItemLit, NodeId,
+    attr,
+};
+use rustc_ast_pretty::pprust;
+use rustc_errors::ErrorGuaranteed;
+use rustc_feature::{Features, GatedCfg, find_gated_cfg, is_builtin_attr_name};
+use rustc_macros::{Decodable, Encodable, HashStable_Generic};
+use rustc_session::config::ExpectedValues;
+use rustc_session::lint::BuiltinLintDiag;
+use rustc_session::lint::builtin::UNEXPECTED_CFGS;
+use rustc_session::parse::feature_err;
+use rustc_session::{RustcVersion, Session};
+use rustc_span::Span;
+use rustc_span::hygiene::Transparency;
+use rustc_span::symbol::{Symbol, kw, sym};
+
+use crate::fluent_generated;
 use crate::session_diagnostics::{self, IncorrectReprFormatGenericCause};
 
 /// The version placeholder that recently stabilized features contain inside the
@@ -31,6 +36,7 @@ pub fn is_builtin_attr(attr: &Attribute) -> bool {
 pub(crate) enum UnsupportedLiteralReason {
     Generic,
     CfgString,
+    CfgBoolean,
     DeprecatedString,
     DeprecatedKvPair,
 }
@@ -74,6 +80,10 @@ impl Stability {
 
     pub fn is_stable(&self) -> bool {
         self.level.is_stable()
+    }
+
+    pub fn stable_since(&self) -> Option<StableSince> {
+        self.level.stable_since()
     }
 }
 
@@ -148,7 +158,7 @@ pub enum StabilityLevel {
 }
 
 /// Rust release in which a feature is stabilized.
-#[derive(Encodable, Decodable, PartialEq, Copy, Clone, Debug, Eq, Hash)]
+#[derive(Encodable, Decodable, PartialEq, Copy, Clone, Debug, Eq, PartialOrd, Ord, Hash)]
 #[derive(HashStable_Generic)]
 pub enum StableSince {
     Version(RustcVersion),
@@ -164,6 +174,12 @@ impl StabilityLevel {
     }
     pub fn is_stable(&self) -> bool {
         matches!(self, StabilityLevel::Stable { .. })
+    }
+    pub fn stable_since(&self) -> Option<StableSince> {
+        match *self {
+            StabilityLevel::Stable { since, .. } => Some(since),
+            StabilityLevel::Unstable { .. } => None,
+        }
     }
 }
 
@@ -517,9 +533,8 @@ pub struct Condition {
 }
 
 /// Tests if a cfg-pattern matches the cfg set
-#[allow(rustc::untranslatable_diagnostic)] // FIXME: make this translatable
 pub fn cfg_matches(
-    cfg: &ast::MetaItem,
+    cfg: &ast::MetaItemInner,
     sess: &Session,
     lint_node_id: NodeId,
     features: Option<&Features>,
@@ -574,7 +589,7 @@ fn gate_cfg(gated_cfg: &GatedCfg, cfg_span: Span, sess: &Session, features: &Fea
 /// Parse a rustc version number written inside string literal in an attribute,
 /// like appears in `since = "1.0.0"`. Suffixes like "-dev" and "-nightly" are
 /// not accepted in this position, unlike when parsing CFG_RELEASE.
-fn parse_version(s: Symbol) -> Option<RustcVersion> {
+pub fn parse_version(s: Symbol) -> Option<RustcVersion> {
     let mut components = s.as_str().split('-');
     let d = components.next()?;
     if components.next().is_some() {
@@ -589,24 +604,54 @@ fn parse_version(s: Symbol) -> Option<RustcVersion> {
 
 /// Evaluate a cfg-like condition (with `any` and `all`), using `eval` to
 /// evaluate individual items.
-#[allow(rustc::untranslatable_diagnostic)] // FIXME: make this translatable
 pub fn eval_condition(
-    cfg: &ast::MetaItem,
+    cfg: &ast::MetaItemInner,
     sess: &Session,
     features: Option<&Features>,
     eval: &mut impl FnMut(Condition) -> bool,
 ) -> bool {
-    let dcx = &sess.psess.dcx;
+    let dcx = sess.dcx();
+
+    let cfg = match cfg {
+        ast::MetaItemInner::MetaItem(meta_item) => meta_item,
+        ast::MetaItemInner::Lit(MetaItemLit { kind: LitKind::Bool(b), .. }) => {
+            if let Some(features) = features {
+                // we can't use `try_gate_cfg` as symbols don't differentiate between `r#true`
+                // and `true`, and we want to keep the former working without feature gate
+                gate_cfg(
+                    &((
+                        if *b { kw::True } else { kw::False },
+                        sym::cfg_boolean_literals,
+                        |features: &Features| features.cfg_boolean_literals,
+                    )),
+                    cfg.span(),
+                    sess,
+                    features,
+                );
+            }
+            return *b;
+        }
+        _ => {
+            dcx.emit_err(session_diagnostics::UnsupportedLiteral {
+                span: cfg.span(),
+                reason: UnsupportedLiteralReason::CfgBoolean,
+                is_bytestr: false,
+                start_point_span: sess.source_map().start_point(cfg.span()),
+            });
+            return false;
+        }
+    };
+
     match &cfg.kind {
         ast::MetaItemKind::List(mis) if cfg.name_or_empty() == sym::version => {
             try_gate_cfg(sym::version, cfg.span, sess, features);
             let (min_version, span) = match &mis[..] {
-                [NestedMetaItem::Lit(MetaItemLit { kind: LitKind::Str(sym, ..), span, .. })] => {
+                [MetaItemInner::Lit(MetaItemLit { kind: LitKind::Str(sym, ..), span, .. })] => {
                     (sym, span)
                 }
                 [
-                    NestedMetaItem::Lit(MetaItemLit { span, .. })
-                    | NestedMetaItem::MetaItem(MetaItem { span, .. }),
+                    MetaItemInner::Lit(MetaItemLit { span, .. })
+                    | MetaItemInner::MetaItem(MetaItem { span, .. }),
                 ] => {
                     dcx.emit_err(session_diagnostics::ExpectedVersionLiteral { span: *span });
                     return false;
@@ -632,7 +677,7 @@ pub fn eval_condition(
         }
         ast::MetaItemKind::List(mis) => {
             for mi in mis.iter() {
-                if !mi.is_meta_item() {
+                if mi.meta_item_or_bool().is_none() {
                     dcx.emit_err(session_diagnostics::UnsupportedLiteral {
                         span: mi.span(),
                         reason: UnsupportedLiteralReason::Generic,
@@ -650,23 +695,19 @@ pub fn eval_condition(
                     .iter()
                     // We don't use any() here, because we want to evaluate all cfg condition
                     // as eval_condition can (and does) extra checks
-                    .fold(false, |res, mi| {
-                        res | eval_condition(mi.meta_item().unwrap(), sess, features, eval)
-                    }),
+                    .fold(false, |res, mi| res | eval_condition(mi, sess, features, eval)),
                 sym::all => mis
                     .iter()
                     // We don't use all() here, because we want to evaluate all cfg condition
                     // as eval_condition can (and does) extra checks
-                    .fold(true, |res, mi| {
-                        res & eval_condition(mi.meta_item().unwrap(), sess, features, eval)
-                    }),
+                    .fold(true, |res, mi| res & eval_condition(mi, sess, features, eval)),
                 sym::not => {
-                    if mis.len() != 1 {
+                    let [mi] = mis.as_slice() else {
                         dcx.emit_err(session_diagnostics::ExpectedOneCfgPattern { span: cfg.span });
                         return false;
-                    }
+                    };
 
-                    !eval_condition(mis[0].meta_item().unwrap(), sess, features, eval)
+                    !eval_condition(mi, sess, features, eval)
                 }
                 sym::target => {
                     if let Some(features) = features
@@ -676,7 +717,7 @@ pub fn eval_condition(
                             sess,
                             sym::cfg_target_compact,
                             cfg.span,
-                            "compact `cfg(target(..))` is experimental and subject to change",
+                            fluent_generated::attr_unstable_cfg_target_compact,
                         )
                         .emit();
                     }
@@ -687,7 +728,12 @@ pub fn eval_condition(
                             seg.ident.name = Symbol::intern(&format!("target_{}", seg.ident.name));
                         }
 
-                        res & eval_condition(&mi, sess, features, eval)
+                        res & eval_condition(
+                            &ast::MetaItemInner::MetaItem(mi),
+                            sess,
+                            features,
+                            eval,
+                        )
                     })
                 }
                 _ => {
@@ -827,7 +873,7 @@ pub fn find_deprecation(
 
                 for meta in list {
                     match meta {
-                        NestedMetaItem::MetaItem(mi) => match mi.name_or_empty() {
+                        MetaItemInner::MetaItem(mi) => match mi.name_or_empty() {
                             sym::since => {
                                 if !get(mi, &mut since) {
                                     continue 'outer;
@@ -843,7 +889,7 @@ pub fn find_deprecation(
                                     sess.dcx().emit_err(
                                         session_diagnostics::DeprecatedItemSuggestion {
                                             span: mi.span,
-                                            is_nightly: sess.is_nightly_build().then_some(()),
+                                            is_nightly: sess.is_nightly_build(),
                                             details: (),
                                         },
                                     );
@@ -866,7 +912,7 @@ pub fn find_deprecation(
                                 continue 'outer;
                             }
                         },
-                        NestedMetaItem::Lit(lit) => {
+                        MetaItemInner::Lit(lit) => {
                             sess.dcx().emit_err(session_diagnostics::UnsupportedLiteral {
                                 span: lit.span,
                                 reason: UnsupportedLiteralReason::DeprecatedKvPair,
@@ -1047,10 +1093,10 @@ pub fn parse_repr_attr(sess: &Session, attr: &Attribute) -> Vec<ReprAttr> {
                     MetaItemKind::List(nested_items) => {
                         if meta_item.has_name(sym::align) {
                             recognised = true;
-                            if nested_items.len() == 1 {
+                            if let [nested_item] = nested_items.as_slice() {
                                 sess.dcx().emit_err(
                                     session_diagnostics::IncorrectReprFormatExpectInteger {
-                                        span: nested_items[0].span(),
+                                        span: nested_item.span(),
                                     },
                                 );
                             } else {
@@ -1062,10 +1108,10 @@ pub fn parse_repr_attr(sess: &Session, attr: &Attribute) -> Vec<ReprAttr> {
                             }
                         } else if meta_item.has_name(sym::packed) {
                             recognised = true;
-                            if nested_items.len() == 1 {
+                            if let [nested_item] = nested_items.as_slice() {
                                 sess.dcx().emit_err(
                                     session_diagnostics::IncorrectReprFormatPackedExpectInteger {
-                                        span: nested_items[0].span(),
+                                        span: nested_item.span(),
                                     },
                                 );
                             } else {
@@ -1231,11 +1277,11 @@ pub fn parse_confusables(attr: &Attribute) -> Option<Vec<Symbol>> {
     let mut candidates = Vec::new();
 
     for meta in metas {
-        let NestedMetaItem::Lit(meta_lit) = meta else {
+        let MetaItemInner::Lit(meta_lit) = meta else {
             return None;
         };
         candidates.push(meta_lit.symbol);
     }
 
-    return Some(candidates);
+    Some(candidates)
 }

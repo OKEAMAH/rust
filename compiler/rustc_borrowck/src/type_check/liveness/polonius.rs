@@ -1,22 +1,23 @@
-use crate::def_use::{self, DefUse};
-use crate::location::{LocationIndex, LocationTable};
 use rustc_middle::mir::visit::{MutatingUseContext, PlaceContext, Visitor};
 use rustc_middle::mir::{Body, Local, Location, Place};
 use rustc_middle::ty::GenericArg;
 use rustc_mir_dataflow::move_paths::{LookupResult, MoveData, MovePathIndex};
+use tracing::debug;
 
 use super::TypeChecker;
+use crate::def_use::{self, DefUse};
+use crate::location::{LocationIndex, LocationTable};
 
 type VarPointRelation = Vec<(Local, LocationIndex)>;
 type PathPointRelation = Vec<(MovePathIndex, LocationIndex)>;
 
-struct UseFactsExtractor<'me, 'tcx> {
-    var_defined_at: &'me mut VarPointRelation,
-    var_used_at: &'me mut VarPointRelation,
-    location_table: &'me LocationTable,
-    var_dropped_at: &'me mut VarPointRelation,
-    move_data: &'me MoveData<'tcx>,
-    path_accessed_at_base: &'me mut PathPointRelation,
+struct UseFactsExtractor<'a, 'tcx> {
+    var_defined_at: &'a mut VarPointRelation,
+    var_used_at: &'a mut VarPointRelation,
+    location_table: &'a LocationTable,
+    var_dropped_at: &'a mut VarPointRelation,
+    move_data: &'a MoveData<'tcx>,
+    path_accessed_at_base: &'a mut PathPointRelation,
 }
 
 // A Visitor to walk through the MIR and extract point-wise facts
@@ -85,15 +86,12 @@ impl<'a, 'tcx> Visitor<'tcx> for UseFactsExtractor<'a, 'tcx> {
 pub(super) fn populate_access_facts<'a, 'tcx>(
     typeck: &mut TypeChecker<'a, 'tcx>,
     body: &Body<'tcx>,
-    location_table: &LocationTable,
     move_data: &MoveData<'tcx>,
-    //FIXME: this is not mutated, but expected to be modified as
-    // out param, bug?
-    dropped_at: &mut Vec<(Local, Location)>,
 ) {
-    debug!("populate_access_facts()");
-
     if let Some(facts) = typeck.borrowck_context.all_facts.as_mut() {
+        debug!("populate_access_facts()");
+        let location_table = typeck.borrowck_context.location_table;
+
         let mut extractor = UseFactsExtractor {
             var_defined_at: &mut facts.var_defined_at,
             var_used_at: &mut facts.var_used_at,
@@ -103,10 +101,6 @@ pub(super) fn populate_access_facts<'a, 'tcx>(
             move_data,
         };
         extractor.visit_body(body);
-
-        facts.var_dropped_at.extend(
-            dropped_at.iter().map(|&(local, location)| (local, location_table.mid_index(location))),
-        );
 
         for (local, local_decl) in body.local_decls.iter_enumerated() {
             debug!(

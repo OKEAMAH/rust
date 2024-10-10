@@ -1,9 +1,12 @@
+use std::collections::hash_map::Entry;
+use std::mem;
+
 use rustc_data_structures::fx::{FxHashMap, FxIndexSet};
 use rustc_data_structures::memmap::Mmap;
 use rustc_data_structures::sync::{HashMapExt, Lock, Lrc, RwLock};
 use rustc_data_structures::unhash::UnhashMap;
 use rustc_data_structures::unord::{UnordMap, UnordSet};
-use rustc_hir::def_id::{CrateNum, DefId, DefIndex, LocalDefId, StableCrateId, LOCAL_CRATE};
+use rustc_hir::def_id::{CrateNum, DefId, DefIndex, LOCAL_CRATE, LocalDefId, StableCrateId};
 use rustc_hir::definitions::DefPathHash;
 use rustc_index::{Idx, IndexVec};
 use rustc_macros::{Decodable, Encodable};
@@ -13,22 +16,17 @@ use rustc_middle::mir::{self, interpret};
 use rustc_middle::ty::codec::{RefDecodable, TyDecoder, TyEncoder};
 use rustc_middle::ty::{self, Ty, TyCtxt};
 use rustc_query_system::query::QuerySideEffects;
-use rustc_serialize::{
-    opaque::{FileEncodeResult, FileEncoder, IntEncodedWithFixedSize, MemDecoder},
-    Decodable, Decoder, Encodable, Encoder,
-};
+use rustc_serialize::opaque::{FileEncodeResult, FileEncoder, IntEncodedWithFixedSize, MemDecoder};
+use rustc_serialize::{Decodable, Decoder, Encodable, Encoder};
 use rustc_session::Session;
 use rustc_span::hygiene::{
     ExpnId, HygieneDecodeContext, HygieneEncodeContext, SyntaxContext, SyntaxContextData,
 };
 use rustc_span::source_map::SourceMap;
 use rustc_span::{
-    BytePos, ExpnData, ExpnHash, Pos, RelativeBytePos, SourceFile, Span, SpanDecoder, SpanEncoder,
-    StableSourceFileId,
+    BytePos, CachingSourceMapView, ExpnData, ExpnHash, Pos, RelativeBytePos, SourceFile, Span,
+    SpanDecoder, SpanEncoder, StableSourceFileId, Symbol,
 };
-use rustc_span::{CachingSourceMapView, Symbol};
-use std::collections::hash_map::Entry;
-use std::mem;
 
 const TAG_FILE_FOOTER: u128 = 0xC0FFEE_C0FFEE_C0FFEE_C0FFEE_C0FFEE;
 
@@ -235,7 +233,7 @@ impl<'sess> OnDiskCache<'sess> {
 
                 for (index, file) in files.iter().enumerate() {
                     let index = SourceFileIndex(index as u32);
-                    let file_ptr: *const SourceFile = std::ptr::addr_of!(**file);
+                    let file_ptr: *const SourceFile = &raw const **file;
                     file_to_file_index.insert(file_ptr, index);
                     let source_file_id = EncodedSourceFileId::new(tcx, file);
                     file_index_to_stable_id.insert(index, source_file_id);
@@ -330,18 +328,15 @@ impl<'sess> OnDiskCache<'sess> {
 
             // Encode the file footer.
             let footer_pos = encoder.position() as u64;
-            encoder.encode_tagged(
-                TAG_FILE_FOOTER,
-                &Footer {
-                    file_index_to_stable_id,
-                    query_result_index,
-                    side_effects_index,
-                    interpret_alloc_index,
-                    syntax_contexts,
-                    expn_data,
-                    foreign_expn_data,
-                },
-            );
+            encoder.encode_tagged(TAG_FILE_FOOTER, &Footer {
+                file_index_to_stable_id,
+                query_result_index,
+                side_effects_index,
+                interpret_alloc_index,
+                syntax_contexts,
+                expn_data,
+                foreign_expn_data,
+            });
 
             // Encode the position of the footer as the last 8 bytes of the
             // file so we know where to look for it.
@@ -733,10 +728,10 @@ impl<'a, 'tcx> SpanDecoder for CacheDecoder<'a, 'tcx> {
         // If we get to this point, then all of the query inputs were green,
         // which means that the definition with this hash is guaranteed to
         // still exist in the current compilation session.
-        self.tcx.def_path_hash_to_def_id(
-            def_path_hash,
-            &("Failed to convert DefPathHash", def_path_hash),
-        )
+        match self.tcx.def_path_hash_to_def_id(def_path_hash) {
+            Some(r) => r,
+            None => panic!("Failed to convert DefPathHash {def_path_hash:?}"),
+        }
     }
 
     fn decode_attr_id(&mut self) -> rustc_span::AttrId {
@@ -752,7 +747,7 @@ impl<'a, 'tcx> Decodable<CacheDecoder<'a, 'tcx>> for &'tcx UnordSet<LocalDefId> 
 }
 
 impl<'a, 'tcx> Decodable<CacheDecoder<'a, 'tcx>>
-    for &'tcx UnordMap<DefId, ty::EarlyBinder<Ty<'tcx>>>
+    for &'tcx UnordMap<DefId, ty::EarlyBinder<'tcx, Ty<'tcx>>>
 {
     #[inline]
     fn decode(d: &mut CacheDecoder<'a, 'tcx>) -> Self {
@@ -832,7 +827,7 @@ pub struct CacheEncoder<'a, 'tcx> {
 impl<'a, 'tcx> CacheEncoder<'a, 'tcx> {
     #[inline]
     fn source_file_index(&mut self, source_file: Lrc<SourceFile>) -> SourceFileIndex {
-        self.file_to_file_index[&std::ptr::addr_of!(*source_file)]
+        self.file_to_file_index[&(&raw const *source_file)]
     }
 
     /// Encode something with additional information that allows to do some

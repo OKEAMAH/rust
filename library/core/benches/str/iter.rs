@@ -1,5 +1,6 @@
+use test::{Bencher, black_box};
+
 use super::corpora;
-use test::{black_box, Bencher};
 
 #[bench]
 fn chars_advance_by_1000(b: &mut Bencher) {

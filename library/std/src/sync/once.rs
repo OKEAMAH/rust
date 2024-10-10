@@ -3,16 +3,22 @@
 //! This primitive is meant to be used to run one-time initialization. An
 //! example use case would be for initializing an FFI library.
 
-#[cfg(all(test, not(target_os = "emscripten")))]
+#[cfg(all(test, not(any(target_os = "emscripten", target_os = "wasi"))))]
 mod tests;
 
 use crate::fmt;
 use crate::panic::{RefUnwindSafe, UnwindSafe};
 use crate::sys::sync as sys;
 
-/// A synchronization primitive which can be used to run a one-time global
-/// initialization. Useful for one-time initialization for FFI or related
-/// functionality. This type can only be constructed with [`Once::new()`].
+/// A low-level synchronization primitive for one-time global execution.
+///
+/// Previously this was the only "execute once" synchronization in `std`.
+/// Other libraries implemented novel synchronizing types with `Once`, like
+/// [`OnceLock<T>`] or [`LazyLock<T, F>`], before those were added to `std`.
+/// `OnceLock<T>` in particular supersedes `Once` in functionality and should
+/// be preferred for the common case where the `Once` is associated with data.
+///
+/// This type can only be constructed with [`Once::new()`].
 ///
 /// # Examples
 ///
@@ -25,6 +31,9 @@ use crate::sys::sync as sys;
 ///     // run initialization here
 /// });
 /// ```
+///
+/// [`OnceLock<T>`]: crate::sync::OnceLock
+/// [`LazyLock<T, F>`]: crate::sync::LazyLock
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct Once {
     inner: sys::Once,
@@ -61,7 +70,7 @@ pub(crate) enum ExclusiveState {
 #[stable(feature = "rust1", since = "1.0.0")]
 #[deprecated(
     since = "1.38.0",
-    note = "the `new` function is now preferred",
+    note = "the `Once::new()` function is now preferred",
     suggestion = "Once::new()"
 )]
 pub const ONCE_INIT: Once = Once::new();
@@ -255,6 +264,47 @@ impl Once {
         self.inner.is_completed()
     }
 
+    /// Blocks the current thread until initialization has completed.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// #![feature(once_wait)]
+    ///
+    /// use std::sync::Once;
+    /// use std::thread;
+    ///
+    /// static READY: Once = Once::new();
+    ///
+    /// let thread = thread::spawn(|| {
+    ///     READY.wait();
+    ///     println!("everything is ready");
+    /// });
+    ///
+    /// READY.call_once(|| println!("performing setup"));
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// If this [`Once`] has been poisoned because an initialization closure has
+    /// panicked, this method will also panic. Use [`wait_force`](Self::wait_force)
+    /// if this behaviour is not desired.
+    #[unstable(feature = "once_wait", issue = "127527")]
+    pub fn wait(&self) {
+        if !self.inner.is_completed() {
+            self.inner.wait(false);
+        }
+    }
+
+    /// Blocks the current thread until initialization has completed, ignoring
+    /// poisoning.
+    #[unstable(feature = "once_wait", issue = "127527")]
+    pub fn wait_force(&self) {
+        if !self.inner.is_completed() {
+            self.inner.wait(true);
+        }
+    }
+
     /// Returns the current state of the `Once` instance.
     ///
     /// Since this takes a mutable reference, no initialization can currently
@@ -263,6 +313,16 @@ impl Once {
     #[inline]
     pub(crate) fn state(&mut self) -> ExclusiveState {
         self.inner.state()
+    }
+
+    /// Sets current state of the `Once` instance.
+    ///
+    /// Since this takes a mutable reference, no initialization can currently
+    /// be running, so the state must be either "incomplete", "poisoned" or
+    /// "complete".
+    #[inline]
+    pub(crate) fn set_state(&mut self, new_state: ExclusiveState) {
+        self.inner.set_state(new_state);
     }
 }
 

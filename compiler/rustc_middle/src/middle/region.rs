@@ -6,16 +6,18 @@
 //!
 //! [rustc dev guide]: https://rustc-dev-guide.rust-lang.org/borrow_check.html
 
-use crate::ty::TyCtxt;
+use std::fmt;
+use std::ops::Deref;
+
 use rustc_data_structures::fx::FxIndexMap;
 use rustc_data_structures::unord::UnordMap;
 use rustc_hir as hir;
 use rustc_hir::{HirId, HirIdMap, Node};
 use rustc_macros::{HashStable, TyDecodable, TyEncodable};
-use rustc_span::{Span, DUMMY_SP};
+use rustc_span::{DUMMY_SP, Span};
+use tracing::debug;
 
-use std::fmt;
-use std::ops::Deref;
+use crate::ty::TyCtxt;
 
 /// Represents a statically-describable scope that can be used to
 /// bound the lifetime/region for values.
@@ -94,6 +96,7 @@ impl fmt::Debug for Scope {
             ScopeData::Arguments => write!(fmt, "Arguments({:?})", self.id),
             ScopeData::Destruction => write!(fmt, "Destruction({:?})", self.id),
             ScopeData::IfThen => write!(fmt, "IfThen({:?})", self.id),
+            ScopeData::IfThenRescope => write!(fmt, "IfThen[edition2024]({:?})", self.id),
             ScopeData::Remainder(fsi) => write!(
                 fmt,
                 "Remainder {{ block: {:?}, first_statement_index: {}}}",
@@ -123,6 +126,11 @@ pub enum ScopeData {
     /// Scope of the condition and then block of an if expression
     /// Used for variables introduced in an if-let expression.
     IfThen,
+
+    /// Scope of the condition and then block of an if expression
+    /// Used for variables introduced in an if-let expression,
+    /// whose lifetimes do not cross beyond this scope.
+    IfThenRescope,
 
     /// Scope following a `let id = expr;` binding in a block.
     Remainder(FirstStatementIndex),

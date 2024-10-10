@@ -1,17 +1,19 @@
 use std::ops::Deref;
 
-use base_db::{CrateGraph, FileId, ProcMacroPaths};
+use base_db::{CrateGraph, ProcMacroPaths};
 use cargo_metadata::Metadata;
 use cfg::{CfgAtom, CfgDiff};
 use expect_test::{expect_file, ExpectFile};
+use intern::sym;
 use paths::{AbsPath, AbsPathBuf, Utf8Path, Utf8PathBuf};
 use rustc_hash::FxHashMap;
 use serde::de::DeserializeOwned;
+use span::FileId;
 use triomphe::Arc;
 
 use crate::{
-    workspace::ProjectWorkspaceKind, CargoWorkspace, CfgOverrides, ManifestPath, ProjectJson,
-    ProjectJsonData, ProjectWorkspace, Sysroot, WorkspaceBuildScripts,
+    sysroot::SysrootMode, workspace::ProjectWorkspaceKind, CargoWorkspace, CfgOverrides,
+    ManifestPath, ProjectJson, ProjectJsonData, ProjectWorkspace, Sysroot, WorkspaceBuildScripts,
 };
 
 fn load_cargo(file: &str) -> (CrateGraph, ProcMacroPaths) {
@@ -32,9 +34,11 @@ fn load_cargo_with_overrides(
             build_scripts: WorkspaceBuildScripts::default(),
             rustc: Err(None),
             cargo_config_extra_env: Default::default(),
+            error: None,
+            set_test: true,
         },
         cfg_overrides,
-        sysroot: Err(None),
+        sysroot: Sysroot::empty(),
         rustc_cfg: Vec::new(),
         toolchain: None,
         target_layout: Err("target_data_layout not loaded".into()),
@@ -42,42 +46,10 @@ fn load_cargo_with_overrides(
     to_crate_graph(project_workspace)
 }
 
-fn load_cargo_with_fake_sysroot(
-    file_map: &mut FxHashMap<AbsPathBuf, FileId>,
-    file: &str,
-) -> (CrateGraph, ProcMacroPaths) {
-    let meta: Metadata = get_test_json_file(file);
-    let manifest_path =
-        ManifestPath::try_from(AbsPathBuf::try_from(meta.workspace_root.clone()).unwrap()).unwrap();
-    let cargo_workspace = CargoWorkspace::new(meta, manifest_path);
-    let project_workspace = ProjectWorkspace {
-        kind: ProjectWorkspaceKind::Cargo {
-            cargo: cargo_workspace,
-            build_scripts: WorkspaceBuildScripts::default(),
-            rustc: Err(None),
-            cargo_config_extra_env: Default::default(),
-        },
-        sysroot: Ok(get_fake_sysroot()),
-        rustc_cfg: Vec::new(),
-        cfg_overrides: Default::default(),
-        toolchain: None,
-        target_layout: Err("target_data_layout not loaded".into()),
-    };
-    project_workspace.to_crate_graph(
-        &mut {
-            |path| {
-                let len = file_map.len();
-                Some(*file_map.entry(path.to_path_buf()).or_insert(FileId::from_raw(len as u32)))
-            }
-        },
-        &Default::default(),
-    )
-}
-
 fn load_rust_project(file: &str) -> (CrateGraph, ProcMacroPaths) {
     let data = get_test_json_file(file);
     let project = rooted_project_json(data);
-    let sysroot = Ok(get_fake_sysroot());
+    let sysroot = get_fake_sysroot();
     let project_workspace = ProjectWorkspace {
         kind: ProjectWorkspaceKind::Json(project),
         sysroot,
@@ -126,7 +98,7 @@ fn replace_fake_sys_root(s: &mut String) {
     let fake_sysroot_path = get_test_path("fake-sysroot");
     let fake_sysroot_path = if cfg!(windows) {
         let normalized_path = fake_sysroot_path.as_str().replace('\\', r#"\\"#);
-        format!(r#"{}\\"#, normalized_path)
+        format!(r#"{normalized_path}\\"#)
     } else {
         format!("{}/", fake_sysroot_path.as_str())
     };
@@ -144,7 +116,7 @@ fn get_fake_sysroot() -> Sysroot {
     // fake sysroot, so we give them both the same path:
     let sysroot_dir = AbsPathBuf::assert(sysroot_path);
     let sysroot_src_dir = sysroot_dir.clone();
-    Sysroot::load(sysroot_dir, Some(Ok(sysroot_src_dir)), false)
+    Sysroot::load(Some(sysroot_dir), Some(sysroot_src_dir))
 }
 
 fn rooted_project_json(data: ProjectJsonData) -> ProjectJson {
@@ -180,7 +152,7 @@ fn check_crate_graph(crate_graph: CrateGraph, expect: ExpectFile) {
 #[test]
 fn cargo_hello_world_project_model_with_wildcard_overrides() {
     let cfg_overrides = CfgOverrides {
-        global: CfgDiff::new(Vec::new(), vec![CfgAtom::Flag("test".into())]).unwrap(),
+        global: CfgDiff::new(Vec::new(), vec![CfgAtom::Flag(sym::test.clone())]).unwrap(),
         selective: Default::default(),
     };
     let (crate_graph, _proc_macros) =
@@ -199,7 +171,7 @@ fn cargo_hello_world_project_model_with_selective_overrides() {
         global: Default::default(),
         selective: std::iter::once((
             "libc".to_owned(),
-            CfgDiff::new(Vec::new(), vec![CfgAtom::Flag("test".into())]).unwrap(),
+            CfgDiff::new(Vec::new(), vec![CfgAtom::Flag(sym::test.clone())]).unwrap(),
         ))
         .collect(),
     };
@@ -232,6 +204,12 @@ fn rust_project_hello_world_project_model() {
 }
 
 #[test]
+fn rust_project_cfg_groups() {
+    let (crate_graph, _proc_macros) = load_rust_project("cfg-groups.json");
+    check_crate_graph(crate_graph, expect_file!["../test_data/output/rust_project_cfg_groups.txt"]);
+}
+
+#[test]
 fn rust_project_is_proc_macro_has_proc_macro_dep() {
     let (crate_graph, _proc_macros) = load_rust_project("is-proc-macro-project.json");
     // Since the project only defines one crate (outside the sysroot crates),
@@ -244,49 +222,19 @@ fn rust_project_is_proc_macro_has_proc_macro_dep() {
 }
 
 #[test]
-fn crate_graph_dedup_identical() {
-    let (mut crate_graph, proc_macros) =
-        load_cargo_with_fake_sysroot(&mut Default::default(), "regex-metadata.json");
-    crate_graph.sort_deps();
-
-    let (d_crate_graph, mut d_proc_macros) = (crate_graph.clone(), proc_macros.clone());
-
-    crate_graph.extend(d_crate_graph.clone(), &mut d_proc_macros, |(_, a), (_, b)| a == b);
-    assert!(crate_graph.iter().eq(d_crate_graph.iter()));
-    assert_eq!(proc_macros, d_proc_macros);
-}
-
-#[test]
-fn crate_graph_dedup() {
-    let path_map = &mut Default::default();
-    let (mut crate_graph, _proc_macros) =
-        load_cargo_with_fake_sysroot(path_map, "ripgrep-metadata.json");
-    assert_eq!(crate_graph.iter().count(), 81);
-    crate_graph.sort_deps();
-    let (regex_crate_graph, mut regex_proc_macros) =
-        load_cargo_with_fake_sysroot(path_map, "regex-metadata.json");
-    assert_eq!(regex_crate_graph.iter().count(), 60);
-
-    crate_graph.extend(regex_crate_graph, &mut regex_proc_macros, |(_, a), (_, b)| a == b);
-    assert_eq!(crate_graph.iter().count(), 118);
-}
-
-#[test]
+// FIXME Remove the ignore
+#[ignore = "requires nightly until the sysroot ships a cargo workspace for library on stable"]
 fn smoke_test_real_sysroot_cargo() {
-    if std::env::var("SYSROOT_CARGO_METADATA").is_err() {
-        return;
-    }
     let file_map = &mut FxHashMap::<AbsPathBuf, FileId>::default();
     let meta: Metadata = get_test_json_file("hello-world-metadata.json");
     let manifest_path =
         ManifestPath::try_from(AbsPathBuf::try_from(meta.workspace_root.clone()).unwrap()).unwrap();
     let cargo_workspace = CargoWorkspace::new(meta, manifest_path);
-    let sysroot = Ok(Sysroot::discover(
+    let sysroot = Sysroot::discover(
         AbsPath::assert(Utf8Path::new(env!("CARGO_MANIFEST_DIR"))),
         &Default::default(),
-        true,
-    )
-    .unwrap());
+    );
+    assert!(matches!(sysroot.mode(), SysrootMode::Workspace(_)));
 
     let project_workspace = ProjectWorkspace {
         kind: ProjectWorkspaceKind::Cargo {
@@ -294,6 +242,8 @@ fn smoke_test_real_sysroot_cargo() {
             build_scripts: WorkspaceBuildScripts::default(),
             rustc: Err(None),
             cargo_config_extra_env: Default::default(),
+            error: None,
+            set_test: true,
         },
         sysroot,
         rustc_cfg: Vec::new(),

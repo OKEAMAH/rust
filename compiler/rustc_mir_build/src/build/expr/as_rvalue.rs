@@ -1,23 +1,24 @@
 //! See docs in `build/expr/mod.rs`.
 
-use rustc_index::{Idx, IndexVec};
-use rustc_middle::ty::util::IntTypeExt;
-use rustc_span::source_map::Spanned;
-use rustc_target::abi::{Abi, FieldIdx, Primitive};
-
-use crate::build::expr::as_place::PlaceBase;
-use crate::build::expr::category::{Category, RvalueFunc};
-use crate::build::{BlockAnd, BlockAndExtension, Builder, NeedsTemporary};
 use rustc_hir::lang_items::LangItem;
+use rustc_index::{Idx, IndexVec};
 use rustc_middle::bug;
 use rustc_middle::middle::region;
 use rustc_middle::mir::interpret::Scalar;
 use rustc_middle::mir::*;
 use rustc_middle::thir::*;
-use rustc_middle::ty::cast::{mir_cast_kind, CastTy};
+use rustc_middle::ty::cast::{CastTy, mir_cast_kind};
 use rustc_middle::ty::layout::IntegerExt;
+use rustc_middle::ty::util::IntTypeExt;
 use rustc_middle::ty::{self, Ty, UpvarArgs};
-use rustc_span::{Span, DUMMY_SP};
+use rustc_span::source_map::Spanned;
+use rustc_span::{DUMMY_SP, Span};
+use rustc_target::abi::{Abi, FieldIdx, Primitive};
+use tracing::debug;
+
+use crate::build::expr::as_place::PlaceBase;
+use crate::build::expr::category::{Category, RvalueFunc};
+use crate::build::{BlockAnd, BlockAndExtension, Builder, NeedsTemporary};
 
 impl<'a, 'tcx> Builder<'a, 'tcx> {
     /// Returns an rvalue suitable for use until the end of the current
@@ -56,7 +57,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 this.in_scope(region_scope, lint_level, |this| this.as_rvalue(block, scope, value))
             }
             ExprKind::Repeat { value, count } => {
-                if Some(0) == count.try_eval_target_usize(this.tcx, this.param_env) {
+                if Some(0) == count.try_to_target_usize(this.tcx) {
                     this.build_zero_repeat(block, value, scope, source_info)
                 } else {
                     let value_operand = unpack!(
@@ -146,22 +147,19 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 );
                 let storage = this.temp(Ty::new_mut_ptr(tcx, tcx.types.u8), expr_span);
                 let success = this.cfg.start_new_block();
-                this.cfg.terminate(
-                    block,
-                    source_info,
-                    TerminatorKind::Call {
-                        func: exchange_malloc,
-                        args: vec![
-                            Spanned { node: Operand::Move(size), span: DUMMY_SP },
-                            Spanned { node: Operand::Move(align), span: DUMMY_SP },
-                        ],
-                        destination: storage,
-                        target: Some(success),
-                        unwind: UnwindAction::Continue,
-                        call_source: CallSource::Misc,
-                        fn_span: expr_span,
-                    },
-                );
+                this.cfg.terminate(block, source_info, TerminatorKind::Call {
+                    func: exchange_malloc,
+                    args: [Spanned { node: Operand::Move(size), span: DUMMY_SP }, Spanned {
+                        node: Operand::Move(align),
+                        span: DUMMY_SP,
+                    }]
+                    .into(),
+                    destination: storage,
+                    target: Some(success),
+                    unwind: UnwindAction::Continue,
+                    call_source: CallSource::Misc,
+                    fn_span: expr_span,
+                });
                 this.diverge_from(block);
                 block = success;
 
@@ -169,10 +167,10 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 // and therefore is not considered during coroutine auto-trait
                 // determination. See the comment about `box` at `yield_in_scope`.
                 let result = this.local_decls.push(LocalDecl::new(expr.ty, expr_span));
-                this.cfg.push(
-                    block,
-                    Statement { source_info, kind: StatementKind::StorageLive(result) },
-                );
+                this.cfg.push(block, Statement {
+                    source_info,
+                    kind: StatementKind::StorageLive(result),
+                });
                 if let Some(scope) = scope {
                     // schedule a shallow free of that memory, lest we unwind:
                     this.schedule_drop_storage_and_value(expr_span, scope, result);
@@ -183,13 +181,9 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 this.cfg.push_assign(block, source_info, Place::from(result), box_);
 
                 // initialize the box contents:
-                unpack!(
-                    block = this.expr_into_dest(
-                        this.tcx.mk_place_deref(Place::from(result)),
-                        block,
-                        value,
-                    )
-                );
+                block = this
+                    .expr_into_dest(this.tcx.mk_place_deref(Place::from(result)), block, value)
+                    .into_block();
                 block.and(Rvalue::Use(Operand::Move(Place::from(result))))
             }
             ExprKind::Cast { source } => {
@@ -270,15 +264,12 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                             );
                             merge_place
                         };
-                        this.cfg.push(
-                            block,
-                            Statement {
-                                source_info,
-                                kind: StatementKind::Intrinsic(Box::new(
-                                    NonDivergingIntrinsic::Assume(Operand::Move(assert_place)),
-                                )),
-                            },
-                        );
+                        this.cfg.push(block, Statement {
+                            source_info,
+                            kind: StatementKind::Intrinsic(Box::new(
+                                NonDivergingIntrinsic::Assume(Operand::Move(assert_place)),
+                            )),
+                        });
                     }
 
                     (op, ty)
@@ -301,7 +292,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 let cast_kind = mir_cast_kind(ty, expr.ty);
                 block.and(Rvalue::Cast(cast_kind, source, expr.ty))
             }
-            ExprKind::PointerCoercion { cast, source } => {
+            ExprKind::PointerCoercion { cast, source, is_from_as_cast } => {
                 let source = unpack!(
                     block = this.as_operand(
                         block,
@@ -311,7 +302,9 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                         NeedsTemporary::No
                     )
                 );
-                block.and(Rvalue::Cast(CastKind::PointerCoercion(cast), source, expr.ty))
+                let origin =
+                    if is_from_as_cast { CoercionSource::AsCast } else { CoercionSource::Implicit };
+                block.and(Rvalue::Cast(CastKind::PointerCoercion(cast, origin), source, expr.ty))
             }
             ExprKind::Array { ref fields } => {
                 // (*) We would (maybe) be closer to codegen if we
@@ -484,7 +477,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 block.and(Rvalue::Aggregate(result, operands))
             }
             ExprKind::Assign { .. } | ExprKind::AssignOp { .. } => {
-                block = unpack!(this.stmt_expr(block, expr_id, None));
+                block = this.stmt_expr(block, expr_id, None).into_block();
                 block.and(Rvalue::Use(Operand::Constant(Box::new(ConstOperand {
                     span: expr_span,
                     user_ty: None,
@@ -514,7 +507,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             | ExprKind::NeverToAny { .. }
             | ExprKind::Use { .. }
             | ExprKind::Borrow { .. }
-            | ExprKind::AddressOf { .. }
+            | ExprKind::RawBorrow { .. }
             | ExprKind::Adt { .. }
             | ExprKind::Loop { .. }
             | ExprKind::LogicalOp { .. }
@@ -723,16 +716,12 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             );
             if let Operand::Move(to_drop) = value_operand {
                 let success = this.cfg.start_new_block();
-                this.cfg.terminate(
-                    block,
-                    outer_source_info,
-                    TerminatorKind::Drop {
-                        place: to_drop,
-                        target: success,
-                        unwind: UnwindAction::Continue,
-                        replace: false,
-                    },
-                );
+                this.cfg.terminate(block, outer_source_info, TerminatorKind::Drop {
+                    place: to_drop,
+                    target: success,
+                    unwind: UnwindAction::Continue,
+                    replace: false,
+                });
                 this.diverge_from(block);
                 block = success;
             }

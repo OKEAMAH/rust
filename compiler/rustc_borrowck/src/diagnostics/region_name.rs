@@ -9,13 +9,15 @@ use rustc_errors::Diag;
 use rustc_hir as hir;
 use rustc_hir::def::{DefKind, Res};
 use rustc_middle::ty::print::RegionHighlightMode;
-use rustc_middle::ty::{self, RegionVid, Ty};
-use rustc_middle::ty::{GenericArgKind, GenericArgsRef};
+use rustc_middle::ty::{self, GenericArgKind, GenericArgsRef, RegionVid, Ty};
 use rustc_middle::{bug, span_bug};
-use rustc_span::symbol::{kw, sym, Ident, Symbol};
-use rustc_span::{Span, DUMMY_SP};
+use rustc_span::symbol::{Symbol, kw, sym};
+use rustc_span::{DUMMY_SP, Span};
+use rustc_trait_selection::error_reporting::InferCtxtErrorExt;
+use tracing::{debug, instrument};
 
-use crate::{universal_regions::DefiningTy, MirBorrowckCtxt};
+use crate::MirBorrowckCtxt;
+use crate::universal_regions::DefiningTy;
 
 /// A name for a particular region used in emitting diagnostics. This name could be a generated
 /// name like `'1`, a name used by the user like `'a`, or a name like `'static`.
@@ -198,7 +200,7 @@ impl rustc_errors::IntoDiagArg for RegionName {
     }
 }
 
-impl<'tcx> MirBorrowckCtxt<'_, 'tcx> {
+impl<'tcx> MirBorrowckCtxt<'_, '_, 'tcx> {
     pub(crate) fn mir_def_id(&self) -> hir::def_id::LocalDefId {
         self.body.source.def_id().expect_local()
     }
@@ -289,7 +291,8 @@ impl<'tcx> MirBorrowckCtxt<'_, 'tcx> {
         debug!("give_region_a_name: error_region = {:?}", error_region);
         match *error_region {
             ty::ReEarlyParam(ebr) => ebr.has_name().then(|| {
-                let span = tcx.hir().span_if_local(ebr.def_id).unwrap_or(DUMMY_SP);
+                let def_id = tcx.generics_of(self.mir_def_id()).region_param(ebr, tcx).def_id;
+                let span = tcx.hir().span_if_local(def_id).unwrap_or(DUMMY_SP);
                 RegionName { name: ebr.name, source: RegionNameSource::NamedEarlyParamRegion(span) }
             }),
 
@@ -456,8 +459,11 @@ impl<'tcx> MirBorrowckCtxt<'_, 'tcx> {
     ) -> RegionNameHighlight {
         let mut highlight = RegionHighlightMode::default();
         highlight.highlighting_region_vid(self.infcx.tcx, needle_fr, counter);
-        let type_name =
-            self.infcx.extract_inference_diagnostics_data(ty.into(), Some(highlight)).name;
+        let type_name = self
+            .infcx
+            .err_ctxt()
+            .extract_inference_diagnostics_data(ty.into(), Some(highlight))
+            .name;
 
         debug!(
             "highlight_if_we_cannot_match_hir_ty: type_name={:?} needle_fr={:?}",
@@ -518,7 +524,7 @@ impl<'tcx> MirBorrowckCtxt<'_, 'tcx> {
                     }
 
                     // Otherwise, let's descend into the referent types.
-                    search_stack.push((*referent_ty, &referent_hir_ty.ty));
+                    search_stack.push((*referent_ty, referent_hir_ty.ty));
                 }
 
                 // Match up something like `Foo<'1>`
@@ -557,7 +563,7 @@ impl<'tcx> MirBorrowckCtxt<'_, 'tcx> {
                 }
 
                 (ty::RawPtr(mut_ty, _), hir::TyKind::Ptr(mut_hir_ty)) => {
-                    search_stack.push((*mut_ty, &mut_hir_ty.ty));
+                    search_stack.push((*mut_ty, mut_hir_ty.ty));
                 }
 
                 _ => {
@@ -627,9 +633,7 @@ impl<'tcx> MirBorrowckCtxt<'_, 'tcx> {
                     | GenericArgKind::Const(_),
                     _,
                 ) => {
-                    // This was previously a `span_delayed_bug` and could be
-                    // reached by the test for #82126, but no longer.
-                    self.dcx().span_bug(
+                    self.dcx().span_delayed_bug(
                         hir_arg.span(),
                         format!("unmatched arg and hir arg: found {kind:?} vs {hir_arg:?}"),
                     );
@@ -653,7 +657,7 @@ impl<'tcx> MirBorrowckCtxt<'_, 'tcx> {
         let upvar_index = self.regioncx.get_upvar_index_for_region(self.infcx.tcx, fr)?;
         let (upvar_name, upvar_span) = self.regioncx.get_upvar_name_and_span_for_region(
             self.infcx.tcx,
-            &self.upvars,
+            self.upvars,
             upvar_index,
         );
         let region_name = self.synthesize_region_name();
@@ -718,7 +722,7 @@ impl<'tcx> MirBorrowckCtxt<'_, 'tcx> {
                             .output;
                         span = output.span();
                         if let hir::FnRetTy::Return(ret) = output {
-                            hir_ty = Some(self.get_future_inner_return_ty(*ret));
+                            hir_ty = Some(self.get_future_inner_return_ty(ret));
                         }
                         " of async function"
                     }
@@ -826,29 +830,19 @@ impl<'tcx> MirBorrowckCtxt<'_, 'tcx> {
     ///
     /// [`OpaqueDef`]: hir::TyKind::OpaqueDef
     fn get_future_inner_return_ty(&self, hir_ty: &'tcx hir::Ty<'tcx>) -> &'tcx hir::Ty<'tcx> {
-        let hir = self.infcx.tcx.hir();
-
-        let hir::TyKind::OpaqueDef(id, _, _) = hir_ty.kind else {
+        let hir::TyKind::OpaqueDef(opaque_ty, _) = hir_ty.kind else {
             span_bug!(
                 hir_ty.span,
                 "lowered return type of async fn is not OpaqueDef: {:?}",
                 hir_ty
             );
         };
-        let opaque_ty = hir.item(id);
-        if let hir::ItemKind::OpaqueTy(hir::OpaqueTy {
-            bounds: [hir::GenericBound::Trait(trait_ref, _)],
-            ..
-        }) = opaque_ty.kind
+        if let hir::OpaqueTy { bounds: [hir::GenericBound::Trait(trait_ref, _)], .. } = opaque_ty
             && let Some(segment) = trait_ref.trait_ref.path.segments.last()
             && let Some(args) = segment.args
-            && let [
-                hir::TypeBinding {
-                    ident: Ident { name: sym::Output, .. },
-                    kind: hir::TypeBindingKind::Equality { term: hir::Term::Ty(ty) },
-                    ..
-                },
-            ] = args.bindings
+            && let [constraint] = args.constraints
+            && constraint.ident.name == sym::Output
+            && let Some(ty) = constraint.ty()
         {
             ty
         } else {
@@ -877,8 +871,11 @@ impl<'tcx> MirBorrowckCtxt<'_, 'tcx> {
 
         let mut highlight = RegionHighlightMode::default();
         highlight.highlighting_region_vid(tcx, fr, *self.next_region_name.try_borrow().unwrap());
-        let type_name =
-            self.infcx.extract_inference_diagnostics_data(yield_ty.into(), Some(highlight)).name;
+        let type_name = self
+            .infcx
+            .err_ctxt()
+            .extract_inference_diagnostics_data(yield_ty.into(), Some(highlight))
+            .name;
 
         let yield_span = match tcx.hir_node(self.mir_hir_id()) {
             hir::Node::Expr(hir::Expr {
@@ -912,7 +909,8 @@ impl<'tcx> MirBorrowckCtxt<'_, 'tcx> {
         };
 
         let tcx = self.infcx.tcx;
-        let region_parent = tcx.parent(region.def_id);
+        let region_def = tcx.generics_of(self.mir_def_id()).region_param(region, tcx).def_id;
+        let region_parent = tcx.parent(region_def);
         let DefKind::Impl { .. } = tcx.def_kind(region_parent) else {
             return None;
         };
@@ -925,7 +923,7 @@ impl<'tcx> MirBorrowckCtxt<'_, 'tcx> {
         Some(RegionName {
             name: self.synthesize_region_name(),
             source: RegionNameSource::AnonRegionFromImplSignature(
-                tcx.def_span(region.def_id),
+                tcx.def_span(region_def),
                 // FIXME(compiler-errors): Does this ever actually show up
                 // anywhere other than the self type? I couldn't create an
                 // example of a `'_` in the impl's trait being referenceable.
@@ -962,7 +960,7 @@ impl<'tcx> MirBorrowckCtxt<'_, 'tcx> {
         {
             let (upvar_name, upvar_span) = self.regioncx.get_upvar_name_and_span_for_region(
                 self.infcx.tcx,
-                &self.upvars,
+                self.upvars,
                 upvar_index,
             );
             let region_name = self.synthesize_region_name();

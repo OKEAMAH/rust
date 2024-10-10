@@ -1,38 +1,36 @@
-use rustc_data_structures::fx::{FxHashMap, FxHashSet};
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, LazyLock};
+use std::{io, mem};
+
+use rustc_data_structures::fx::{FxHashMap, FxHashSet, FxIndexMap};
 use rustc_data_structures::sync::Lrc;
 use rustc_data_structures::unord::UnordSet;
-use rustc_errors::emitter::{stderr_destination, DynEmitter, HumanEmitter};
+use rustc_errors::codes::*;
+use rustc_errors::emitter::{DynEmitter, HumanEmitter, stderr_destination};
 use rustc_errors::json::JsonEmitter;
-use rustc_errors::{codes::*, ErrorGuaranteed, TerminalUrl};
+use rustc_errors::{DiagCtxtHandle, ErrorGuaranteed, TerminalUrl};
 use rustc_feature::UnstableFeatures;
 use rustc_hir::def::Res;
 use rustc_hir::def_id::{DefId, DefIdMap, DefIdSet, LocalDefId};
 use rustc_hir::intravisit::{self, Visitor};
 use rustc_hir::{HirId, Path};
 use rustc_interface::interface;
-use rustc_lint::{late_lint_mod, MissingDoc};
+use rustc_lint::{MissingDoc, late_lint_mod};
 use rustc_middle::hir::nested_filter;
 use rustc_middle::ty::{ParamEnv, Ty, TyCtxt};
-use rustc_session::config::{self, CrateType, ErrorOutputType, ResolveDocLinks};
-use rustc_session::lint;
-use rustc_session::Session;
+use rustc_session::config::{self, CrateType, ErrorOutputType, Input, ResolveDocLinks};
+pub(crate) use rustc_session::config::{Options, UnstableOptions};
+use rustc_session::{Session, lint};
 use rustc_span::symbol::sym;
-use rustc_span::{source_map, Span};
-
-use std::cell::RefCell;
-use std::io;
-use std::mem;
-use std::rc::Rc;
-use std::sync::LazyLock;
-use std::sync::{atomic::AtomicBool, Arc};
+use rustc_span::{Span, source_map};
+use tracing::{debug, info};
 
 use crate::clean::inline::build_external_trait;
 use crate::clean::{self, ItemId};
 use crate::config::{Options as RustdocOptions, OutputFormat, RenderOptions};
 use crate::formats::cache::Cache;
-use crate::passes::{self, Condition::*};
-
-pub(crate) use rustc_session::config::{Options, UnstableOptions};
+use crate::passes::Condition::*;
+use crate::passes::{self};
 
 pub(crate) struct DocContext<'tcx> {
     pub(crate) tcx: TyCtxt<'tcx>,
@@ -41,7 +39,7 @@ pub(crate) struct DocContext<'tcx> {
     /// Most of this logic is copied from rustc_lint::late.
     pub(crate) param_env: ParamEnv<'tcx>,
     /// Later on moved through `clean::Crate` into `cache`
-    pub(crate) external_traits: Rc<RefCell<FxHashMap<DefId, clean::Trait>>>,
+    pub(crate) external_traits: FxIndexMap<DefId, clean::Trait>,
     /// Used while populating `external_traits` to ensure we don't process the same trait twice at
     /// the same time.
     pub(crate) active_extern_traits: DefIdSet,
@@ -139,8 +137,8 @@ pub(crate) fn new_dcx(
         false,
     );
     let emitter: Box<DynEmitter> = match error_format {
-        ErrorOutputType::HumanReadable(kind) => {
-            let (short, color_config) = kind.unzip();
+        ErrorOutputType::HumanReadable(kind, color_config) => {
+            let short = kind.short();
             Box::new(
                 HumanEmitter::new(stderr_destination(color_config), fallback_bundle)
                     .sm(source_map.map(|sm| sm as _))
@@ -151,7 +149,7 @@ pub(crate) fn new_dcx(
                     .ui_testing(unstable_opts.ui_testing),
             )
         }
-        ErrorOutputType::Json { pretty, json_rendered } => {
+        ErrorOutputType::Json { pretty, json_rendered, color_config } => {
             let source_map = source_map.unwrap_or_else(|| {
                 Lrc::new(source_map::SourceMap::new(source_map::FilePathMapping::empty()))
             });
@@ -162,6 +160,7 @@ pub(crate) fn new_dcx(
                     fallback_bundle,
                     pretty,
                     json_rendered,
+                    color_config,
                 )
                 .ui_testing(unstable_opts.ui_testing)
                 .diagnostic_width(diagnostic_width)
@@ -176,8 +175,8 @@ pub(crate) fn new_dcx(
 
 /// Parse, resolve, and typecheck the given crate.
 pub(crate) fn create_config(
+    input: Input,
     RustdocOptions {
-        input,
         crate_name,
         proc_macro_crate,
         error_format,
@@ -196,6 +195,7 @@ pub(crate) fn create_config(
         lint_cap,
         scrape_examples_options,
         expanded_args,
+        remap_path_prefix,
         ..
     }: RustdocOptions,
     RenderOptions { document_private, .. }: &RenderOptions,
@@ -248,6 +248,7 @@ pub(crate) fn create_config(
         describe_lints,
         crate_name,
         test,
+        remap_path_prefix,
         ..Options::default()
     };
 
@@ -259,7 +260,7 @@ pub(crate) fn create_config(
         output_file: None,
         output_dir: None,
         file_loader: None,
-        locale_resources: rustc_driver::DEFAULT_LOCALE_RESOURCES,
+        locale_resources: rustc_driver::DEFAULT_LOCALE_RESOURCES.to_vec(),
         lint_caps,
         psess_created: None,
         hash_untracked_state: None,
@@ -284,7 +285,7 @@ pub(crate) fn create_config(
                 }
 
                 let hir = tcx.hir();
-                let body = hir.body(hir.body_owned_by(def_id));
+                let body = hir.body_owned_by(def_id);
                 debug!("visiting body for {def_id:?}");
                 EmitIgnoredResolutionErrors::new(tcx).visit_body(body);
                 (rustc_interface::DEFAULT_QUERY_PROVIDERS.typeck)(tcx, def_id)
@@ -347,7 +348,7 @@ pub(crate) fn run_global_ctxt(
         show_coverage,
     };
 
-    for cnum in tcx.crates_including_speculative(()) {
+    for cnum in tcx.crates(()) {
         crate::visit_lib::lib_embargo_visit_item(&mut ctxt, cnum.as_def_id());
     }
 
@@ -356,7 +357,7 @@ pub(crate) fn run_global_ctxt(
     // Note that in case of `#![no_core]`, the trait is not available.
     if let Some(sized_trait_did) = ctxt.tcx.lang_items().sized_trait() {
         let sized_trait = build_external_trait(&mut ctxt, sized_trait_did);
-        ctxt.external_traits.borrow_mut().insert(sized_trait_did, sized_trait);
+        ctxt.external_traits.insert(sized_trait_did, sized_trait);
     }
 
     debug!("crate: {:?}", tcx.hir().krate());
@@ -372,14 +373,14 @@ pub(crate) fn run_global_ctxt(
         tcx.node_lint(
             crate::lint::MISSING_CRATE_LEVEL_DOCS,
             DocContext::as_local_hir_id(tcx, krate.module.item_id).unwrap(),
-            "no documentation found for this crate's top-level module",
             |lint| {
+                lint.primary_message("no documentation found for this crate's top-level module");
                 lint.help(help);
             },
         );
     }
 
-    fn report_deprecated_attr(name: &str, dcx: &rustc_errors::DiagCtxt, sp: Span) {
+    fn report_deprecated_attr(name: &str, dcx: DiagCtxtHandle<'_>, sp: Span) {
         let mut msg =
             dcx.struct_span_warn(sp, format!("the `#![doc({name})]` attribute is deprecated"));
         msg.note(

@@ -1,5 +1,6 @@
 //! Trait solving using Chalk.
 
+use core::fmt;
 use std::env::var;
 
 use chalk_ir::{fold::TypeFoldable, DebruijnIndex, GoalData};
@@ -11,14 +12,16 @@ use hir_def::{
     lang_item::{LangItem, LangItemTarget},
     BlockId, TraitId,
 };
-use hir_expand::name::{name, Name};
-use stdx::panic_context;
+use hir_expand::name::Name;
+use intern::sym;
+use span::Edition;
+use stdx::{never, panic_context};
 use triomphe::Arc;
 
 use crate::{
     db::HirDatabase, infer::unify::InferenceTable, utils::UnevaluatedConstEvaluatorFolder, AliasEq,
     AliasTy, Canonical, DomainGoal, Goal, Guidance, InEnvironment, Interner, ProjectionTy,
-    ProjectionTyExt, Solution, TraitRefExt, Ty, TyKind, WhereClause,
+    ProjectionTyExt, Solution, TraitRefExt, Ty, TyKind, TypeFlags, WhereClause,
 };
 
 /// This controls how much 'time' we give the Chalk solver before giving up.
@@ -88,6 +91,16 @@ pub(crate) fn normalize_projection_query(
     projection: ProjectionTy,
     env: Arc<TraitEnvironment>,
 ) -> Ty {
+    if projection.substitution.iter(Interner).any(|arg| {
+        arg.ty(Interner)
+            .is_some_and(|ty| ty.data(Interner).flags.intersects(TypeFlags::HAS_TY_INFER))
+    }) {
+        never!(
+            "Invoking `normalize_projection_query` with a projection type containing inference var"
+        );
+        return TyKind::Error.intern(Interner);
+    }
+
     let mut table = InferenceTable::new(db, env);
     let ty = table.normalize_projection_ty(projection);
     table.resolve_completely(ty)
@@ -102,12 +115,12 @@ pub(crate) fn trait_solve_query(
 ) -> Option<Solution> {
     let detail = match &goal.value.goal.data(Interner) {
         GoalData::DomainGoal(DomainGoal::Holds(WhereClause::Implemented(it))) => {
-            db.trait_data(it.hir_trait_id()).name.display(db.upcast()).to_string()
+            db.trait_data(it.hir_trait_id()).name.display(db.upcast(), Edition::LATEST).to_string()
         }
         GoalData::DomainGoal(DomainGoal::Holds(WhereClause::AliasEq(_))) => "alias_eq".to_owned(),
         _ => "??".to_owned(),
     };
-    let _p = tracing::span!(tracing::Level::INFO, "trait_solve_query", ?detail).entered();
+    let _p = tracing::info_span!("trait_solve_query", ?detail).entered();
     tracing::info!("trait_solve_query({:?})", goal.value.goal);
 
     if let GoalData::DomainGoal(DomainGoal::Holds(WhereClause::AliasEq(AliasEq {
@@ -139,7 +152,7 @@ fn solve(
     block: Option<BlockId>,
     goal: &chalk_ir::UCanonical<chalk_ir::InEnvironment<chalk_ir::Goal<Interner>>>,
 ) -> Option<chalk_solve::Solution<Interner>> {
-    let _p = tracing::span!(tracing::Level::INFO, "solve", ?krate, ?block).entered();
+    let _p = tracing::info_span!("solve", ?krate, ?block).entered();
     let context = ChalkContext { db, krate, block };
     tracing::debug!("solve goal: {:?}", goal);
     let mut solver = create_chalk_solver();
@@ -209,7 +222,25 @@ pub enum FnTrait {
     Fn,
 }
 
+impl fmt::Display for FnTrait {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            FnTrait::FnOnce => write!(f, "FnOnce"),
+            FnTrait::FnMut => write!(f, "FnMut"),
+            FnTrait::Fn => write!(f, "Fn"),
+        }
+    }
+}
+
 impl FnTrait {
+    pub const fn function_name(&self) -> &'static str {
+        match self {
+            FnTrait::FnOnce => "call_once",
+            FnTrait::FnMut => "call_mut",
+            FnTrait::Fn => "call",
+        }
+    }
+
     const fn lang_item(self) -> LangItem {
         match self {
             FnTrait::FnOnce => LangItem::FnOnce,
@@ -237,9 +268,9 @@ impl FnTrait {
 
     pub fn method_name(self) -> Name {
         match self {
-            FnTrait::FnOnce => name!(call_once),
-            FnTrait::FnMut => name!(call_mut),
-            FnTrait::Fn => name!(call),
+            FnTrait::FnOnce => Name::new_symbol_root(sym::call_once.clone()),
+            FnTrait::FnMut => Name::new_symbol_root(sym::call_mut.clone()),
+            FnTrait::Fn => Name::new_symbol_root(sym::call.clone()),
         }
     }
 

@@ -1,6 +1,6 @@
 use clippy_utils::diagnostics::span_lint_and_then;
 use itertools::Itertools;
-use rustc_errors::{Applicability, SuggestionStyle};
+use rustc_errors::Applicability;
 use rustc_lint::LateContext;
 use rustc_span::{BytePos, Span};
 use std::ops::Range;
@@ -46,20 +46,19 @@ pub(super) fn check(
         .sum();
     if ccount < blockquote_level || lcount < list_indentation {
         let msg = if ccount < blockquote_level {
-            "doc quote missing `>` marker"
+            "doc quote line without `>` marker"
         } else {
-            "doc list item missing indentation"
+            "doc list item without indentation"
         };
         span_lint_and_then(cx, DOC_LAZY_CONTINUATION, span, msg, |diag| {
             if ccount == 0 && blockquote_level == 0 {
                 // simpler suggestion style for indentation
                 let indent = list_indentation - lcount;
-                diag.span_suggestion_with_style(
+                diag.span_suggestion_verbose(
                     span.shrink_to_hi(),
                     "indent this line",
                     std::iter::repeat(" ").take(indent).join(""),
                     Applicability::MaybeIncorrect,
-                    SuggestionStyle::ShowAlways,
                 );
                 diag.help("if this is supposed to be its own paragraph, add a blank line");
                 return;
@@ -82,12 +81,11 @@ pub(super) fn check(
                     suggested.push_str(text);
                 }
             }
-            diag.span_suggestion_with_style(
+            diag.span_suggestion_verbose(
                 span,
                 "add markers to start of line",
                 suggested,
                 Applicability::MachineApplicable,
-                SuggestionStyle::ShowAlways,
             );
             diag.help("if this not intended to be a quote at all, escape it with `\\>`");
         });

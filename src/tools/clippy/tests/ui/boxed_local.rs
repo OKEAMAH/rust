@@ -1,10 +1,10 @@
-#![feature(lint_reasons)]
 #![allow(
     clippy::borrowed_box,
     clippy::needless_pass_by_value,
     clippy::unused_unit,
     clippy::redundant_clone,
-    clippy::match_single_binding
+    clippy::match_single_binding,
+    clippy::needless_lifetimes
 )]
 #![warn(clippy::boxed_local)]
 

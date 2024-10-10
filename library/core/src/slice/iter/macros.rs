@@ -14,11 +14,11 @@ macro_rules! if_zst {
         if T::IS_ZST {
             // SAFETY: for ZSTs, the pointer is storing a provenance-free length,
             // so consuming and updating it as a `usize` is fine.
-            let $len = unsafe { &mut *ptr::addr_of_mut!($this.end_or_len).cast::<usize>() };
+            let $len = unsafe { &mut *(&raw mut $this.end_or_len).cast::<usize>() };
             $zst_body
         } else {
             // SAFETY: for non-ZSTs, the type invariant ensures it cannot be null
-            let $end = unsafe { &mut *ptr::addr_of_mut!($this.end_or_len).cast::<NonNull<T>>() };
+            let $end = unsafe { &mut *(&raw mut $this.end_or_len).cast::<NonNull<T>>() };
             $other_body
         }
     }};
@@ -30,7 +30,7 @@ macro_rules! if_zst {
             $zst_body
         } else {
             // SAFETY: for non-ZSTs, the type invariant ensures it cannot be null
-            let $end = unsafe { *ptr::addr_of!($this.end_or_len).cast::<NonNull<T>>() };
+            let $end = unsafe { *(&raw const $this.end_or_len).cast::<NonNull<T>>() };
             $other_body
         }
     }};
@@ -103,7 +103,8 @@ macro_rules! iterator {
                 // so this new pointer is inside `self` and thus guaranteed to be non-null.
                 unsafe {
                     if_zst!(mut self,
-                        len => *len = len.unchecked_sub(offset),
+                        // Using the intrinsic directly avoids emitting a UbCheck
+                        len => *len = crate::intrinsics::unchecked_sub(*len, offset),
                         _end => self.ptr = self.ptr.add(offset),
                     );
                 }
@@ -119,7 +120,8 @@ macro_rules! iterator {
                     // SAFETY: By our precondition, `offset` can be at most the
                     // current length, so the subtraction can never overflow.
                     len => unsafe {
-                        *len = len.unchecked_sub(offset);
+                        // Using the intrinsic directly avoids emitting a UbCheck
+                        *len = crate::intrinsics::unchecked_sub(*len, offset);
                         self.ptr
                     },
                     // SAFETY: the caller guarantees that `offset` doesn't exceed `self.len()`,

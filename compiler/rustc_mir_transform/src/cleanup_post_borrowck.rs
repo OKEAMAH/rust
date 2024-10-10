@@ -16,14 +16,14 @@
 //! [`BlockMarker`]: rustc_middle::mir::coverage::CoverageKind::BlockMarker
 //! [`SpanMarker`]: rustc_middle::mir::coverage::CoverageKind::SpanMarker
 
-use crate::MirPass;
 use rustc_middle::mir::coverage::CoverageKind;
-use rustc_middle::mir::{Body, BorrowKind, Rvalue, StatementKind, TerminatorKind};
+use rustc_middle::mir::{Body, BorrowKind, CastKind, Rvalue, StatementKind, TerminatorKind};
 use rustc_middle::ty::TyCtxt;
+use rustc_middle::ty::adjustment::PointerCoercion;
 
-pub struct CleanupPostBorrowck;
+pub(super) struct CleanupPostBorrowck;
 
-impl<'tcx> MirPass<'tcx> for CleanupPostBorrowck {
+impl<'tcx> crate::MirPass<'tcx> for CleanupPostBorrowck {
     fn run_pass(&self, _tcx: TyCtxt<'tcx>, body: &mut Body<'tcx>) {
         for basic_block in body.basic_blocks.as_mut() {
             for statement in basic_block.statements.iter_mut() {
@@ -36,6 +36,23 @@ impl<'tcx> MirPass<'tcx> for CleanupPostBorrowck {
                         CoverageKind::BlockMarker { .. } | CoverageKind::SpanMarker { .. },
                     )
                     | StatementKind::FakeRead(..) => statement.make_nop(),
+                    StatementKind::Assign(box (
+                        _,
+                        Rvalue::Cast(
+                            ref mut cast_kind @ CastKind::PointerCoercion(
+                                PointerCoercion::ArrayToPointer
+                                | PointerCoercion::MutToConstPointer,
+                                _,
+                            ),
+                            ..,
+                        ),
+                    )) => {
+                        // BorrowCk needed to track whether these cases were coercions or casts,
+                        // to know whether to check lifetimes in their pointees,
+                        // but from now on that distinction doesn't matter,
+                        // so just make them ordinary pointer casts instead.
+                        *cast_kind = CastKind::PtrToPtr;
+                    }
                     _ => (),
                 }
             }

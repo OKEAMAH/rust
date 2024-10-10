@@ -5,20 +5,8 @@ use rustc_target::abi::{Align, Size};
 
 use crate::*;
 
-/// Check some basic requirements for this allocation request:
-/// non-zero size, power-of-two alignment.
-pub(super) fn check_alloc_request<'tcx>(size: u64, align: u64) -> InterpResult<'tcx> {
-    if size == 0 {
-        throw_ub_format!("creating allocation with size 0");
-    }
-    if !align.is_power_of_two() {
-        throw_ub_format!("creating allocation with non-power-of-two alignment {}", align);
-    }
-    Ok(())
-}
-
-impl<'mir, 'tcx: 'mir> EvalContextExt<'mir, 'tcx> for crate::MiriInterpCx<'mir, 'tcx> {}
-pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
+impl<'tcx> EvalContextExt<'tcx> for crate::MiriInterpCx<'tcx> {}
+pub trait EvalContextExt<'tcx>: crate::MiriInterpCxExt<'tcx> {
     /// Returns the alignment that `malloc` would guarantee for requests of the given size.
     fn malloc_align(&self, size: u64) -> Align {
         let this = self.eval_context_ref();
@@ -67,13 +55,13 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
     /// Emulates calling the internal __rust_* allocator functions
     fn emulate_allocator(
         &mut self,
-        default: impl FnOnce(&mut MiriInterpCx<'mir, 'tcx>) -> InterpResult<'tcx>,
+        default: impl FnOnce(&mut MiriInterpCx<'tcx>) -> InterpResult<'tcx>,
     ) -> InterpResult<'tcx, EmulateItemResult> {
         let this = self.eval_context_mut();
 
         let Some(allocator_kind) = this.tcx.allocator_kind(()) else {
             // in real code, this symbol does not exist without an allocator
-            return Ok(EmulateItemResult::NotSupported);
+            return interp_ok(EmulateItemResult::NotSupported);
         };
 
         match allocator_kind {
@@ -83,20 +71,16 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 // and not execute any Miri shim. Somewhat unintuitively doing so is done
                 // by returning `NotSupported`, which triggers the `lookup_exported_symbol`
                 // fallback case in `emulate_foreign_item`.
-                return Ok(EmulateItemResult::NotSupported);
+                interp_ok(EmulateItemResult::NotSupported)
             }
             AllocatorKind::Default => {
                 default(this)?;
-                Ok(EmulateItemResult::NeedsReturn)
+                interp_ok(EmulateItemResult::NeedsReturn)
             }
         }
     }
 
-    fn malloc(
-        &mut self,
-        size: u64,
-        zero_init: bool,
-    ) -> InterpResult<'tcx, Pointer<Option<Provenance>>> {
+    fn malloc(&mut self, size: u64, zero_init: bool) -> InterpResult<'tcx, Pointer> {
         let this = self.eval_context_mut();
         let align = this.malloc_align(size);
         let ptr = this.allocate_ptr(Size::from_bytes(size), align, MiriMemoryKind::C.into())?;
@@ -108,15 +92,15 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
             )
             .unwrap();
         }
-        Ok(ptr.into())
+        interp_ok(ptr.into())
     }
 
     fn posix_memalign(
         &mut self,
-        memptr: &OpTy<'tcx, Provenance>,
-        align: &OpTy<'tcx, Provenance>,
-        size: &OpTy<'tcx, Provenance>,
-    ) -> InterpResult<'tcx, Scalar<Provenance>> {
+        memptr: &OpTy<'tcx>,
+        align: &OpTy<'tcx>,
+        size: &OpTy<'tcx>,
+    ) -> InterpResult<'tcx, Scalar> {
         let this = self.eval_context_mut();
         let memptr = this.deref_pointer(memptr)?;
         let align = this.read_target_usize(align)?;
@@ -125,7 +109,7 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
         // Align must be power of 2, and also at least ptr-sized (POSIX rules).
         // But failure to adhere to this is not UB, it's an error condition.
         if !align.is_power_of_two() || align < this.pointer_size().bytes() {
-            Ok(this.eval_libc("EINVAL"))
+            interp_ok(this.eval_libc("EINVAL"))
         } else {
             let ptr = this.allocate_ptr(
                 Size::from_bytes(size),
@@ -133,23 +117,19 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                 MiriMemoryKind::C.into(),
             )?;
             this.write_pointer(ptr, &memptr)?;
-            Ok(Scalar::from_i32(0))
+            interp_ok(Scalar::from_i32(0))
         }
     }
 
-    fn free(&mut self, ptr: Pointer<Option<Provenance>>) -> InterpResult<'tcx> {
+    fn free(&mut self, ptr: Pointer) -> InterpResult<'tcx> {
         let this = self.eval_context_mut();
         if !this.ptr_is_null(ptr)? {
             this.deallocate_ptr(ptr, None, MiriMemoryKind::C.into())?;
         }
-        Ok(())
+        interp_ok(())
     }
 
-    fn realloc(
-        &mut self,
-        old_ptr: Pointer<Option<Provenance>>,
-        new_size: u64,
-    ) -> InterpResult<'tcx, Pointer<Option<Provenance>>> {
+    fn realloc(&mut self, old_ptr: Pointer, new_size: u64) -> InterpResult<'tcx, Pointer> {
         let this = self.eval_context_mut();
         let new_align = this.malloc_align(new_size);
         if this.ptr_is_null(old_ptr)? {
@@ -168,16 +148,16 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                     new_align,
                     MiriMemoryKind::C.into(),
                 )?;
-                Ok(new_ptr.into())
+                interp_ok(new_ptr.into())
             }
         }
     }
 
     fn aligned_alloc(
         &mut self,
-        align: &OpTy<'tcx, Provenance>,
-        size: &OpTy<'tcx, Provenance>,
-    ) -> InterpResult<'tcx, Pointer<Option<Provenance>>> {
+        align: &OpTy<'tcx>,
+        size: &OpTy<'tcx>,
+    ) -> InterpResult<'tcx, Pointer> {
         let this = self.eval_context_mut();
         let align = this.read_target_usize(align)?;
         let size = this.read_target_usize(size)?;
@@ -208,9 +188,9 @@ pub trait EvalContextExt<'mir, 'tcx: 'mir>: crate::MiriInterpCxExt<'mir, 'tcx> {
                     Align::from_bytes(align).unwrap(),
                     MiriMemoryKind::C.into(),
                 )?;
-                Ok(ptr.into())
+                interp_ok(ptr.into())
             }
-            _ => Ok(Pointer::null()),
+            _ => interp_ok(Pointer::null()),
         }
     }
 }

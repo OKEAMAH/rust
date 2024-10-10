@@ -1,7 +1,9 @@
+use std::fmt::Debug;
+
 use rustc_middle::mir::patch::MirPatch;
 use rustc_middle::mir::*;
 use rustc_middle::ty::{Ty, TyCtxt};
-use std::fmt::Debug;
+use tracing::trace;
 
 use super::simplify::simplify_cfg;
 
@@ -88,9 +90,9 @@ use super::simplify::simplify_cfg;
 ///     |      ...      |
 ///     =================
 /// ```
-pub struct EarlyOtherwiseBranch;
+pub(super) struct EarlyOtherwiseBranch;
 
-impl<'tcx> MirPass<'tcx> for EarlyOtherwiseBranch {
+impl<'tcx> crate::MirPass<'tcx> for EarlyOtherwiseBranch {
     fn is_enabled(&self, sess: &rustc_session::Session) -> bool {
         sess.mir_opt_level() >= 2
     }
@@ -106,11 +108,11 @@ impl<'tcx> MirPass<'tcx> for EarlyOtherwiseBranch {
             let parent = BasicBlock::from_usize(i);
             let Some(opt_data) = evaluate_candidate(tcx, body, parent) else { continue };
 
-            if !tcx.consider_optimizing(|| format!("EarlyOtherwiseBranch {:?}", &opt_data)) {
+            if !tcx.consider_optimizing(|| format!("EarlyOtherwiseBranch {opt_data:?}")) {
                 break;
             }
 
-            trace!("SUCCESS: found optimization possibility to apply: {:?}", &opt_data);
+            trace!("SUCCESS: found optimization possibility to apply: {opt_data:?}");
 
             should_cleanup = true;
 
@@ -259,8 +261,8 @@ fn evaluate_candidate<'tcx>(
         // };
         // ```
         //
-        // Hoisting the `discriminant(Q)` out of the `A` arm causes us to compute the discriminant of an
-        // invalid value, which is UB.
+        // Hoisting the `discriminant(Q)` out of the `A` arm causes us to compute the discriminant
+        // of an invalid value, which is UB.
         // In order to fix this, **we would either need to show that the discriminant computation of
         // `place` is computed in all branches**.
         // FIXME(#95162) For the moment, we adopt a conservative approach and
@@ -308,42 +310,28 @@ fn verify_candidate_branch<'tcx>(
 ) -> bool {
     // In order for the optimization to be correct, the branch must...
     // ...have exactly one statement
-    if branch.statements.len() != 1 {
-        return false;
+    if let [statement] = branch.statements.as_slice()
+        // ...assign the discriminant of `place` in that statement
+        && let StatementKind::Assign(boxed) = &statement.kind
+        && let (discr_place, Rvalue::Discriminant(from_place)) = &**boxed
+        && *from_place == place
+        // ...make that assignment to a local
+        && discr_place.projection.is_empty()
+        // ...terminate on a `SwitchInt` that invalidates that local
+        && let TerminatorKind::SwitchInt { discr: switch_op, targets, .. } =
+            &branch.terminator().kind
+        && *switch_op == Operand::Move(*discr_place)
+        // ...fall through to `destination` if the switch misses
+        && destination == targets.otherwise()
+        // ...have a branch for value `value`
+        && let mut iter = targets.iter()
+        && let Some((target_value, _)) = iter.next()
+        && target_value == value
+        // ...and have no more branches
+        && iter.next().is_none()
+    {
+        true
+    } else {
+        false
     }
-    // ...assign the discriminant of `place` in that statement
-    let StatementKind::Assign(boxed) = &branch.statements[0].kind else { return false };
-    let (discr_place, Rvalue::Discriminant(from_place)) = &**boxed else { return false };
-    if *from_place != place {
-        return false;
-    }
-    // ...make that assignment to a local
-    if discr_place.projection.len() != 0 {
-        return false;
-    }
-    // ...terminate on a `SwitchInt` that invalidates that local
-    let TerminatorKind::SwitchInt { discr: switch_op, targets, .. } = &branch.terminator().kind
-    else {
-        return false;
-    };
-    if *switch_op != Operand::Move(*discr_place) {
-        return false;
-    }
-    // ...fall through to `destination` if the switch misses
-    if destination != targets.otherwise() {
-        return false;
-    }
-    // ...have a branch for value `value`
-    let mut iter = targets.iter();
-    let Some((target_value, _)) = iter.next() else {
-        return false;
-    };
-    if target_value != value {
-        return false;
-    }
-    // ...and have no more branches
-    if let Some(_) = iter.next() {
-        return false;
-    }
-    true
 }

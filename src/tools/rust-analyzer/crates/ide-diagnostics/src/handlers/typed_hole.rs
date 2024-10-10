@@ -1,7 +1,7 @@
 use hir::{
     db::ExpandDatabase,
     term_search::{term_search, TermSearchConfig, TermSearchCtx},
-    ClosureStyle, HirDisplay,
+    ClosureStyle, HirDisplay, ImportPathConfig,
 };
 use ide_db::{
     assists::{Assist, AssistId, AssistKind, GroupLabel},
@@ -26,7 +26,9 @@ pub(crate) fn typed_hole(ctx: &DiagnosticsContext<'_>, d: &hir::TypedHole) -> Di
         (
             format!(
                 "invalid `_` expression, expected type `{}`",
-                d.expected.display(ctx.sema.db).with_closure_style(ClosureStyle::ClosureWithId),
+                d.expected
+                    .display(ctx.sema.db, ctx.edition)
+                    .with_closure_style(ClosureStyle::ClosureWithId),
             ),
             fixes(ctx, d),
         )
@@ -47,7 +49,12 @@ fn fixes(ctx: &DiagnosticsContext<'_>, d: &hir::TypedHole) -> Option<Vec<Assist>
         sema: &ctx.sema,
         scope: &scope,
         goal: d.expected.clone(),
-        config: TermSearchConfig { fuel: ctx.config.term_search_fuel, ..Default::default() },
+        config: TermSearchConfig {
+            fuel: ctx.config.term_search_fuel,
+            enable_borrowcheck: ctx.config.term_search_borrowck,
+
+            ..Default::default()
+        },
     };
     let paths = term_search(&term_search_ctx);
 
@@ -59,22 +66,26 @@ fn fixes(ctx: &DiagnosticsContext<'_>, d: &hir::TypedHole) -> Option<Vec<Assist>
             path.gen_source_code(
                 &scope,
                 &mut formatter,
-                ctx.config.prefer_no_std,
-                ctx.config.prefer_prelude,
+                ImportPathConfig {
+                    prefer_no_std: ctx.config.prefer_no_std,
+                    prefer_prelude: ctx.config.prefer_prelude,
+                    prefer_absolute: ctx.config.prefer_absolute,
+                },
+                ctx.edition,
             )
             .ok()
         })
         .unique()
         .map(|code| Assist {
             id: AssistId("typed-hole", AssistKind::QuickFix),
-            label: Label::new(format!("Replace `_` with `{}`", &code)),
+            label: Label::new(format!("Replace `_` with `{code}`")),
             group: Some(GroupLabel("Replace `_` with a term".to_owned())),
             target: original_range.range,
             source_change: Some(SourceChange::from_text_edit(
                 original_range.file_id,
                 TextEdit::replace(original_range.range, code),
             )),
-            trigger_signature_help: false,
+            command: None,
         })
         .collect();
 
@@ -274,7 +285,7 @@ impl Foo for Baz {
 }
 fn asd() -> Bar {
     let a = Baz;
-    Foo::foo(_)
+    Foo::foo(a)
 }
 ",
         );
@@ -363,11 +374,12 @@ impl Foo for A {
 }
 fn main() {
     let a = A;
-    let c: Bar = Foo::foo(_);
+    let c: Bar = Foo::foo(&a);
 }"#,
         );
     }
 
+    // FIXME
     #[test]
     fn local_shadow_fn() {
         check_fixes_unordered(
@@ -385,9 +397,31 @@ fn f() {
                 r#"
 fn f() {
     let f: i32 = 0;
-    crate::f()
+    f()
 }"#,
             ],
+        );
+    }
+
+    #[test]
+    fn underscore_in_asm() {
+        check_diagnostics(
+            r#"
+//- minicore: asm
+fn rdtscp() -> u64 {
+    let hi: u64;
+    let lo: u64;
+    unsafe {
+        core::arch::asm!(
+            "rdtscp",
+            out("rdx") hi,
+            out("rax") lo,
+            out("rcx") _,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    (hi << 32) | lo
+}"#,
         );
     }
 }

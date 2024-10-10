@@ -1,30 +1,32 @@
-#![cfg_attr(feature = "nightly", feature(step_trait))]
+// tidy-alphabetical-start
 #![cfg_attr(feature = "nightly", allow(internal_features))]
 #![cfg_attr(feature = "nightly", doc(rust_logo))]
 #![cfg_attr(feature = "nightly", feature(rustdoc_internals))]
+#![cfg_attr(feature = "nightly", feature(step_trait))]
+#![warn(unreachable_pub)]
+// tidy-alphabetical-end
 
 use std::fmt;
+#[cfg(feature = "nightly")]
+use std::iter::Step;
 use std::num::{NonZeroUsize, ParseIntError};
 use std::ops::{Add, AddAssign, Mul, RangeInclusive, Sub};
 use std::str::FromStr;
 
 use bitflags::bitflags;
-use rustc_index::{Idx, IndexSlice, IndexVec};
-
 #[cfg(feature = "nightly")]
 use rustc_data_structures::stable_hasher::StableOrd;
+use rustc_index::{Idx, IndexSlice, IndexVec};
 #[cfg(feature = "nightly")]
 use rustc_macros::HashStable_Generic;
 #[cfg(feature = "nightly")]
 use rustc_macros::{Decodable_Generic, Encodable_Generic};
-#[cfg(feature = "nightly")]
-use std::iter::Step;
 
 mod layout;
 #[cfg(test)]
 mod tests;
 
-pub use layout::LayoutCalculator;
+pub use layout::{LayoutCalculator, LayoutCalculatorError};
 
 /// Requirements for a `StableHashingContext` to be used in this crate.
 /// This is a hack to allow using the `HashStable_Generic` derive macro
@@ -41,14 +43,17 @@ bitflags! {
         const IS_SIMD            = 1 << 1;
         const IS_TRANSPARENT     = 1 << 2;
         // Internal only for now. If true, don't reorder fields.
+        // On its own it does not prevent ABI optimizations.
         const IS_LINEAR          = 1 << 3;
-        // If true, the type's layout can be randomized using
-        // the seed stored in `ReprOptions.field_shuffle_seed`
+        // If true, the type's crate has opted into layout randomization.
+        // Other flags can still inhibit reordering and thus randomization.
+        // The seed stored in `ReprOptions.field_shuffle_seed`.
         const RANDOMIZE_LAYOUT   = 1 << 4;
         // Any of these flags being set prevent field reordering optimisation.
-        const IS_UNOPTIMISABLE   = ReprFlags::IS_C.bits()
+        const FIELD_ORDER_UNOPTIMIZABLE   = ReprFlags::IS_C.bits()
                                  | ReprFlags::IS_SIMD.bits()
                                  | ReprFlags::IS_LINEAR.bits();
+        const ABI_UNOPTIMIZABLE = ReprFlags::IS_C.bits() | ReprFlags::IS_SIMD.bits();
     }
 }
 
@@ -137,23 +142,20 @@ impl ReprOptions {
         self.c() || self.int.is_some()
     }
 
-    /// Returns `true` if this `#[repr()]` should inhibit struct field reordering
-    /// optimizations, such as with `repr(C)`, `repr(packed(1))`, or `repr(<int>)`.
-    pub fn inhibit_struct_field_reordering_opt(&self) -> bool {
-        if let Some(pack) = self.pack {
-            if pack.bytes() == 1 {
-                return true;
-            }
-        }
+    pub fn inhibit_newtype_abi_optimization(&self) -> bool {
+        self.flags.intersects(ReprFlags::ABI_UNOPTIMIZABLE)
+    }
 
-        self.flags.intersects(ReprFlags::IS_UNOPTIMISABLE) || self.int.is_some()
+    /// Returns `true` if this `#[repr()]` guarantees a fixed field order,
+    /// e.g. `repr(C)` or `repr(<int>)`.
+    pub fn inhibit_struct_field_reordering(&self) -> bool {
+        self.flags.intersects(ReprFlags::FIELD_ORDER_UNOPTIMIZABLE) || self.int.is_some()
     }
 
     /// Returns `true` if this type is valid for reordering and `-Z randomize-layout`
     /// was enabled for its declaration crate.
     pub fn can_randomize_type_layout(&self) -> bool {
-        !self.inhibit_struct_field_reordering_opt()
-            && self.flags.contains(ReprFlags::RANDOMIZE_LAYOUT)
+        !self.inhibit_struct_field_reordering() && self.flags.contains(ReprFlags::RANDOMIZE_LAYOUT)
     }
 
     /// Returns `true` if this `#[repr()]` should inhibit union ABI optimisations.
@@ -335,23 +337,21 @@ impl TargetDataLayout {
         Ok(dl)
     }
 
-    /// Returns exclusive upper bound on object size.
+    /// Returns **exclusive** upper bound on object size in bytes.
     ///
     /// The theoretical maximum object size is defined as the maximum positive `isize` value.
     /// This ensures that the `offset` semantics remain well-defined by allowing it to correctly
     /// index every address within an object along with one byte past the end, along with allowing
     /// `isize` to store the difference between any two pointers into an object.
     ///
-    /// The upper bound on 64-bit currently needs to be lower because LLVM uses a 64-bit integer
-    /// to represent object size in bits. It would need to be 1 << 61 to account for this, but is
-    /// currently conservatively bounded to 1 << 47 as that is enough to cover the current usable
-    /// address space on 64-bit ARMv8 and x86_64.
+    /// LLVM uses a 64-bit integer to represent object size in *bits*, but we care only for bytes,
+    /// so we adopt such a more-constrained size bound due to its technical limitations.
     #[inline]
     pub fn obj_size_bound(&self) -> u64 {
         match self.pointer_size.bits() {
             16 => 1 << 15,
             32 => 1 << 31,
-            64 => 1 << 47,
+            64 => 1 << 61,
             bits => panic!("obj_size_bound: unknown pointer bit size {bits}"),
         }
     }
@@ -388,6 +388,14 @@ impl HasDataLayout for TargetDataLayout {
     #[inline]
     fn data_layout(&self) -> &TargetDataLayout {
         self
+    }
+}
+
+// used by rust-analyzer
+impl HasDataLayout for &TargetDataLayout {
+    #[inline]
+    fn data_layout(&self) -> &TargetDataLayout {
+        (**self).data_layout()
     }
 }
 
@@ -432,11 +440,13 @@ pub struct Size {
     raw: u64,
 }
 
-// Safety: Ord is implement as just comparing numerical values and numerical values
-// are not changed by (de-)serialization.
 #[cfg(feature = "nightly")]
-unsafe impl StableOrd for Size {
+impl StableOrd for Size {
     const CAN_USE_UNSTABLE_SORT: bool = true;
+
+    // `Ord` is implemented as just comparing numerical values and numerical values
+    // are not changed by (de-)serialization.
+    const THIS_IMPLEMENTATION_HAS_BEEN_TRIPLE_CHECKED: () = ();
 }
 
 // This is debug-printed a lot in larger structs, don't waste too much space there
@@ -520,7 +530,7 @@ impl Size {
     /// Truncates `value` to `self` bits and then sign-extends it to 128 bits
     /// (i.e., if it is negative, fill with 1's on the left).
     #[inline]
-    pub fn sign_extend(self, value: u128) -> u128 {
+    pub fn sign_extend(self, value: u128) -> i128 {
         let size = self.bits();
         if size == 0 {
             // Truncated until nothing is left.
@@ -530,7 +540,7 @@ impl Size {
         let shift = 128 - size;
         // Shift the unsigned value to the left, then shift back to the right as signed
         // (essentially fills with sign bit on the left).
-        (((value << shift) as i128) >> shift) as u128
+        ((value << shift) as i128) >> shift
     }
 
     /// Truncates `value` to `self` bits.
@@ -548,7 +558,7 @@ impl Size {
 
     #[inline]
     pub fn signed_int_min(&self) -> i128 {
-        self.sign_extend(1_u128 << (self.bits() - 1)) as i128
+        self.sign_extend(1_u128 << (self.bits() - 1))
     }
 
     #[inline]
@@ -630,7 +640,7 @@ impl Step for Size {
 
     #[inline]
     unsafe fn forward_unchecked(start: Self, count: usize) -> Self {
-        Self::from_bytes(u64::forward_unchecked(start.bytes(), count))
+        Self::from_bytes(unsafe { u64::forward_unchecked(start.bytes(), count) })
     }
 
     #[inline]
@@ -645,7 +655,7 @@ impl Step for Size {
 
     #[inline]
     unsafe fn backward_unchecked(start: Self, count: usize) -> Self {
-        Self::from_bytes(u64::backward_unchecked(start.bytes(), count))
+        Self::from_bytes(unsafe { u64::backward_unchecked(start.bytes(), count) })
     }
 }
 
@@ -777,6 +787,14 @@ impl Align {
 }
 
 /// A pair of alignments, ABI-mandated and preferred.
+///
+/// The "preferred" alignment is an LLVM concept that is virtually meaningless to Rust code:
+/// it is not exposed semantically to programmers nor can they meaningfully affect it.
+/// The only concern for us is that preferred alignment must not be less than the mandated alignment
+/// and thus in practice the two values are almost always identical.
+///
+/// An example of a rare thing actually affected by preferred alignment is aligning of statics.
+/// It is of effectively no consequence for layout in structs and on the stack.
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 #[cfg_attr(feature = "nightly", derive(HashStable_Generic))]
 pub struct AbiAndPrefAlign {
@@ -813,6 +831,28 @@ pub enum Integer {
 }
 
 impl Integer {
+    pub fn int_ty_str(self) -> &'static str {
+        use Integer::*;
+        match self {
+            I8 => "i8",
+            I16 => "i16",
+            I32 => "i32",
+            I64 => "i64",
+            I128 => "i128",
+        }
+    }
+
+    pub fn uint_ty_str(self) -> &'static str {
+        use Integer::*;
+        match self {
+            I8 => "u8",
+            I16 => "u16",
+            I32 => "u32",
+            I64 => "u64",
+            I128 => "u128",
+        }
+    }
+
     #[inline]
     pub fn size(self) -> Size {
         use Integer::*;
@@ -1098,13 +1138,10 @@ impl Scalar {
     #[inline]
     pub fn is_bool(&self) -> bool {
         use Integer::*;
-        matches!(
-            self,
-            Scalar::Initialized {
-                value: Primitive::Int(I8, false),
-                valid_range: WrappingRange { start: 0, end: 1 }
-            }
-        )
+        matches!(self, Scalar::Initialized {
+            value: Primitive::Int(I8, false),
+            valid_range: WrappingRange { start: 0, end: 1 }
+        })
     }
 
     /// Get the primitive representation of this type, ignoring the valid range and whether the
@@ -1432,7 +1469,7 @@ pub enum Variants<FieldIdx: Idx, VariantIdx: Idx> {
     /// Single enum variants, structs/tuples, unions, and all non-ADTs.
     Single { index: VariantIdx },
 
-    /// Enum-likes with more than one inhabited variant: each variant comes with
+    /// Enum-likes with more than one variant: each variant comes with
     /// a *discriminant* (usually the same as the variant index but the user can
     /// assign explicit discriminant values). That discriminant is encoded
     /// as a *tag* on the machine. The layout of each variant is
@@ -1703,7 +1740,9 @@ impl<FieldIdx: Idx, VariantIdx: Idx> LayoutS<FieldIdx, VariantIdx> {
 
     /// Checks if these two `Layout` are equal enough to be considered "the same for all function
     /// call ABIs". Note however that real ABIs depend on more details that are not reflected in the
-    /// `Layout`; the `PassMode` need to be compared as well.
+    /// `Layout`; the `PassMode` need to be compared as well. Also note that we assume
+    /// aggregates are passed via `PassMode::Indirect` or `PassMode::Cast`; more strict
+    /// checks would otherwise be required.
     pub fn eq_abi(&self, other: &Self) -> bool {
         // The one thing that we are not capturing here is that for unsized types, the metadata must
         // also have the same ABI, and moreover that the same metadata leads to the same size. The

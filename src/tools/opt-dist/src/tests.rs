@@ -1,8 +1,9 @@
-use crate::environment::{executable_extension, Environment};
-use crate::exec::cmd;
-use crate::utils::io::{copy_directory, find_file_in_dir, unpack_archive};
 use anyhow::Context;
 use camino::{Utf8Path, Utf8PathBuf};
+
+use crate::environment::{Environment, executable_extension};
+use crate::exec::cmd;
+use crate::utils::io::{copy_directory, find_file_in_dir, unpack_archive};
 
 /// Run tests on optimized dist artifacts.
 pub fn run_tests(env: &Environment) -> anyhow::Result<()> {
@@ -66,6 +67,7 @@ change-id = 115898
 [build]
 rustc = "{rustc}"
 cargo = "{cargo}"
+local-rebuild = true
 
 [target.{host_triple}]
 llvm-config = "{llvm_config}"
@@ -94,7 +96,6 @@ llvm-config = "{llvm_config}"
         "tests/incremental",
         "tests/mir-opt",
         "tests/pretty",
-        "tests/run-pass-valgrind",
         "tests/ui",
         "tests/crashes",
     ];

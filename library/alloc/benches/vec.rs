@@ -1,6 +1,7 @@
-use rand::RngCore;
 use std::iter::repeat;
-use test::{black_box, Bencher};
+
+use rand::RngCore;
+use test::{Bencher, black_box};
 
 #[bench]
 fn bench_new(b: &mut Bencher) {

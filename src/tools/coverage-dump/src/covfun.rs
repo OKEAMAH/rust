@@ -1,9 +1,11 @@
-use crate::parser::{unescape_llvm_string_contents, Parser};
-use anyhow::{anyhow, Context};
-use regex::Regex;
 use std::collections::HashMap;
 use std::fmt::{self, Debug, Write as _};
 use std::sync::OnceLock;
+
+use anyhow::{Context, anyhow};
+use regex::Regex;
+
+use crate::parser::{Parser, unescape_llvm_string_contents};
 
 pub(crate) fn dump_covfun_mappings(
     llvm_ir: &str,

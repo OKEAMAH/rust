@@ -9,14 +9,15 @@
 //! within the `SourceMap`, which upon request can be converted to line and column
 //! information, source code snippets, etc.
 
-use crate::*;
+use std::io::{self, BorrowedBuf, Read};
+use std::{fs, path};
+
 use rustc_data_structures::sync::{IntoDynSyncSend, MappedReadGuard, ReadGuard, RwLock};
 use rustc_data_structures::unhash::UnhashMap;
 use rustc_macros::{Decodable, Encodable};
-use std::fs;
-use std::io::{self, BorrowedBuf, Read};
-use std::path;
 use tracing::{debug, instrument, trace};
+
+use crate::*;
 
 #[cfg(test)]
 mod tests;
@@ -174,6 +175,7 @@ pub struct SourceMapInputs {
     pub file_loader: Box<dyn FileLoader + Send + Sync>,
     pub path_mapping: FilePathMapping,
     pub hash_kind: SourceFileHashAlgorithm,
+    pub checksum_hash_kind: Option<SourceFileHashAlgorithm>,
 }
 
 pub struct SourceMap {
@@ -186,6 +188,12 @@ pub struct SourceMap {
 
     /// The algorithm used for hashing the contents of each source file.
     hash_kind: SourceFileHashAlgorithm,
+
+    /// Similar to `hash_kind`, however this algorithm is used for checksums to determine if a crate is fresh.
+    /// `cargo` is the primary user of these.
+    ///
+    /// If this is equal to `hash_kind` then the checksum won't be computed twice.
+    checksum_hash_kind: Option<SourceFileHashAlgorithm>,
 }
 
 impl SourceMap {
@@ -194,17 +202,19 @@ impl SourceMap {
             file_loader: Box::new(RealFileLoader),
             path_mapping,
             hash_kind: SourceFileHashAlgorithm::Md5,
+            checksum_hash_kind: None,
         })
     }
 
     pub fn with_inputs(
-        SourceMapInputs { file_loader, path_mapping, hash_kind }: SourceMapInputs,
+        SourceMapInputs { file_loader, path_mapping, hash_kind, checksum_hash_kind }: SourceMapInputs,
     ) -> SourceMap {
         SourceMap {
             files: Default::default(),
             file_loader: IntoDynSyncSend(file_loader),
             path_mapping,
             hash_kind,
+            checksum_hash_kind,
         }
     }
 
@@ -306,7 +316,8 @@ impl SourceMap {
         match self.source_file_by_stable_id(stable_id) {
             Some(lrc_sf) => Ok(lrc_sf),
             None => {
-                let source_file = SourceFile::new(filename, src, self.hash_kind)?;
+                let source_file =
+                    SourceFile::new(filename, src, self.hash_kind, self.checksum_hash_kind)?;
 
                 // Let's make sure the file_id we generated above actually matches
                 // the ID we generate for the SourceFile we just created.
@@ -325,12 +336,12 @@ impl SourceMap {
         &self,
         filename: FileName,
         src_hash: SourceFileHash,
+        checksum_hash: Option<SourceFileHash>,
         stable_id: StableSourceFileId,
         source_len: u32,
         cnum: CrateNum,
         file_local_lines: FreezeLock<SourceFileLines>,
         multibyte_chars: Vec<MultiByteChar>,
-        non_narrow_chars: Vec<NonNarrowChar>,
         normalized_pos: Vec<NormalizedPos>,
         metadata_index: u32,
     ) -> Lrc<SourceFile> {
@@ -340,6 +351,7 @@ impl SourceMap {
             name: filename,
             src: None,
             src_hash,
+            checksum_hash,
             external_src: FreezeLock::new(ExternalSource::Foreign {
                 kind: ExternalSourceKind::AbsentOk,
                 metadata_index,
@@ -348,7 +360,6 @@ impl SourceMap {
             source_len,
             lines: file_local_lines,
             multibyte_chars,
-            non_narrow_chars,
             normalized_pos,
             stable_id,
             cnum,
@@ -780,7 +791,7 @@ impl SourceMap {
                     return Ok(false);
                 }
             }
-            return Ok(true);
+            Ok(true)
         })
         .is_ok_and(|is_accessible| is_accessible)
     }

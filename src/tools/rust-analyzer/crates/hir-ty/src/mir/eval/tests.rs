@@ -1,5 +1,5 @@
-use base_db::FileId;
 use hir_def::db::DefDatabase;
+use span::{Edition, EditionedFileId};
 use syntax::{TextRange, TextSize};
 use test_fixture::WithFixture;
 
@@ -7,7 +7,7 @@ use crate::{db::HirDatabase, test_db::TestDB, Interner, Substitution};
 
 use super::{interpret_mir, MirEvalError};
 
-fn eval_main(db: &TestDB, file_id: FileId) -> Result<(String, String), MirEvalError> {
+fn eval_main(db: &TestDB, file_id: EditionedFileId) -> Result<(String, String), MirEvalError> {
     let module_id = db.module_for_file(file_id);
     let def_map = module_id.def_map(db);
     let scope = &def_map[module_id.local_id].scope;
@@ -15,7 +15,7 @@ fn eval_main(db: &TestDB, file_id: FileId) -> Result<(String, String), MirEvalEr
         .declarations()
         .find_map(|x| match x {
             hir_def::ModuleDefId::FunctionId(x) => {
-                if db.function_data(x).name.display(db).to_string() == "main" {
+                if db.function_data(x).name.display(db, Edition::CURRENT).to_string() == "main" {
                     Some(x)
                 } else {
                     None
@@ -63,7 +63,7 @@ fn check_pass_and_stdio(ra_fixture: &str, expected_stdout: &str, expected_stderr
             let span_formatter = |file, range: TextRange| {
                 format!("{:?} {:?}..{:?}", file, line_index(range.start()), line_index(range.end()))
             };
-            e.pretty_print(&mut err, &db, span_formatter).unwrap();
+            e.pretty_print(&mut err, &db, span_formatter, Edition::CURRENT).unwrap();
             panic!("Error in interpreting: {err}");
         }
         Ok((stdout, stderr)) => {
@@ -77,7 +77,7 @@ fn check_panic(ra_fixture: &str, expected_panic: &str) {
     let (db, file_ids) = TestDB::with_many_files(ra_fixture);
     let file_id = *file_ids.last().unwrap();
     let e = eval_main(&db, file_id).unwrap_err();
-    assert_eq!(e.is_panic().unwrap_or_else(|| panic!("unexpected error: {:?}", e)), expected_panic);
+    assert_eq!(e.is_panic().unwrap_or_else(|| panic!("unexpected error: {e:?}")), expected_panic);
 }
 
 #[test]
@@ -399,7 +399,7 @@ extern "C" {
     fn memcmp(s1: *const u8, s2: *const u8, n: usize) -> i32;
 }
 
-fn my_cmp(x: &[u8], y: &[u8]) -> i32 {
+fn my_cmp(x: &[u8; 3], y: &[u8; 3]) -> i32 {
     memcmp(x as *const u8, y as *const u8, x.len())
 }
 
@@ -779,6 +779,7 @@ fn main() {
 fn posix_getenv() {
     check_pass(
         r#"
+//- minicore: sized
 //- /main.rs env:foo=bar
 
 type c_char = u8;
@@ -849,7 +850,7 @@ fn main() {
 fn regression_14966() {
     check_pass(
         r#"
-//- minicore: fn, copy, coerce_unsized
+//- minicore: fn, copy, coerce_unsized, dispatch_from_dyn
 trait A<T> {
     fn a(&self) {}
 }

@@ -145,7 +145,7 @@ To log all communication between the server and the client, there are two choice
   ```
   env RA_LOG=lsp_server=debug code .
   ```
-* You can log on the client side, by enabling `"rust-analyzer.trace.server": "verbose"` workspace setting.
+* You can log on the client side, by the `rust-analyzer: Toggle LSP Logs` command or enabling `"rust-analyzer.trace.server": "verbose"` workspace setting.
   These logs are shown in a separate tab in the output and could be used with LSP inspector.
   Kudos to [@DJMcNab](https://github.com/DJMcNab) for setting this awesome infra up!
 
@@ -178,7 +178,15 @@ RA_PROFILE=foo|bar|baz   // enabled only selected entries
 RA_PROFILE=*@3>10        // dump everything, up to depth 3, if it takes more than 10 ms
 ```
 
-In particular, I have `export RA_PROFILE='*>10'` in my shell profile.
+Some rust-analyzer contributors have `export RA_PROFILE='*>10'` in my shell profile.
+
+For machine-readable JSON output, we have the `RA_PROFILE_JSON` env variable. We support
+filtering only by span name:
+
+```
+RA_PROFILE=* // dump everything
+RA_PROFILE_JSON="vfs_load|parallel_prime_caches|discover_command" // dump selected spans
+```
 
 We also have a "counting" profiler which counts number of instances of popular structs.
 It is enabled by `RA_COUNT=1`.

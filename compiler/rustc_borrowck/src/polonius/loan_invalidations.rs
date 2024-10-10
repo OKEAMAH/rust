@@ -2,17 +2,20 @@ use rustc_data_structures::graph::dominators::Dominators;
 use rustc_middle::bug;
 use rustc_middle::mir::visit::Visitor;
 use rustc_middle::mir::{
-    self, BasicBlock, Body, FakeBorrowKind, Location, NonDivergingIntrinsic, Place, Rvalue,
+    self, BasicBlock, Body, BorrowKind, FakeBorrowKind, InlineAsmOperand, Location, Mutability,
+    NonDivergingIntrinsic, Operand, Place, Rvalue, Statement, StatementKind, Terminator,
+    TerminatorKind,
 };
-use rustc_middle::mir::{BorrowKind, Mutability, Operand};
-use rustc_middle::mir::{InlineAsmOperand, Terminator, TerminatorKind};
-use rustc_middle::mir::{Statement, StatementKind};
 use rustc_middle::ty::TyCtxt;
+use tracing::debug;
 
+use crate::borrow_set::BorrowSet;
+use crate::facts::AllFacts;
+use crate::location::LocationTable;
+use crate::path_utils::*;
 use crate::{
-    borrow_set::BorrowSet, facts::AllFacts, location::LocationTable, path_utils::*, AccessDepth,
-    Activation, ArtificialField, BorrowIndex, Deep, LocalMutationIsAllowed, Read, ReadKind,
-    ReadOrWrite, Reservation, Shallow, Write, WriteKind,
+    AccessDepth, Activation, ArtificialField, BorrowIndex, Deep, LocalMutationIsAllowed, Read,
+    ReadKind, ReadOrWrite, Reservation, Shallow, Write, WriteKind,
 };
 
 /// Emit `loan_invalidated_at` facts.
@@ -29,18 +32,18 @@ pub(super) fn emit_loan_invalidations<'tcx>(
     visitor.visit_body(body);
 }
 
-struct LoanInvalidationsGenerator<'cx, 'tcx> {
+struct LoanInvalidationsGenerator<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
-    all_facts: &'cx mut AllFacts,
-    location_table: &'cx LocationTable,
-    body: &'cx Body<'tcx>,
-    dominators: &'cx Dominators<BasicBlock>,
-    borrow_set: &'cx BorrowSet<'tcx>,
+    all_facts: &'a mut AllFacts,
+    location_table: &'a LocationTable,
+    body: &'a Body<'tcx>,
+    dominators: &'a Dominators<BasicBlock>,
+    borrow_set: &'a BorrowSet<'tcx>,
 }
 
 /// Visits the whole MIR and generates `invalidates()` facts.
 /// Most of the code implementing this was stolen from `borrow_check/mod.rs`.
-impl<'cx, 'tcx> Visitor<'tcx> for LoanInvalidationsGenerator<'cx, 'tcx> {
+impl<'a, 'tcx> Visitor<'tcx> for LoanInvalidationsGenerator<'a, 'tcx> {
     fn visit_statement(&mut self, statement: &Statement<'tcx>, location: Location) {
         self.check_activations(location);
 
@@ -125,6 +128,12 @@ impl<'cx, 'tcx> Visitor<'tcx> for LoanInvalidationsGenerator<'cx, 'tcx> {
                 }
                 self.mutate_place(location, *destination, Deep);
             }
+            TerminatorKind::TailCall { func, args, .. } => {
+                self.consume_operand(location, func);
+                for arg in args {
+                    self.consume_operand(location, &arg.node);
+                }
+            }
             TerminatorKind::Assert { cond, expected: _, msg, target: _, unwind: _ } => {
                 self.consume_operand(location, cond);
                 use rustc_middle::mir::AssertKind;
@@ -160,6 +169,7 @@ impl<'cx, 'tcx> Visitor<'tcx> for LoanInvalidationsGenerator<'cx, 'tcx> {
                 }
             }
             TerminatorKind::InlineAsm {
+                asm_macro: _,
                 template: _,
                 operands,
                 options: _,
@@ -203,7 +213,7 @@ impl<'cx, 'tcx> Visitor<'tcx> for LoanInvalidationsGenerator<'cx, 'tcx> {
     }
 }
 
-impl<'cx, 'tcx> LoanInvalidationsGenerator<'cx, 'tcx> {
+impl<'a, 'tcx> LoanInvalidationsGenerator<'a, 'tcx> {
     /// Simulates mutation of a place.
     fn mutate_place(&mut self, location: Location, place: Place<'tcx>, kind: AccessDepth) {
         self.access_place(
@@ -261,7 +271,7 @@ impl<'cx, 'tcx> LoanInvalidationsGenerator<'cx, 'tcx> {
                 self.access_place(location, place, access_kind, LocalMutationIsAllowed::No);
             }
 
-            &Rvalue::AddressOf(mutability, place) => {
+            &Rvalue::RawPtr(mutability, place) => {
                 let access_kind = match mutability {
                     Mutability::Mut => (
                         Deep,

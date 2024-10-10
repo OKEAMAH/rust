@@ -5,7 +5,7 @@
 
 extern crate proc_macro;
 
-use proc_macro::{quote, Delimiter, Group, Ident, Literal, Punct, Spacing, Span, TokenStream, TokenTree};
+use proc_macro::{Delimiter, Group, Ident, Literal, Punct, Spacing, Span, TokenStream, TokenTree, quote};
 
 #[proc_macro_derive(DeriveSomething)]
 pub fn derive(_: TokenStream) -> TokenStream {
@@ -167,5 +167,18 @@ pub fn derive_ignored_unit_pattern(_: TokenStream) -> TokenStream {
                 let _ = self.a().unwrap();
             }
         }
+    }
+}
+
+#[proc_macro_derive(NonCanonicalClone)]
+pub fn non_canonical_clone_derive(_: TokenStream) -> TokenStream {
+    quote! {
+        struct NonCanonicalClone;
+        impl Clone for NonCanonicalClone {
+            fn clone(&self) -> Self {
+                todo!()
+            }
+        }
+        impl Copy for NonCanonicalClone {}
     }
 }

@@ -1,13 +1,12 @@
 use rustc_ast as ast;
 use rustc_ast::visit::{self, AssocCtxt, FnCtxt, FnKind, Visitor};
-use rustc_ast::{attr, AssocConstraint, AssocConstraintKind, NodeId};
-use rustc_ast::{token, PatKind};
-use rustc_feature::{AttributeGate, BuiltinAttribute, Features, GateIssue, BUILTIN_ATTRIBUTE_MAP};
-use rustc_session::parse::{feature_err, feature_err_issue, feature_warn};
+use rustc_ast::{NodeId, PatKind, attr, token};
+use rustc_feature::{AttributeGate, BUILTIN_ATTRIBUTE_MAP, BuiltinAttribute, Features, GateIssue};
 use rustc_session::Session;
+use rustc_session::parse::{feature_err, feature_err_issue, feature_warn};
 use rustc_span::source_map::Spanned;
 use rustc_span::symbol::sym;
-use rustc_span::Span;
+use rustc_span::{Span, Symbol};
 use rustc_target::spec::abi;
 use thin_vec::ThinVec;
 
@@ -76,21 +75,8 @@ struct PostExpansionVisitor<'a> {
 
 impl<'a> PostExpansionVisitor<'a> {
     #[allow(rustc::untranslatable_diagnostic)] // FIXME: make this translatable
-    fn check_abi(&self, abi: ast::StrLit, constness: ast::Const) {
+    fn check_abi(&self, abi: ast::StrLit) {
         let ast::StrLit { symbol_unescaped, span, .. } = abi;
-
-        if let ast::Const::Yes(_) = constness {
-            match symbol_unescaped {
-                // Stable
-                sym::Rust | sym::C => {}
-                abi => gate!(
-                    &self,
-                    const_extern_fn,
-                    span,
-                    format!("`{}` as a `const fn` ABI is unstable", abi)
-                ),
-            }
-        }
 
         match abi::is_enabled(self.features, span, symbol_unescaped.as_str()) {
             Ok(()) => (),
@@ -111,9 +97,9 @@ impl<'a> PostExpansionVisitor<'a> {
         }
     }
 
-    fn check_extern(&self, ext: ast::Extern, constness: ast::Const) {
+    fn check_extern(&self, ext: ast::Extern) {
         if let ast::Extern::Explicit(abi, _) = ext {
-            self.check_abi(abi, constness);
+            self.check_abi(abi);
         }
     }
 
@@ -162,6 +148,22 @@ impl<'a> PostExpansionVisitor<'a> {
             crate::fluent_generated::ast_passes_forbidden_non_lifetime_param
         );
 
+        // FIXME(non_lifetime_binders): Const bound params are pretty broken.
+        // Let's keep users from using this feature accidentally.
+        if self.features.non_lifetime_binders {
+            let const_param_spans: Vec<_> = params
+                .iter()
+                .filter_map(|param| match param.kind {
+                    ast::GenericParamKind::Const { .. } => Some(param.ident.span),
+                    _ => None,
+                })
+                .collect();
+
+            if !const_param_spans.is_empty() {
+                self.sess.dcx().emit_err(errors::ForbiddenConstParam { const_param_spans });
+            }
+        }
+
         for param in params {
             if !param.bounds.is_empty() {
                 let spans: Vec<_> = param.bounds.iter().map(|b| b.span()).collect();
@@ -184,9 +186,9 @@ impl<'a> Visitor<'a> for PostExpansionVisitor<'a> {
         }
         // Check unstable flavors of the `#[doc]` attribute.
         if attr.has_name(sym::doc) {
-            for nested_meta in attr.meta_item_list().unwrap_or_default() {
+            for meta_item_inner in attr.meta_item_list().unwrap_or_default() {
                 macro_rules! gate_doc { ($($s:literal { $($name:ident => $feature:ident)* })*) => {
-                    $($(if nested_meta.has_name(sym::$name) {
+                    $($(if meta_item_inner.has_name(sym::$name) {
                         let msg = concat!("`#[doc(", stringify!($name), ")]` is ", $s);
                         gate!(self, $feature, attr.span, msg);
                     })*)*
@@ -224,7 +226,7 @@ impl<'a> Visitor<'a> for PostExpansionVisitor<'a> {
         match &i.kind {
             ast::ItemKind::ForeignMod(foreign_module) => {
                 if let Some(abi) = foreign_module.abi {
-                    self.check_abi(abi, ast::Const::No);
+                    self.check_abi(abi);
                 }
             }
 
@@ -326,7 +328,7 @@ impl<'a> Visitor<'a> for PostExpansionVisitor<'a> {
         match &ty.kind {
             ast::TyKind::BareFn(bare_fn_ty) => {
                 // Function pointers cannot be `const`
-                self.check_extern(bare_fn_ty.ext, ast::Const::No);
+                self.check_extern(bare_fn_ty.ext);
                 self.check_late_bound_lifetime_defs(&bare_fn_ty.generic_params);
             }
             ast::TyKind::Never => {
@@ -344,7 +346,7 @@ impl<'a> Visitor<'a> for PostExpansionVisitor<'a> {
         for predicate in &g.where_clause.predicates {
             match predicate {
                 ast::WherePredicate::BoundPredicate(bound_pred) => {
-                    // A type binding, eg `for<'c> Foo: Send+Clone+'c`
+                    // A type bound (e.g., `for<'c> Foo: Send + Clone + 'c`).
                     self.check_late_bound_lifetime_defs(&bound_pred.bound_generic_params);
                 }
                 _ => {}
@@ -431,7 +433,7 @@ impl<'a> Visitor<'a> for PostExpansionVisitor<'a> {
     fn visit_fn(&mut self, fn_kind: FnKind<'a>, span: Span, _: NodeId) {
         if let Some(header) = fn_kind.header() {
             // Stability of const fn methods are covered in `visit_assoc_item` below.
-            self.check_extern(header.ext, header.constness);
+            self.check_extern(header.ext);
         }
 
         if let FnKind::Closure(ast::ClosureBinder::For { generic_params, .. }, ..) = fn_kind {
@@ -443,23 +445,6 @@ impl<'a> Visitor<'a> for PostExpansionVisitor<'a> {
         }
 
         visit::walk_fn(self, fn_kind)
-    }
-
-    fn visit_assoc_constraint(&mut self, constraint: &'a AssocConstraint) {
-        if let AssocConstraintKind::Bound { .. } = constraint.kind {
-            if let Some(ast::GenericArgs::Parenthesized(args)) = constraint.gen_args.as_ref()
-                && args.inputs.is_empty()
-                && matches!(args.output, ast::FnRetTy::Default(..))
-            {
-                gate!(
-                    &self,
-                    return_type_notation,
-                    constraint.span,
-                    "return type notation is experimental"
-                );
-            }
-        }
-        visit::walk_assoc_constraint(self, constraint)
     }
 
     fn visit_assoc_item(&mut self, i: &'a ast::AssocItem, ctxt: AssocCtxt) {
@@ -498,6 +483,8 @@ impl<'a> Visitor<'a> for PostExpansionVisitor<'a> {
 pub fn check_crate(krate: &ast::Crate, sess: &Session, features: &Features) {
     maybe_stage_features(sess, features, krate);
     check_incompatible_features(sess, features);
+    check_new_solver_banned_features(sess, features);
+
     let mut visitor = PostExpansionVisitor { sess, features };
 
     let spans = sess.psess.gated_spans.spans.borrow();
@@ -541,7 +528,6 @@ pub fn check_crate(krate: &ast::Crate, sess: &Session, features: &Features) {
         }
     }
     gate_all!(gen_blocks, "gen blocks are experimental");
-    gate_all!(raw_ref_op, "raw address of syntax is experimental");
     gate_all!(const_trait_impl, "const trait impls are experimental");
     gate_all!(
         half_open_range_patterns_in_slices,
@@ -559,8 +545,8 @@ pub fn check_crate(krate: &ast::Crate, sess: &Session, features: &Features) {
     gate_all!(fn_delegation, "functions delegation is not yet fully implemented");
     gate_all!(postfix_match, "postfix match is experimental");
     gate_all!(mut_ref, "mutable by-reference bindings are experimental");
-    gate_all!(precise_capturing, "precise captures on `impl Trait` are experimental");
     gate_all!(global_registration, "global registration is experimental");
+    gate_all!(return_type_notation, "return type notation is experimental");
 
     if !visitor.features.never_patterns {
         if let Some(spans) = spans.get(&sym::never_patterns) {
@@ -606,10 +592,6 @@ pub fn check_crate(krate: &ast::Crate, sess: &Session, features: &Features) {
 
     gate_all_legacy_dont_use!(box_patterns, "box pattern syntax is experimental");
     gate_all_legacy_dont_use!(trait_alias, "trait aliases are experimental");
-    // Despite being a new feature, `where T: Trait<Assoc(): Sized>`, which is RTN syntax now,
-    // used to be gated under associated_type_bounds, which are right above, so RTN needs to
-    // be too.
-    gate_all_legacy_dont_use!(return_type_notation, "return type notation is experimental");
     gate_all_legacy_dont_use!(decl_macro, "`macro` is experimental");
     gate_all_legacy_dont_use!(try_blocks, "`try` blocks are unstable");
     gate_all_legacy_dont_use!(auto_traits, "`auto` traits are unstable");
@@ -622,8 +604,7 @@ fn maybe_stage_features(sess: &Session, features: &Features, krate: &ast::Crate)
     // does not check the same for lib features unless there's at least one
     // declared lang feature
     if !sess.opts.unstable_features.is_nightly_build() {
-        let lang_features = &features.declared_lang_features;
-        if lang_features.len() == 0 {
+        if features.declared_features.is_empty() {
             return;
         }
         for attr in krate.attrs.iter().filter(|attr| attr.has_name(sym::feature)) {
@@ -639,7 +620,8 @@ fn maybe_stage_features(sess: &Session, features: &Features, krate: &ast::Crate)
                 attr.meta_item_list().into_iter().flatten().flat_map(|nested| nested.ident())
             {
                 let name = ident.name;
-                let stable_since = lang_features
+                let stable_since = features
+                    .declared_lang_features
                     .iter()
                     .flat_map(|&(feature, _, since)| if feature == name { since } else { None })
                     .next();
@@ -680,5 +662,24 @@ fn check_incompatible_features(sess: &Session, features: &Features) {
                 });
             }
         }
+    }
+}
+
+fn check_new_solver_banned_features(sess: &Session, features: &Features) {
+    if !sess.opts.unstable_opts.next_solver.is_some_and(|n| n.globally) {
+        return;
+    }
+
+    // Ban GCE with the new solver, because it does not implement GCE correctly.
+    if let Some(&(_, gce_span, _)) = features
+        .declared_lang_features
+        .iter()
+        .find(|&&(feat, _, _)| feat == sym::generic_const_exprs)
+    {
+        sess.dcx().emit_err(errors::IncompatibleFeatures {
+            spans: vec![gce_span],
+            f1: Symbol::intern("-Znext-solver=globally"),
+            f2: sym::generic_const_exprs,
+        });
     }
 }

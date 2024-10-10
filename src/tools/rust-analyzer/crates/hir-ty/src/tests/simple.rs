@@ -397,8 +397,10 @@ fn infer_literals() {
         r##"
         fn test() {
             5i32;
+            5f16;
             5f32;
             5f64;
+            5f128;
             "hello";
             b"bytes";
             'c';
@@ -421,26 +423,28 @@ h";
         }
         "##,
         expect![[r##"
-            18..478 '{     ...     }': ()
+            18..515 '{     ...     }': ()
             32..36 '5i32': i32
-            50..54 '5f32': f32
-            68..72 '5f64': f64
-            86..93 '"hello"': &'static str
-            107..115 'b"bytes"': &'static [u8; 5]
-            129..132 ''c'': char
-            146..150 'b'b'': u8
-            164..168 '3.14': f64
-            182..186 '5000': i32
-            200..205 'false': bool
-            219..223 'true': bool
-            237..333 'r#"   ...    "#': &'static str
-            347..357 'br#"yolo"#': &'static [u8; 4]
-            375..376 'a': &'static [u8; 4]
-            379..403 'b"a\x2...    c"': &'static [u8; 4]
-            421..422 'b': &'static [u8; 4]
-            425..433 'br"g\ h"': &'static [u8; 4]
-            451..452 'c': &'static [u8; 6]
-            455..467 'br#"x"\"yb"#': &'static [u8; 6]
+            50..54 '5f16': f16
+            68..72 '5f32': f32
+            86..90 '5f64': f64
+            104..109 '5f128': f128
+            123..130 '"hello"': &'static str
+            144..152 'b"bytes"': &'static [u8; 5]
+            166..169 ''c'': char
+            183..187 'b'b'': u8
+            201..205 '3.14': f64
+            219..223 '5000': i32
+            237..242 'false': bool
+            256..260 'true': bool
+            274..370 'r#"   ...    "#': &'static str
+            384..394 'br#"yolo"#': &'static [u8; 4]
+            412..413 'a': &'static [u8; 4]
+            416..440 'b"a\x2...    c"': &'static [u8; 4]
+            458..459 'b': &'static [u8; 4]
+            462..470 'br"g\ h"': &'static [u8; 4]
+            488..489 'c': &'static [u8; 6]
+            492..504 'br#"x"\"yb"#': &'static [u8; 6]
         "##]],
     );
 }
@@ -913,7 +917,7 @@ fn test(a: A<i32>) {
             278..279 'A': extern "rust-call" A<i32>(*mut i32) -> A<i32>
             278..292 'A(0 as *mut _)': A<i32>
             278..307 'A(0 as...B(a)))': &'? i32
-            280..281 '0': i32
+            280..281 '0': usize
             280..291 '0 as *mut _': *mut i32
             297..306 '&&B(B(a))': &'? &'? B<B<A<i32>>>
             298..306 '&B(B(a))': &'? B<B<A<i32>>>
@@ -1197,8 +1201,8 @@ fn infer_array() {
             209..215 '[1, 2]': [i32; 2]
             210..211 '1': i32
             213..214 '2': i32
-            225..226 'i': [&'? str; 2]
-            229..239 '["a", "b"]': [&'? str; 2]
+            225..226 'i': [&'static str; 2]
+            229..239 '["a", "b"]': [&'static str; 2]
             230..233 '"a"': &'static str
             235..238 '"b"': &'static str
             250..251 'b': [[&'? str; 1]; 2]
@@ -3568,6 +3572,7 @@ fn f<T>(t: Ark<T>) {
 fn ref_to_array_to_ptr_cast() {
     check_types(
         r#"
+//- minicore: sized
 fn default<T>() -> T { loop {} }
 fn foo() {
     let arr = [default()];
@@ -3680,5 +3685,38 @@ fn main() {
     }
 }
 "#,
+    );
+}
+
+#[test]
+fn infer_bad_lang_item() {
+    check_infer(
+        r#"
+#[lang="eq"]
+pub trait Eq {
+    fn eq(&self, ) -> bool;
+
+}
+
+#[lang="shr"]
+pub trait Shr<RHS,Result> {
+    fn shr(&self, rhs: &RHS) -> Result;
+}
+
+fn test() -> bool {
+    1 >> 1;
+    1 == 1;
+}
+"#,
+        expect![[r#"
+            39..43 'self': &'? Self
+            114..118 'self': &'? Self
+            120..123 'rhs': &'? RHS
+            163..190 '{     ...= 1; }': bool
+            169..170 '1': i32
+            169..175 '1 >> 1': {unknown}
+            181..182 '1': i32
+            181..187 '1 == 1': {unknown}
+        "#]],
     );
 }

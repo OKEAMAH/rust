@@ -1,17 +1,17 @@
-use super::operand::OperandValue;
-use super::{FunctionCx, LocalRef};
-
-use crate::common::IntPredicate;
-use crate::size_of_val;
-use crate::traits::*;
-
-use rustc_middle::bug;
-use rustc_middle::mir;
+use rustc_abi::Primitive::{Int, Pointer};
+use rustc_abi::{Align, FieldsShape, Size, TagEncoding, Variants};
 use rustc_middle::mir::tcx::PlaceTy;
 use rustc_middle::ty::layout::{HasTyCtxt, LayoutOf, TyAndLayout};
 use rustc_middle::ty::{self, Ty};
-use rustc_target::abi::{Align, FieldsShape, Int, Pointer, Size, TagEncoding};
-use rustc_target::abi::{VariantIdx, Variants};
+use rustc_middle::{bug, mir};
+use rustc_target::abi::VariantIdx;
+use tracing::{debug, instrument};
+
+use super::operand::OperandValue;
+use super::{FunctionCx, LocalRef};
+use crate::common::IntPredicate;
+use crate::size_of_val;
+use crate::traits::*;
 
 /// The location and extra runtime properties of the place.
 ///
@@ -54,7 +54,7 @@ impl<V: CodegenObject> PlaceValue<V> {
 
     /// Creates a `PlaceRef` to this location with the given type.
     pub fn with_type<'tcx>(self, layout: TyAndLayout<'tcx>) -> PlaceRef<'tcx, V> {
-        debug_assert!(
+        assert!(
             layout.is_unsized() || layout.abi.is_uninhabited() || self.llextra.is_none(),
             "Had pointer metadata {:?} for sized type {layout:?}",
             self.llextra,
@@ -108,8 +108,16 @@ impl<'a, 'tcx, V: CodegenObject> PlaceRef<'tcx, V> {
         bx: &mut Bx,
         layout: TyAndLayout<'tcx>,
     ) -> Self {
+        Self::alloca_size(bx, layout.size, layout)
+    }
+
+    pub fn alloca_size<Bx: BuilderMethods<'a, 'tcx, Value = V>>(
+        bx: &mut Bx,
+        size: Size,
+        layout: TyAndLayout<'tcx>,
+    ) -> Self {
         assert!(layout.is_sized(), "tried to statically allocate unsized place");
-        PlaceValue::alloca(bx, layout.size, layout.align.abi).with_type(layout)
+        PlaceValue::alloca(bx, size, layout.align.abi).with_type(layout)
     }
 
     /// Returns a place for an indirect reference to an unsized place.
@@ -125,7 +133,7 @@ impl<'a, 'tcx, V: CodegenObject> PlaceRef<'tcx, V> {
         Self::alloca(bx, ptr_layout)
     }
 
-    pub fn len<Cx: ConstMethods<'tcx, Value = V>>(&self, cx: &Cx) -> V {
+    pub fn len<Cx: ConstCodegenMethods<'tcx, Value = V>>(&self, cx: &Cx) -> V {
         if let FieldsShape::Array { count, .. } = self.layout.fields {
             if self.layout.is_unsized() {
                 assert_eq!(count, 0);
@@ -159,9 +167,9 @@ impl<'a, 'tcx, V: CodegenObject> PlaceRef<'tcx, V> {
                 bx.inbounds_ptradd(self.val.llval, bx.const_usize(offset.bytes()))
             };
             let val = PlaceValue {
-                    llval,
+                llval,
                 llextra: if bx.cx().type_has_metadata(field.ty) { self.val.llextra } else { None },
-                    align: effective_field_align,
+                align: effective_field_align,
             };
             val.with_type(field)
         };
@@ -407,11 +415,10 @@ impl<'a, 'tcx, V: CodegenObject> PlaceRef<'tcx, V> {
             layout.size
         };
 
-        let llval = bx.inbounds_gep(
-                    bx.cx().backend_type(self.layout),
-                    self.val.llval,
-                    &[bx.cx().const_usize(0), llindex],
-        );
+        let llval = bx.inbounds_gep(bx.cx().backend_type(self.layout), self.val.llval, &[
+            bx.cx().const_usize(0),
+            llindex,
+        ]);
         let align = self.val.align.restrict_for_offset(offset);
         PlaceValue::new_sized(llval, align).with_type(layout)
     }
@@ -462,10 +469,10 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
             LocalRef::Operand(..) => {
                 if place_ref.is_indirect_first_projection() {
                     base = 1;
-                    let cg_base = self.codegen_consume(
-                        bx,
-                        mir::PlaceRef { projection: &place_ref.projection[..0], ..place_ref },
-                    );
+                    let cg_base = self.codegen_consume(bx, mir::PlaceRef {
+                        projection: &place_ref.projection[..0],
+                        ..place_ref
+                    });
                     cg_base.deref(bx.cx())
                 } else {
                     bug!("using operand local {:?} as place", place_ref);
@@ -479,6 +486,11 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
             cg_base = match *elem {
                 mir::ProjectionElem::Deref => bx.load_operand(cg_base).deref(bx.cx()),
                 mir::ProjectionElem::Field(ref field, _) => {
+                    assert!(
+                        !cg_base.layout.ty.is_any_ptr(),
+                        "Bad PlaceRef: destructing pointers should use cast/PtrMetadata, \
+                         but tried to access field {field:?} of pointer {cg_base:?}",
+                    );
                     cg_base.project_field(bx, field.index())
                 }
                 mir::ProjectionElem::OpaqueCast(ty) => {

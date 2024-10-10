@@ -1,7 +1,6 @@
 use std::iter::Step;
 use std::marker::PhantomData;
-use std::ops::RangeBounds;
-use std::ops::{Bound, Range};
+use std::ops::{Bound, Range, RangeBounds};
 
 use smallvec::SmallVec;
 
@@ -18,8 +17,8 @@ mod tests;
 /// first value of the following element.
 #[derive(Debug, Clone)]
 pub struct IntervalSet<I> {
-    // Start, end
-    map: SmallVec<[(u32, u32); 4]>,
+    // Start, end (both inclusive)
+    map: SmallVec<[(u32, u32); 2]>,
     domain: usize,
     _data: PhantomData<I>,
 }

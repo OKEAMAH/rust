@@ -6,6 +6,7 @@
 use rustc_middle::mir::{Body, LocalKind, Location, START_BLOCK};
 use rustc_middle::ty::TyCtxt;
 use rustc_mir_dataflow::move_paths::{InitKind, InitLocation, MoveData};
+use tracing::debug;
 
 use crate::borrow_set::BorrowSet;
 use crate::facts::{AllFacts, PoloniusRegionVid};
@@ -43,8 +44,8 @@ pub(crate) fn emit_facts<'tcx>(
     emit_universal_region_facts(
         all_facts,
         borrow_set,
-        &universal_regions,
-        &universal_region_relations,
+        universal_regions,
+        universal_region_relations,
     );
     emit_cfg_and_loan_kills_facts(all_facts, tcx, location_table, body, borrow_set);
     emit_loan_invalidations_facts(all_facts, tcx, location_table, body, borrow_set);

@@ -81,10 +81,9 @@
 //! We generate various special nodes for various, well, special purposes.
 //! These are described in the `Liveness` struct.
 
-use crate::errors;
-
-use self::LiveNodeKind::*;
-use self::VarKind::*;
+use std::io;
+use std::io::prelude::*;
+use std::rc::Rc;
 
 use rustc_data_structures::fx::FxIndexMap;
 use rustc_hir as hir;
@@ -97,12 +96,13 @@ use rustc_middle::query::Providers;
 use rustc_middle::span_bug;
 use rustc_middle::ty::{self, RootVariableMinCaptureList, Ty, TyCtxt};
 use rustc_session::lint;
-use rustc_span::symbol::{kw, sym, Symbol};
+use rustc_span::symbol::{Symbol, kw, sym};
 use rustc_span::{BytePos, Span};
+use tracing::{debug, instrument};
 
-use std::io;
-use std::io::prelude::*;
-use std::rc::Rc;
+use self::LiveNodeKind::*;
+use self::VarKind::*;
+use crate::errors;
 
 mod rwu_table;
 
@@ -153,9 +153,8 @@ fn check_liveness(tcx: TyCtxt<'_>, def_id: LocalDefId) {
     }
 
     let mut maps = IrMaps::new(tcx);
-    let body_id = tcx.hir().body_owned_by(def_id);
-    let hir_id = tcx.hir().body_owner(body_id);
-    let body = tcx.hir().body(body_id);
+    let body = tcx.hir().body_owned_by(def_id);
+    let hir_id = tcx.hir().body_owner(body.id());
 
     if let Some(upvars) = tcx.upvars_mentioned(def_id) {
         for &var_hir_id in upvars.keys() {
@@ -166,20 +165,20 @@ fn check_liveness(tcx: TyCtxt<'_>, def_id: LocalDefId) {
 
     // gather up the various local variables, significant expressions,
     // and so forth:
-    maps.visit_body(body);
+    maps.visit_body(&body);
 
     // compute liveness
     let mut lsets = Liveness::new(&mut maps, def_id);
-    let entry_ln = lsets.compute(body, hir_id);
-    lsets.log_liveness(entry_ln, body_id.hir_id);
+    let entry_ln = lsets.compute(&body, hir_id);
+    lsets.log_liveness(entry_ln, body.id().hir_id);
 
     // check for various error conditions
-    lsets.visit_body(body);
+    lsets.visit_body(&body);
     lsets.warn_about_unused_upvars(entry_ln);
-    lsets.warn_about_unused_args(body, entry_ln);
+    lsets.warn_about_unused_args(&body, entry_ln);
 }
 
-pub fn provide(providers: &mut Providers) {
+pub(crate) fn provide(providers: &mut Providers) {
     *providers = Providers { check_liveness, ..*providers };
 }
 
@@ -1501,15 +1500,13 @@ impl<'tcx> Liveness<'_, 'tcx> {
                             );
                         }
                     }
-                } else {
-                    if let Some(name) = self.should_warn(var) {
-                        self.ir.tcx.emit_node_span_lint(
-                            lint::builtin::UNUSED_VARIABLES,
-                            var_hir_id,
-                            vec![span],
-                            errors::UnusedVarMaybeCaptureRef { name },
-                        );
-                    }
+                } else if let Some(name) = self.should_warn(var) {
+                    self.ir.tcx.emit_node_span_lint(
+                        lint::builtin::UNUSED_VARIABLES,
+                        var_hir_id,
+                        vec![span],
+                        errors::UnusedVarMaybeCaptureRef { name },
+                    );
                 }
             }
         }

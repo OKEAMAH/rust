@@ -2,7 +2,6 @@
 //!
 //! Based on cli flags, either spawns an LSP server, or runs a batch analysis
 
-#![warn(rust_2018_idioms, unused_lifetimes)]
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 #![cfg_attr(feature = "in-rust-tree", feature(rustc_private))]
 
@@ -15,7 +14,12 @@ use std::{env, fs, path::PathBuf, process::ExitCode, sync::Arc};
 
 use anyhow::Context;
 use lsp_server::Connection;
-use rust_analyzer::{cli::flags, config::Config, from_json};
+use paths::Utf8PathBuf;
+use rust_analyzer::{
+    cli::flags,
+    config::{Config, ConfigChange, ConfigErrors},
+    from_json,
+};
 use semver::Version;
 use tracing_subscriber::fmt::writer::BoxMakeWriter;
 use vfs::AbsPathBuf;
@@ -78,6 +82,7 @@ fn actual_main() -> anyhow::Result<ExitCode> {
         flags::RustAnalyzerCmd::Highlight(cmd) => cmd.run()?,
         flags::RustAnalyzerCmd::AnalysisStats(cmd) => cmd.run(verbosity)?,
         flags::RustAnalyzerCmd::Diagnostics(cmd) => cmd.run()?,
+        flags::RustAnalyzerCmd::UnresolvedReferences(cmd) => cmd.run()?,
         flags::RustAnalyzerCmd::Ssr(cmd) => cmd.run()?,
         flags::RustAnalyzerCmd::Search(cmd) => cmd.run()?,
         flags::RustAnalyzerCmd::Lsif(cmd) => cmd.run()?,
@@ -132,6 +137,7 @@ fn setup_logging(log_file_flag: Option<PathBuf>) -> anyhow::Result<()> {
         filter: env::var("RA_LOG").ok().unwrap_or_else(|| "error".to_owned()),
         chalk_filter: env::var("CHALK_DEBUG").ok(),
         profile_filter: env::var("RA_PROFILE").ok(),
+        json_profile_filter: std::env::var("RA_PROFILE_JSON").ok(),
     }
     .init()?;
 
@@ -172,6 +178,7 @@ fn run_server() -> anyhow::Result<()> {
             return Err(e.into());
         }
     };
+
     tracing::info!("InitializeParams: {}", initialize_params);
     let lsp_types::InitializeParams {
         root_uri,
@@ -185,6 +192,7 @@ fn run_server() -> anyhow::Result<()> {
     let root_path = match root_uri
         .and_then(|it| it.to_file_path().ok())
         .map(patch_path_prefix)
+        .and_then(|it| Utf8PathBuf::from_path_buf(it).ok())
         .and_then(|it| AbsPathBuf::try_from(it).ok())
     {
         Some(it) => it,
@@ -214,6 +222,7 @@ fn run_server() -> anyhow::Result<()> {
                 .into_iter()
                 .filter_map(|it| it.uri.to_file_path().ok())
                 .map(patch_path_prefix)
+                .filter_map(|it| Utf8PathBuf::from_path_buf(it).ok())
                 .filter_map(|it| AbsPathBuf::try_from(it).ok())
                 .collect::<Vec<_>>()
         })
@@ -222,14 +231,20 @@ fn run_server() -> anyhow::Result<()> {
     let mut config =
         Config::new(root_path, capabilities, workspace_roots, visual_studio_code_version);
     if let Some(json) = initialization_options {
-        if let Err(e) = config.update(json) {
+        let mut change = ConfigChange::default();
+        change.change_client_config(json);
+
+        let error_sink: ConfigErrors;
+        (config, error_sink, _) = config.apply_change(change);
+
+        if !error_sink.is_empty() {
             use lsp_types::{
                 notification::{Notification, ShowMessage},
                 MessageType, ShowMessageParams,
             };
             let not = lsp_server::Notification::new(
                 ShowMessage::METHOD.to_owned(),
-                ShowMessageParams { typ: MessageType::WARNING, message: e.to_string() },
+                ShowMessageParams { typ: MessageType::WARNING, message: error_sink.to_string() },
             );
             connection.sender.send(lsp_server::Message::Notification(not)).unwrap();
         }
@@ -255,7 +270,10 @@ fn run_server() -> anyhow::Result<()> {
         return Err(e.into());
     }
 
-    if !config.has_linked_projects() && config.detached_files().is_empty() {
+    if config.discover_workspace_config().is_none()
+        && !config.has_linked_projects()
+        && config.detached_files().is_empty()
+    {
         config.rediscover_workspaces();
     }
 

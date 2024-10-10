@@ -1,20 +1,22 @@
-use crate::errors::DumpVTableEntries;
-use crate::traits::{impossible_predicates, is_vtable_safe_method};
-use rustc_hir::def_id::DefId;
-use rustc_hir::lang_items::LangItem;
-use rustc_infer::traits::util::PredicateSet;
-use rustc_infer::traits::ImplSource;
-use rustc_middle::bug;
-use rustc_middle::query::Providers;
-use rustc_middle::traits::BuiltinImplSource;
-use rustc_middle::ty::visit::TypeVisitableExt;
-use rustc_middle::ty::GenericArgs;
-use rustc_middle::ty::{self, GenericParamDefKind, Ty, TyCtxt, Upcast, VtblEntry};
-use rustc_span::{sym, Span};
-use smallvec::{smallvec, SmallVec};
-
 use std::fmt::Debug;
 use std::ops::ControlFlow;
+
+use rustc_hir::def_id::DefId;
+use rustc_infer::infer::at::ToTrace;
+use rustc_infer::infer::{BoundRegionConversionTime, TyCtxtInferExt};
+use rustc_infer::traits::ObligationCause;
+use rustc_infer::traits::util::PredicateSet;
+use rustc_middle::bug;
+use rustc_middle::query::Providers;
+use rustc_middle::ty::{
+    self, GenericArgs, GenericParamDefKind, Ty, TyCtxt, TypeVisitableExt, Upcast, VtblEntry,
+};
+use rustc_span::{DUMMY_SP, Span, sym};
+use smallvec::{SmallVec, smallvec};
+use tracing::debug;
+
+use crate::errors::DumpVTableEntries;
+use crate::traits::{ObligationCtxt, impossible_predicates, is_vtable_safe_method};
 
 #[derive(Clone, Debug)]
 pub enum VtblSegment<'tcx> {
@@ -23,6 +25,8 @@ pub enum VtblSegment<'tcx> {
 }
 
 /// Prepare the segments for a vtable
+// FIXME: This should take a `PolyExistentialTraitRef`, since we don't care
+// about our `Self` type here.
 pub fn prepare_vtable_segments<'tcx, T>(
     tcx: TyCtxt<'tcx>,
     trait_ref: ty::PolyTraitRef<'tcx>,
@@ -121,11 +125,10 @@ fn prepare_vtable_segments_inner<'tcx, T>(
             let &(inner_most_trait_ref, _, _) = stack.last().unwrap();
 
             let mut direct_super_traits_iter = tcx
-                .super_predicates_of(inner_most_trait_ref.def_id())
-                .predicates
-                .into_iter()
+                .explicit_super_predicates_of(inner_most_trait_ref.def_id())
+                .iter_identity_copied()
                 .filter_map(move |(pred, _)| {
-                    pred.instantiate_supertrait(tcx, &inner_most_trait_ref).as_trait_clause()
+                    pred.instantiate_supertrait(tcx, inner_most_trait_ref).as_trait_clause()
                 });
 
             // Find an unvisited supertrait
@@ -289,13 +292,14 @@ fn vtable_entries<'tcx>(
                         return VtblEntry::Vacant;
                     }
 
-                    let instance = ty::Instance::resolve_for_vtable(
+                    let instance = ty::Instance::expect_resolve_for_vtable(
                         tcx,
                         ty::ParamEnv::reveal_all(),
                         def_id,
                         args,
-                    )
-                    .expect("resolution failed during building vtable representation");
+                        DUMMY_SP,
+                    );
+
                     VtblEntry::Method(instance)
                 });
 
@@ -320,30 +324,41 @@ fn vtable_entries<'tcx>(
     tcx.arena.alloc_from_iter(entries)
 }
 
-/// Find slot base for trait methods within vtable entries of another trait
-pub(super) fn vtable_trait_first_method_offset<'tcx>(
-    tcx: TyCtxt<'tcx>,
-    trait_to_be_found: ty::PolyTraitRef<'tcx>,
-    trait_owning_vtable: ty::PolyTraitRef<'tcx>,
-) -> usize {
-    // #90177
-    let trait_to_be_found_erased = tcx.erase_regions(trait_to_be_found);
+// Given a `dyn Subtrait: Supertrait` trait ref, find corresponding first slot
+// for `Supertrait`'s methods in the vtable of `Subtrait`.
+pub(crate) fn first_method_vtable_slot<'tcx>(tcx: TyCtxt<'tcx>, key: ty::TraitRef<'tcx>) -> usize {
+    debug_assert!(!key.has_non_region_infer() && !key.has_non_region_param());
+
+    let ty::Dynamic(source, _, _) = *key.self_ty().kind() else {
+        bug!();
+    };
+    let source_principal =
+        source.principal().unwrap().with_self_ty(tcx, tcx.types.trait_object_dummy_self);
+
+    let target_principal = ty::Binder::dummy(ty::ExistentialTraitRef::erase_self_ty(tcx, key));
 
     let vtable_segment_callback = {
-        let mut vtable_base = 0;
-
+        let mut vptr_offset = 0;
         move |segment| {
             match segment {
                 VtblSegment::MetadataDSA => {
-                    vtable_base += TyCtxt::COMMON_VTABLE_ENTRIES.len();
+                    vptr_offset += TyCtxt::COMMON_VTABLE_ENTRIES.len();
                 }
-                VtblSegment::TraitOwnEntries { trait_ref, emit_vptr } => {
-                    if tcx.erase_regions(trait_ref) == trait_to_be_found_erased {
-                        return ControlFlow::Break(vtable_base);
+                VtblSegment::TraitOwnEntries { trait_ref: vtable_principal, emit_vptr } => {
+                    if trait_refs_are_compatible(
+                        tcx,
+                        vtable_principal
+                            .map_bound(|t| ty::ExistentialTraitRef::erase_self_ty(tcx, t)),
+                        target_principal,
+                    ) {
+                        return ControlFlow::Break(vptr_offset);
                     }
-                    vtable_base += count_own_vtable_entries(tcx, trait_ref);
+
+                    vptr_offset +=
+                        tcx.own_existential_vtable_entries(vtable_principal.def_id()).len();
+
                     if emit_vptr {
-                        vtable_base += 1;
+                        vptr_offset += 1;
                     }
                 }
             }
@@ -351,55 +366,112 @@ pub(super) fn vtable_trait_first_method_offset<'tcx>(
         }
     };
 
-    if let Some(vtable_base) =
-        prepare_vtable_segments(tcx, trait_owning_vtable, vtable_segment_callback)
-    {
-        vtable_base
-    } else {
-        bug!("Failed to find info for expected trait in vtable");
-    }
+    prepare_vtable_segments(tcx, source_principal, vtable_segment_callback).unwrap()
 }
 
-/// Find slot offset for trait vptr within vtable entries of another trait
-pub(crate) fn vtable_trait_upcasting_coercion_new_vptr_slot<'tcx>(
+/// Given a `dyn Subtrait` and `dyn Supertrait` trait object, find the slot of
+/// the trait vptr in the subtrait's vtable.
+///
+/// A return value of `None` means that the original vtable can be reused.
+pub(crate) fn supertrait_vtable_slot<'tcx>(
     tcx: TyCtxt<'tcx>,
     key: (
-        Ty<'tcx>, // trait object type whose trait owning vtable
-        Ty<'tcx>, // trait object for supertrait
+        Ty<'tcx>, // Source -- `dyn Subtrait`.
+        Ty<'tcx>, // Target -- `dyn Supertrait` being coerced to.
     ),
 ) -> Option<usize> {
+    debug_assert!(!key.has_non_region_infer() && !key.has_non_region_param());
     let (source, target) = key;
-    assert!(matches!(&source.kind(), &ty::Dynamic(..)) && !source.has_infer());
-    assert!(matches!(&target.kind(), &ty::Dynamic(..)) && !target.has_infer());
 
-    // this has been typecked-before, so diagnostics is not really needed.
-    let unsize_trait_did = tcx.require_lang_item(LangItem::Unsize, None);
+    // If the target principal is `None`, we can just return `None`.
+    let ty::Dynamic(target, _, _) = *target.kind() else {
+        bug!();
+    };
+    let target_principal = target.principal()?;
 
-    let trait_ref = ty::TraitRef::new(tcx, unsize_trait_did, [source, target]);
+    // Given that we have a target principal, it is a bug for there not to be a source principal.
+    let ty::Dynamic(source, _, _) = *source.kind() else {
+        bug!();
+    };
+    let source_principal =
+        source.principal().unwrap().with_self_ty(tcx, tcx.types.trait_object_dummy_self);
 
-    match tcx.codegen_select_candidate((ty::ParamEnv::reveal_all(), trait_ref)) {
-        Ok(ImplSource::Builtin(BuiltinImplSource::TraitUpcasting { vtable_vptr_slot }, _)) => {
-            *vtable_vptr_slot
+    let vtable_segment_callback = {
+        let mut vptr_offset = 0;
+        move |segment| {
+            match segment {
+                VtblSegment::MetadataDSA => {
+                    vptr_offset += TyCtxt::COMMON_VTABLE_ENTRIES.len();
+                }
+                VtblSegment::TraitOwnEntries { trait_ref: vtable_principal, emit_vptr } => {
+                    vptr_offset +=
+                        tcx.own_existential_vtable_entries(vtable_principal.def_id()).len();
+                    if trait_refs_are_compatible(
+                        tcx,
+                        vtable_principal
+                            .map_bound(|t| ty::ExistentialTraitRef::erase_self_ty(tcx, t)),
+                        target_principal,
+                    ) {
+                        if emit_vptr {
+                            return ControlFlow::Break(Some(vptr_offset));
+                        } else {
+                            return ControlFlow::Break(None);
+                        }
+                    }
+
+                    if emit_vptr {
+                        vptr_offset += 1;
+                    }
+                }
+            }
+            ControlFlow::Continue(())
         }
-        otherwise => bug!("expected TraitUpcasting candidate, got {otherwise:?}"),
-    }
+    };
+
+    prepare_vtable_segments(tcx, source_principal, vtable_segment_callback).unwrap()
 }
 
-/// Given a trait `trait_ref`, returns the number of vtable entries
-/// that come from `trait_ref`, excluding its supertraits. Used in
-/// computing the vtable base for an upcast trait of a trait object.
-pub(crate) fn count_own_vtable_entries<'tcx>(
+fn trait_refs_are_compatible<'tcx>(
     tcx: TyCtxt<'tcx>,
-    trait_ref: ty::PolyTraitRef<'tcx>,
-) -> usize {
-    tcx.own_existential_vtable_entries(trait_ref.def_id()).len()
+    hr_vtable_principal: ty::PolyExistentialTraitRef<'tcx>,
+    hr_target_principal: ty::PolyExistentialTraitRef<'tcx>,
+) -> bool {
+    if hr_vtable_principal.def_id() != hr_target_principal.def_id() {
+        return false;
+    }
+
+    let infcx = tcx.infer_ctxt().build();
+    let param_env = ty::ParamEnv::reveal_all();
+    let ocx = ObligationCtxt::new(&infcx);
+    let hr_source_principal =
+        ocx.normalize(&ObligationCause::dummy(), param_env, hr_vtable_principal);
+    let hr_target_principal =
+        ocx.normalize(&ObligationCause::dummy(), param_env, hr_target_principal);
+    infcx.enter_forall(hr_target_principal, |target_principal| {
+        let source_principal = infcx.instantiate_binder_with_fresh_vars(
+            DUMMY_SP,
+            BoundRegionConversionTime::HigherRankedType,
+            hr_source_principal,
+        );
+        let Ok(()) = ocx.eq_trace(
+            &ObligationCause::dummy(),
+            param_env,
+            ToTrace::to_trace(&ObligationCause::dummy(), hr_target_principal, hr_source_principal),
+            target_principal,
+            source_principal,
+        ) else {
+            return false;
+        };
+        ocx.select_all_or_error().is_empty()
+    })
 }
 
 pub(super) fn provide(providers: &mut Providers) {
     *providers = Providers {
         own_existential_vtable_entries,
         vtable_entries,
-        vtable_trait_upcasting_coercion_new_vptr_slot,
+        first_method_vtable_slot,
+        supertrait_vtable_slot,
         ..*providers
     };
 }

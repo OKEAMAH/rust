@@ -1,21 +1,17 @@
-use annotate_snippets::{Annotation, AnnotationType, Renderer, Slice, Snippet, SourceAnnotation};
+use std::collections::{HashMap, HashSet};
+use std::fs::read_to_string;
+use std::path::{Path, PathBuf};
+
+use annotate_snippets::{Renderer, Snippet};
 use fluent_bundle::{FluentBundle, FluentError, FluentResource};
-use fluent_syntax::{
-    ast::{
-        Attribute, Entry, Expression, Identifier, InlineExpression, Message, Pattern,
-        PatternElement,
-    },
-    parser::ParserError,
+use fluent_syntax::ast::{
+    Attribute, Entry, Expression, Identifier, InlineExpression, Message, Pattern, PatternElement,
 };
+use fluent_syntax::parser::ParserError;
 use proc_macro::{Diagnostic, Level, Span};
 use proc_macro2::TokenStream;
 use quote::quote;
-use std::{
-    collections::{HashMap, HashSet},
-    fs::read_to_string,
-    path::{Path, PathBuf},
-};
-use syn::{parse_macro_input, Ident, LitStr};
+use syn::{Ident, LitStr, parse_macro_input};
 use unic_langid::langid;
 
 /// Helper function for returning an absolute path for macro-invocation relative file paths.
@@ -142,43 +138,14 @@ pub(crate) fn fluent_messages(input: proc_macro::TokenStream) -> proc_macro::Tok
                 // with a lowercase as rustc errors do.
                 err.replace_range(0..1, &err.chars().next().unwrap().to_lowercase().to_string());
 
-                let line_starts: Vec<usize> = std::iter::once(0)
-                    .chain(
-                        this.source()
-                            .char_indices()
-                            .filter_map(|(i, c)| Some(i + 1).filter(|_| c == '\n')),
-                    )
-                    .collect();
-                let line_start = line_starts
-                    .iter()
-                    .enumerate()
-                    .map(|(line, idx)| (line + 1, idx))
-                    .filter(|(_, idx)| **idx <= pos.start)
-                    .last()
-                    .unwrap()
-                    .0;
-
-                let snippet = Snippet {
-                    title: Some(Annotation {
-                        label: Some(&err),
-                        id: None,
-                        annotation_type: AnnotationType::Error,
-                    }),
-                    footer: vec![],
-                    slices: vec![Slice {
-                        source: this.source(),
-                        line_start,
-                        origin: Some(&relative_ftl_path),
-                        fold: true,
-                        annotations: vec![SourceAnnotation {
-                            label: "",
-                            annotation_type: AnnotationType::Error,
-                            range: (pos.start, pos.end - 1),
-                        }],
-                    }],
-                };
+                let message = annotate_snippets::Level::Error.title(&err).snippet(
+                    Snippet::source(this.source())
+                        .origin(&relative_ftl_path)
+                        .fold(true)
+                        .annotation(annotate_snippets::Level::Error.span(pos.start..pos.end - 1)),
+                );
                 let renderer = Renderer::plain();
-                eprintln!("{}\n", renderer.render(snippet));
+                eprintln!("{}\n", renderer.render(message));
             }
 
             return failed(&crate_name);
@@ -253,7 +220,7 @@ pub(crate) fn fluent_messages(input: proc_macro::TokenStream) -> proc_macro::Tok
 
             for Attribute { id: Identifier { name: attr_name }, .. } in attributes {
                 let snake_name = Ident::new(
-                    &format!("{}{}", &crate_prefix, &attr_name.replace('-', "_")),
+                    &format!("{crate_prefix}{}", attr_name.replace('-', "_")),
                     resource_str.span(),
                 );
                 if !previous_attrs.insert(snake_name.clone()) {

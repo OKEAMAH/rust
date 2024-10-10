@@ -1,12 +1,11 @@
 use rustc_data_structures::fx::FxHashSet;
 use rustc_hir::def_id::DefId;
-use rustc_infer::infer::canonical::{Canonical, QueryResponse};
 use rustc_infer::infer::TyCtxtInferExt;
+use rustc_infer::infer::canonical::{Canonical, QueryResponse};
 use rustc_middle::bug;
 use rustc_middle::query::Providers;
 use rustc_middle::traits::query::{DropckConstraint, DropckOutlivesResult};
-use rustc_middle::ty::GenericArgs;
-use rustc_middle::ty::TyCtxt;
+use rustc_middle::ty::{GenericArgs, TyCtxt};
 use rustc_trait_selection::infer::InferCtxtBuilderExt;
 use rustc_trait_selection::traits::query::dropck_outlives::{
     compute_dropck_outlives_inner, dtorck_constraint_for_ty_inner,

@@ -1,19 +1,18 @@
-use crate::common::CodegenCx;
-use crate::coverageinfo;
-use crate::coverageinfo::ffi::CounterMappingRegion;
-use crate::coverageinfo::map_data::{FunctionCoverage, FunctionCoverageCollector};
-use crate::llvm;
-
 use itertools::Itertools as _;
-use rustc_codegen_ssa::traits::{BaseTypeMethods, ConstMethods};
+use rustc_codegen_ssa::traits::{BaseTypeCodegenMethods, ConstCodegenMethods};
 use rustc_data_structures::fx::{FxHashSet, FxIndexMap, FxIndexSet};
 use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_index::IndexVec;
-use rustc_middle::bug;
-use rustc_middle::mir;
 use rustc_middle::ty::{self, TyCtxt};
-use rustc_span::def_id::DefIdSet;
+use rustc_middle::{bug, mir};
 use rustc_span::Symbol;
+use rustc_span::def_id::DefIdSet;
+use tracing::debug;
+
+use crate::common::CodegenCx;
+use crate::coverageinfo::ffi::CounterMappingRegion;
+use crate::coverageinfo::map_data::{FunctionCoverage, FunctionCoverageCollector};
+use crate::{coverageinfo, llvm};
 
 /// Generates and exports the Coverage Map.
 ///
@@ -28,7 +27,7 @@ use rustc_span::Symbol;
 /// implementing this Rust version, and though the format documentation is very explicit and
 /// detailed, some undocumented details in Clang's implementation (that may or may not be important)
 /// were also replicated for Rust's Coverage Map.
-pub fn finalize(cx: &CodegenCx<'_, '_>) {
+pub(crate) fn finalize(cx: &CodegenCx<'_, '_>) {
     let tcx = cx.tcx;
 
     // Ensure that LLVM is using a version of the coverage mapping format that
@@ -184,8 +183,8 @@ impl GlobalFileTable {
         // Since rustc generates coverage maps with relative paths, the
         // compilation directory can be combined with the relative paths
         // to get absolute paths, if needed.
-        use rustc_session::config::RemapPathScopeComponents;
         use rustc_session::RemapFileNameExt;
+        use rustc_session::config::RemapPathScopeComponents;
         let working_dir: &str = &tcx
             .sess
             .opts
@@ -423,7 +422,7 @@ fn prepare_usage_sets<'tcx>(tcx: TyCtxt<'tcx>) -> UsageSets<'tcx> {
             (instance.def_id(), body)
         });
 
-    // Functions whose coverage statments were found inlined into other functions.
+    // Functions whose coverage statements were found inlined into other functions.
     let mut used_via_inlining = FxHashSet::default();
     // Functions that were instrumented, but had all of their coverage statements
     // removed by later MIR transforms (e.g. UnreachablePropagation).

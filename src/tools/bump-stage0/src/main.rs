@@ -1,10 +1,9 @@
 #![deny(unused_variables)]
 
 use anyhow::{Context, Error};
-use build_helper::stage0_parser::{parse_stage0_file, Stage0Config, VersionMetadata};
+use build_helper::stage0_parser::{Stage0Config, VersionMetadata, parse_stage0_file};
 use curl::easy::Easy;
 use indexmap::IndexMap;
-use std::collections::HashMap;
 
 const PATH: &str = "src/stage0";
 const COMPILER_COMPONENTS: &[&str] = &["rustc", "rust-std", "cargo", "clippy-preview"];
@@ -216,13 +215,13 @@ enum Channel {
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct Manifest {
     date: String,
-    pkg: HashMap<String, ManifestPackage>,
+    pkg: IndexMap<String, ManifestPackage>,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct ManifestPackage {
     version: String,
-    target: HashMap<String, ManifestTargetPackage>,
+    target: IndexMap<String, ManifestTargetPackage>,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]

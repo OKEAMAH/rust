@@ -3,30 +3,25 @@
 //! This is in a dedicated file so that changes to this file can be reviewed more carefully.
 //! The intention is that this file only contains datatype declarations, no code.
 
-use super::{BasicBlock, Const, Local, UserTypeProjection};
+use rustc_ast::{InlineAsmOptions, InlineAsmTemplatePiece, Mutability};
+use rustc_data_structures::packed::Pu128;
+use rustc_hir::CoroutineKind;
+use rustc_hir::def_id::DefId;
+use rustc_index::IndexVec;
+use rustc_macros::{HashStable, TyDecodable, TyEncodable, TypeFoldable, TypeVisitable};
+use rustc_span::Span;
+use rustc_span::def_id::LocalDefId;
+use rustc_span::source_map::Spanned;
+use rustc_span::symbol::Symbol;
+use rustc_target::abi::{FieldIdx, VariantIdx};
+use rustc_target::asm::InlineAsmRegOrRegClass;
+use smallvec::SmallVec;
 
+use super::{BasicBlock, Const, Local, UserTypeProjection};
 use crate::mir::coverage::CoverageKind;
 use crate::traits::Reveal;
 use crate::ty::adjustment::PointerCoercion;
-use crate::ty::GenericArgsRef;
-use crate::ty::{self, List, Ty};
-use crate::ty::{Region, UserTypeAnnotationIndex};
-
-use rustc_ast::{InlineAsmOptions, InlineAsmTemplatePiece};
-use rustc_data_structures::packed::Pu128;
-use rustc_hir::def_id::DefId;
-use rustc_hir::CoroutineKind;
-use rustc_index::IndexVec;
-use rustc_macros::{HashStable, TyDecodable, TyEncodable, TypeFoldable, TypeVisitable};
-use rustc_span::source_map::Spanned;
-use rustc_target::abi::{FieldIdx, VariantIdx};
-
-use rustc_ast::Mutability;
-use rustc_span::def_id::LocalDefId;
-use rustc_span::symbol::Symbol;
-use rustc_span::Span;
-use rustc_target::asm::InlineAsmRegOrRegClass;
-use smallvec::SmallVec;
+use crate::ty::{self, GenericArgsRef, List, Region, Ty, UserTypeAnnotationIndex};
 
 /// Represents the "flavors" of MIR.
 ///
@@ -127,6 +122,9 @@ pub enum AnalysisPhase {
     /// * [`StatementKind::AscribeUserType`]
     /// * [`StatementKind::Coverage`] with [`CoverageKind::BlockMarker`] or [`CoverageKind::SpanMarker`]
     /// * [`Rvalue::Ref`] with `BorrowKind::Fake`
+    /// * [`CastKind::PointerCoercion`] with any of the following:
+    ///   * [`PointerCoercion::ArrayToPointer`]
+    ///   * [`PointerCoercion::MutToConstPointer`]
     ///
     /// Furthermore, `Deref` projections must be the first projection within any place (if they
     /// appear at all)
@@ -361,16 +359,19 @@ pub enum StatementKind<'tcx> {
     /// At any point during the execution of a function, each local is either allocated or
     /// unallocated. Except as noted below, all locals except function parameters are initially
     /// unallocated. `StorageLive` statements cause memory to be allocated for the local while
-    /// `StorageDead` statements cause the memory to be freed. Using a local in any way (not only
-    /// reading/writing from it) while it is unallocated is UB.
+    /// `StorageDead` statements cause the memory to be freed. In other words,
+    /// `StorageLive`/`StorageDead` act like the heap operations `allocate`/`deallocate`, but for
+    /// stack-allocated local variables. Using a local in any way (not only reading/writing from it)
+    /// while it is unallocated is UB.
     ///
     /// Some locals have no `StorageLive` or `StorageDead` statements within the entire MIR body.
     /// These locals are implicitly allocated for the full duration of the function. There is a
     /// convenience method at `rustc_mir_dataflow::storage::always_storage_live_locals` for
     /// computing these locals.
     ///
-    /// If the local is already allocated, calling `StorageLive` again is UB. However, for an
-    /// unallocated local an additional `StorageDead` all is simply a nop.
+    /// If the local is already allocated, calling `StorageLive` again will implicitly free the
+    /// local and then allocate fresh uninitilized memory. If a local is already deallocated,
+    /// calling `StorageDead` again is a NOP.
     StorageLive(Local),
 
     /// See `StorageLive` above.
@@ -394,7 +395,7 @@ pub enum StatementKind<'tcx> {
     /// `PlaceMention(PLACE)`.
     ///
     /// When executed at runtime, this computes the given place, but then discards
-    /// it without doing a load. It is UB if the place is not pointing to live memory.
+    /// it without doing a load. `let _ = *ptr;` is fine even if the pointer is dangling.
     PlaceMention(Box<Place<'tcx>>),
 
     /// Encodes a user's type ascription. These need to be preserved
@@ -578,7 +579,8 @@ pub struct CopyNonOverlapping<'tcx> {
     pub count: Operand<'tcx>,
 }
 
-/// Represents how a `TerminatorKind::Call` was constructed, used for diagnostics
+/// Represents how a [`TerminatorKind::Call`] was constructed.
+/// Used only for diagnostics.
 #[derive(Clone, Copy, TyEncodable, TyDecodable, Debug, PartialEq, Hash, HashStable)]
 #[derive(TypeFoldable, TypeVisitable)]
 pub enum CallSource {
@@ -600,6 +602,25 @@ pub enum CallSource {
 impl CallSource {
     pub fn from_hir_call(self) -> bool {
         matches!(self, CallSource::Normal)
+    }
+}
+
+#[derive(Clone, Copy, Debug, TyEncodable, TyDecodable, Hash, HashStable, PartialEq)]
+#[derive(TypeFoldable, TypeVisitable)]
+/// The macro that an inline assembly block was created by
+pub enum InlineAsmMacro {
+    /// The `asm!` macro
+    Asm,
+    /// The `naked_asm!` macro
+    NakedAsm,
+}
+
+impl InlineAsmMacro {
+    pub const fn diverges(self, options: InlineAsmOptions) -> bool {
+        match self {
+            InlineAsmMacro::Asm => options.contains(InlineAsmOptions::NORETURN),
+            InlineAsmMacro::NakedAsm => true,
+        }
     }
 }
 
@@ -724,7 +745,7 @@ pub enum TerminatorKind<'tcx> {
         /// reused across function calls without duplicating the contents.
         /// The span for each arg is also included
         /// (e.g. `a` and `b` in `x.foo(a, b)`).
-        args: Vec<Spanned<Operand<'tcx>>>,
+        args: Box<[Spanned<Operand<'tcx>>]>,
         /// Where the returned value will be written
         destination: Place<'tcx>,
         /// Where to go after this call returns. If none, the call necessarily diverges.
@@ -735,6 +756,36 @@ pub enum TerminatorKind<'tcx> {
         call_source: CallSource,
         /// This `Span` is the span of the function, without the dot and receiver
         /// e.g. `foo(a, b)` in `x.foo(a, b)`
+        fn_span: Span,
+    },
+
+    /// Tail call.
+    ///
+    /// Roughly speaking this is a chimera of [`Call`] and [`Return`], with some caveats.
+    /// Semantically tail calls consists of two actions:
+    /// - pop of the current stack frame
+    /// - a call to the `func`, with the return address of the **current** caller
+    ///   - so that a `return` inside `func` returns to the caller of the caller
+    ///     of the function that is currently being executed
+    ///
+    /// Note that in difference with [`Call`] this is missing
+    /// - `destination` (because it's always the return place)
+    /// - `target` (because it's always taken from the current stack frame)
+    /// - `unwind` (because it's always taken from the current stack frame)
+    ///
+    /// [`Call`]: TerminatorKind::Call
+    /// [`Return`]: TerminatorKind::Return
+    TailCall {
+        /// The function that’s being called.
+        func: Operand<'tcx>,
+        /// Arguments the function is called with.
+        /// These are owned by the callee, which is free to modify them.
+        /// This allows the memory occupied by "by-value" arguments to be
+        /// reused across function calls without duplicating the contents.
+        args: Box<[Spanned<Operand<'tcx>>]>,
+        // FIXME(explicit_tail_calls): should we have the span for `become`? is this span accurate? do we need it?
+        /// This `Span` is the span of the function, without the dot and receiver
+        /// (e.g. `foo(a, b)` in `x.foo(a, b)`
         fn_span: Span,
     },
 
@@ -827,11 +878,14 @@ pub enum TerminatorKind<'tcx> {
     /// Block ends with an inline assembly block. This is a terminator since
     /// inline assembly is allowed to diverge.
     InlineAsm {
+        /// Macro used to create this inline asm: one of `asm!` or `naked_asm!`
+        asm_macro: InlineAsmMacro,
+
         /// The template for the inline assembly, with placeholders.
         template: &'tcx [InlineAsmTemplatePiece],
 
         /// The operands for the inline assembly, as `Operand`s or `Place`s.
-        operands: Vec<InlineAsmOperand<'tcx>>,
+        operands: Box<[InlineAsmOperand<'tcx>]>,
 
         /// Miscellaneous options for the inline assembly.
         options: InlineAsmOptions,
@@ -842,8 +896,8 @@ pub enum TerminatorKind<'tcx> {
 
         /// Valid targets for the inline assembly.
         /// The first element is the fallthrough destination, unless
-        /// InlineAsmOptions::NORETURN is set.
-        targets: Vec<BasicBlock>,
+        /// asm_macro == InlineAsmMacro::NakedAsm or InlineAsmOptions::NORETURN is set.
+        targets: Box<[BasicBlock]>,
 
         /// Action to be taken if the inline assembly unwinds. This is present
         /// if and only if InlineAsmOptions::MAY_UNWIND is set.
@@ -864,6 +918,7 @@ impl TerminatorKind<'_> {
             TerminatorKind::Unreachable => "Unreachable",
             TerminatorKind::Drop { .. } => "Drop",
             TerminatorKind::Call { .. } => "Call",
+            TerminatorKind::TailCall { .. } => "TailCall",
             TerminatorKind::Assert { .. } => "Assert",
             TerminatorKind::Yield { .. } => "Yield",
             TerminatorKind::CoroutineDrop => "CoroutineDrop",
@@ -1008,8 +1063,8 @@ pub type AssertMessage<'tcx> = AssertKind<Operand<'tcx>>;
 /// element:
 ///
 ///  - [`Downcast`](ProjectionElem::Downcast): This projection sets the place's variant index to the
-///    given one, and makes no other changes. A `Downcast` projection on a place with its variant
-///    index already set is not well-formed.
+///    given one, and makes no other changes. A `Downcast` projection must always be followed
+///    immediately by a `Field` projection.
 ///  - [`Field`](ProjectionElem::Field): `Field` projections take their parent place and create a
 ///    place referring to one of the fields of the type. The resulting address is the parent
 ///    address, plus the offset of the field. The type becomes the type of the field. If the parent
@@ -1062,7 +1117,7 @@ pub struct Place<'tcx> {
     pub projection: &'tcx List<PlaceElem<'tcx>>,
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 #[derive(TyEncodable, TyDecodable, HashStable, TypeFoldable, TypeVisitable)]
 pub enum ProjectionElem<V, T> {
     Deref,
@@ -1102,8 +1157,10 @@ pub enum ProjectionElem<V, T> {
     ConstantIndex {
         /// index or -index (in Python terms), depending on from_end
         offset: u64,
-        /// The thing being indexed must be at least this long. For arrays this
-        /// is always the exact length.
+        /// The thing being indexed must be at least this long -- otherwise, the
+        /// projection is UB.
+        ///
+        /// For arrays this is always the exact length.
         min_length: u64,
         /// Counting backwards from end? This is always false when indexing an
         /// array.
@@ -1261,28 +1318,30 @@ pub enum Rvalue<'tcx> {
     /// nature of this operation?
     ThreadLocalRef(DefId),
 
-    /// Creates a pointer with the indicated mutability to the place.
+    /// Creates a raw pointer with the indicated mutability to the place.
     ///
-    /// This is generated by pointer casts like `&v as *const _` or raw address of expressions like
-    /// `&raw v` or `addr_of!(v)`.
+    /// This is generated by pointer casts like `&v as *const _` or raw borrow expressions like
+    /// `&raw const v`.
     ///
     /// Like with references, the semantics of this operation are heavily dependent on the aliasing
     /// model.
-    AddressOf(Mutability, Place<'tcx>),
+    RawPtr(Mutability, Place<'tcx>),
 
     /// Yields the length of the place, as a `usize`.
     ///
     /// If the type of the place is an array, this is the array length. For slices (`[T]`, not
     /// `&[T]`) this accesses the place's metadata to determine the length. This rvalue is
     /// ill-formed for places of other types.
+    ///
+    /// This cannot be a `UnOp(PtrMetadata, _)` because that expects a value, and we only
+    /// have a place, and `UnOp(PtrMetadata, RawPtr(place))` is not a thing.
     Len(Place<'tcx>),
 
     /// Performs essentially all of the casts that can be performed via `as`.
     ///
     /// This allows for casts from/to a variety of types.
     ///
-    /// **FIXME**: Document exactly which `CastKind`s allow which types of casts. Figure out why
-    /// `ArrayToPointer` and `MutToConstPointer` are special.
+    /// **FIXME**: Document exactly which `CastKind`s allow which types of casts.
     Cast(CastKind, Operand<'tcx>, Ty<'tcx>),
 
     /// * `Offset` has the same semantics as [`offset`](pointer::offset), except that the second
@@ -1362,9 +1421,14 @@ pub enum CastKind {
     PointerWithExposedProvenance,
     /// Pointer related casts that are done by coercions. Note that reference-to-raw-ptr casts are
     /// translated into `&raw mut/const *r`, i.e., they are not actually casts.
-    PointerCoercion(PointerCoercion),
-    /// Cast into a dyn* object.
-    DynStar,
+    ///
+    /// The following are allowed in [`AnalysisPhase::Initial`] as they're needed for borrowck,
+    /// but after that are forbidden (including in all phases of runtime MIR):
+    /// * [`PointerCoercion::ArrayToPointer`]
+    /// * [`PointerCoercion::MutToConstPointer`]
+    ///
+    /// Both are runtime nops, so should be [`CastKind::PtrToPtr`] instead in runtime MIR.
+    PointerCoercion(PointerCoercion, CoercionSource),
     IntToInt,
     FloatToInt,
     FloatToFloat,
@@ -1378,6 +1442,16 @@ pub enum CastKind {
     ///
     /// Allowed only in [`MirPhase::Runtime`]; Earlier it's a [`TerminatorKind::Call`].
     Transmute,
+}
+
+/// Represents how a [`CastKind::PointerCoercion`] was constructed.
+/// Used only for diagnostics.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, TyEncodable, TyDecodable, Hash, HashStable)]
+pub enum CoercionSource {
+    /// The coercion was manually written by the user with an `as` cast.
+    AsCast,
+    /// The coercion was automatically inserted by the compiler.
+    Implicit,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, TyEncodable, TyDecodable, Hash, HashStable)]
@@ -1427,16 +1501,25 @@ pub enum NullOp<'tcx> {
     UbChecks,
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 #[derive(HashStable, TyEncodable, TyDecodable, TypeFoldable, TypeVisitable)]
 pub enum UnOp {
     /// The `!` operator for logical inversion
     Not,
     /// The `-` operator for negation
     Neg,
+    /// Gets the metadata `M` from a `*const`/`*mut`/`&`/`&mut` to
+    /// `impl Pointee<Metadata = M>`.
+    ///
+    /// For example, this will give a `()` from `*const i32`, a `usize` from
+    /// `&mut [u8]`, or a `ptr::DynMetadata<dyn Foo>` (internally a pointer)
+    /// from a `*mut dyn Foo`.
+    ///
+    /// Allowed only in [`MirPhase::Runtime`]; earlier it's an intrinsic.
+    PtrMetadata,
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, PartialOrd, Ord, Eq, Hash)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 #[derive(TyEncodable, TyDecodable, HashStable, TypeFoldable, TypeVisitable)]
 pub enum BinOp {
     /// The `+` operator (addition)
@@ -1483,7 +1566,8 @@ pub enum BinOp {
     BitOr,
     /// The `<<` operator (shift left)
     ///
-    /// The offset is (uniquely) determined as follows:
+    /// The offset is given by `RHS.rem_euclid(LHS::BITS)`.
+    /// In other words, it is (uniquely) determined as follows:
     /// - it is "equal modulo LHS::BITS" to the RHS
     /// - it is in the range `0..LHS::BITS`
     Shl,
@@ -1491,7 +1575,8 @@ pub enum BinOp {
     ShlUnchecked,
     /// The `>>` operator (shift right)
     ///
-    /// The offset is (uniquely) determined as follows:
+    /// The offset is given by `RHS.rem_euclid(LHS::BITS)`.
+    /// In other words, it is (uniquely) determined as follows:
     /// - it is "equal modulo LHS::BITS" to the RHS
     /// - it is in the range `0..LHS::BITS`
     ///
@@ -1529,8 +1614,9 @@ pub enum BinOp {
 // Some nodes are used a lot. Make sure they don't unintentionally get bigger.
 #[cfg(target_pointer_width = "64")]
 mod size_asserts {
-    use super::*;
     use rustc_data_structures::static_assert_size;
+
+    use super::*;
     // tidy-alphabetical-start
     static_assert_size!(AggregateKind<'_>, 32);
     static_assert_size!(Operand<'_>, 24);
@@ -1538,6 +1624,6 @@ mod size_asserts {
     static_assert_size!(PlaceElem<'_>, 24);
     static_assert_size!(Rvalue<'_>, 40);
     static_assert_size!(StatementKind<'_>, 16);
-    static_assert_size!(TerminatorKind<'_>, 96);
+    static_assert_size!(TerminatorKind<'_>, 80);
     // tidy-alphabetical-end
 }

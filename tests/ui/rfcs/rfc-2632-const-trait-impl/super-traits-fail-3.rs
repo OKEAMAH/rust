@@ -1,3 +1,5 @@
+//@ compile-flags: -Znext-solver
+#![allow(incomplete_features)]
 #![feature(const_trait_impl, effects)]
 
 //@ revisions: yy yn ny nn
@@ -18,7 +20,7 @@ trait Bar: ~const Foo {}
 const fn foo<T: ~const Bar>(x: &T) {
     //[yn,nn]~^ ERROR: `~const` can only be applied to `#[const_trait]`
     x.a();
-    //[yn]~^ ERROR: mismatched types
+    //[yn]~^ ERROR: the trait bound `T: ~const Foo` is not satisfied
 }
 
 fn main() {}

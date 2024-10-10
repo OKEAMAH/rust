@@ -1,6 +1,6 @@
-use crate::spec::{base, Cc, LinkerFlavor, Lld, StackProbeType, Target, TargetOptions};
+use crate::spec::{Cc, LinkerFlavor, Lld, StackProbeType, Target, TargetOptions, base};
 
-pub fn target() -> Target {
+pub(crate) fn target() -> Target {
     let mut base = base::netbsd::opts();
     base.cpu = "pentium4".into();
     base.max_atomic_width = Some(64);
@@ -10,10 +10,10 @@ pub fn target() -> Target {
     Target {
         llvm_target: "i686-unknown-netbsdelf".into(),
         metadata: crate::spec::TargetMetadata {
-            description: None,
-            tier: None,
-            host_tools: None,
-            std: None,
+            description: Some("NetBSD/i386 with SSE2".into()),
+            tier: Some(3),
+            host_tools: Some(true),
+            std: Some(true),
         },
         pointer_width: 32,
         data_layout: "e-m:e-p:32:32-p270:32:32-p271:32:32-p272:64:64-\

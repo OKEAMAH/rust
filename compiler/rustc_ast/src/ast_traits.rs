@@ -2,18 +2,17 @@
 //! typically those used in AST fragments during macro expansion.
 //! The traits are not implemented exhaustively, only when actually necessary.
 
+use std::fmt;
+use std::marker::PhantomData;
+
 use crate::ptr::P;
 use crate::token::Nonterminal;
 use crate::tokenstream::LazyAttrTokenStream;
-use crate::{Arm, Crate, ExprField, FieldDef, GenericParam, Param, PatField, Variant};
-use crate::{AssocItem, Expr, ForeignItem, Item, NodeId};
-use crate::{AttrItem, AttrKind, Block, Pat, Path, Ty, Visibility};
-use crate::{AttrVec, Attribute, Stmt, StmtKind};
-
-use rustc_span::Span;
-
-use std::fmt;
-use std::marker::PhantomData;
+use crate::{
+    Arm, AssocItem, AttrItem, AttrKind, AttrVec, Attribute, Block, Crate, Expr, ExprField,
+    FieldDef, ForeignItem, GenericParam, Item, NodeId, Param, Pat, PatField, Path, Stmt, StmtKind,
+    Ty, Variant, Visibility,
+};
 
 /// A utility trait to reduce boilerplate.
 /// Standard `Deref(Mut)` cannot be reused due to coherence.
@@ -91,37 +90,6 @@ impl<T: AstDeref<Target: HasNodeId>> HasNodeId for T {
     }
 }
 
-/// A trait for AST nodes having a span.
-pub trait HasSpan {
-    fn span(&self) -> Span;
-}
-
-macro_rules! impl_has_span {
-    ($($T:ty),+ $(,)?) => {
-        $(
-            impl HasSpan for $T {
-                fn span(&self) -> Span {
-                    self.span
-                }
-            }
-        )+
-    };
-}
-
-impl_has_span!(AssocItem, Block, Expr, ForeignItem, Item, Pat, Path, Stmt, Ty, Visibility);
-
-impl<T: AstDeref<Target: HasSpan>> HasSpan for T {
-    fn span(&self) -> Span {
-        self.ast_deref().span()
-    }
-}
-
-impl HasSpan for AttrItem {
-    fn span(&self) -> Span {
-        self.span()
-    }
-}
-
 /// A trait for AST nodes having (or not having) collected tokens.
 pub trait HasTokens {
     fn tokens(&self) -> Option<&LazyAttrTokenStream>;
@@ -185,7 +153,7 @@ impl HasTokens for StmtKind {
             StmtKind::Let(local) => local.tokens.as_ref(),
             StmtKind::Item(item) => item.tokens(),
             StmtKind::Expr(expr) | StmtKind::Semi(expr) => expr.tokens(),
-            StmtKind::Empty => return None,
+            StmtKind::Empty => None,
             StmtKind::MacCall(mac) => mac.tokens.as_ref(),
         }
     }
@@ -194,7 +162,7 @@ impl HasTokens for StmtKind {
             StmtKind::Let(local) => Some(&mut local.tokens),
             StmtKind::Item(item) => item.tokens_mut(),
             StmtKind::Expr(expr) | StmtKind::Semi(expr) => expr.tokens_mut(),
-            StmtKind::Empty => return None,
+            StmtKind::Empty => None,
             StmtKind::MacCall(mac) => Some(&mut mac.tokens),
         }
     }

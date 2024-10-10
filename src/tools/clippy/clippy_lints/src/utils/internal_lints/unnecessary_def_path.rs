@@ -8,12 +8,12 @@ use rustc_hir::def::{DefKind, Res};
 use rustc_hir::def_id::DefId;
 use rustc_hir::{Expr, ExprKind, LetStmt, Mutability, Node};
 use rustc_lint::{LateContext, LateLintPass};
-use rustc_middle::mir::interpret::{Allocation, GlobalAlloc};
 use rustc_middle::mir::ConstValue;
+use rustc_middle::mir::interpret::{Allocation, GlobalAlloc};
 use rustc_middle::ty::{self, Ty};
 use rustc_session::impl_lint_pass;
-use rustc_span::symbol::Symbol;
 use rustc_span::Span;
+use rustc_span::symbol::Symbol;
 
 use std::str;
 
@@ -108,7 +108,7 @@ impl UnnecessaryDefPath {
             // Extract the path to the matched type
             && let Some(segments) = path_to_matched_type(cx, item_arg)
             && let segments = segments.iter().map(|sym| &**sym).collect::<Vec<_>>()
-            && let Some(def_id) = def_path_def_ids(cx, &segments[..]).next()
+            && let Some(def_id) = def_path_def_ids(cx.tcx, &segments[..]).next()
         {
             // Check if the target item is a diagnostic item or LangItem.
             #[rustfmt::skip]
@@ -206,7 +206,7 @@ impl UnnecessaryDefPath {
     fn check_array(&mut self, cx: &LateContext<'_>, elements: &[Expr<'_>], span: Span) {
         let Some(path) = path_from_array(elements) else { return };
 
-        for def_id in def_path_def_ids(cx, &path.iter().map(AsRef::as_ref).collect::<Vec<_>>()) {
+        for def_id in def_path_def_ids(cx.tcx, &path.iter().map(AsRef::as_ref).collect::<Vec<_>>()) {
             self.array_def_ids.insert((def_id, span));
         }
     }

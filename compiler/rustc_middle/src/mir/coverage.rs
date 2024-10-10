@@ -1,10 +1,10 @@
 //! Metadata from source code coverage analysis and instrumentation.
 
+use std::fmt::{self, Debug, Formatter};
+
 use rustc_index::IndexVec;
 use rustc_macros::{HashStable, TyDecodable, TyEncodable, TypeFoldable, TypeVisitable};
 use rustc_span::{Span, Symbol};
-
-use std::fmt::{self, Debug, Formatter};
 
 rustc_index::newtype_index! {
     /// Used by [`CoverageKind::BlockMarker`] to mark blocks during THIR-to-MIR
@@ -67,7 +67,7 @@ rustc_index::newtype_index! {
 }
 
 impl ConditionId {
-    pub const NONE: Self = Self::from_u32(0);
+    pub const START: Self = Self::from_usize(0);
 }
 
 /// Enum that can hold a constant zero value, the ID of an physical coverage
@@ -103,7 +103,7 @@ pub enum CoverageKind {
     SpanMarker,
 
     /// Marks its enclosing basic block with an ID that can be referred to by
-    /// side data in [`BranchInfo`].
+    /// side data in [`CoverageInfoHi`].
     ///
     /// Should be erased before codegen (at some point after `InstrumentCoverage`).
     BlockMarker { id: BlockMarkerId },
@@ -128,8 +128,8 @@ pub enum CoverageKind {
 
     /// Marks the point in MIR control flow represented by a evaluated condition.
     ///
-    /// This is eventually lowered to `llvm.instrprof.mcdc.condbitmap.update` in LLVM IR.
-    CondBitmapUpdate { id: ConditionId, value: bool, decision_depth: u16 },
+    /// This is eventually lowered to instruments updating mcdc temp variables.
+    CondBitmapUpdate { index: u32, decision_depth: u16 },
 
     /// Marks the point in MIR control flow represented by a evaluated decision.
     ///
@@ -145,14 +145,8 @@ impl Debug for CoverageKind {
             BlockMarker { id } => write!(fmt, "BlockMarker({:?})", id.index()),
             CounterIncrement { id } => write!(fmt, "CounterIncrement({:?})", id.index()),
             ExpressionUsed { id } => write!(fmt, "ExpressionUsed({:?})", id.index()),
-            CondBitmapUpdate { id, value, decision_depth } => {
-                write!(
-                    fmt,
-                    "CondBitmapUpdate({:?}, {:?}, depth={:?})",
-                    id.index(),
-                    value,
-                    decision_depth
-                )
+            CondBitmapUpdate { index, decision_depth } => {
+                write!(fmt, "CondBitmapUpdate(index={:?}, depth={:?})", index, decision_depth)
             }
             TestVectorBitmapUpdate { bitmap_idx, decision_depth } => {
                 write!(fmt, "TestVectorUpdate({:?}, depth={:?})", bitmap_idx, decision_depth)
@@ -163,7 +157,7 @@ impl Debug for CoverageKind {
 
 #[derive(Clone, TyEncodable, TyDecodable, Hash, HashStable, PartialEq, Eq, PartialOrd, Ord)]
 #[derive(TypeFoldable, TypeVisitable)]
-pub struct CodeRegion {
+pub struct SourceRegion {
     pub file_name: Symbol,
     pub start_line: u32,
     pub start_col: u32,
@@ -171,7 +165,7 @@ pub struct CodeRegion {
     pub end_col: u32,
 }
 
-impl Debug for CodeRegion {
+impl Debug for SourceRegion {
     fn fmt(&self, fmt: &mut Formatter<'_>) -> fmt::Result {
         write!(
             fmt,
@@ -220,19 +214,6 @@ pub enum MappingKind {
 }
 
 impl MappingKind {
-    /// Iterator over all coverage terms in this mapping kind.
-    pub fn terms(&self) -> impl Iterator<Item = CovTerm> {
-        let zero = || None.into_iter().chain(None);
-        let one = |a| Some(a).into_iter().chain(None);
-        let two = |a, b| Some(a).into_iter().chain(Some(b));
-        match *self {
-            Self::Code(term) => one(term),
-            Self::Branch { true_term, false_term } => two(true_term, false_term),
-            Self::MCDCBranch { true_term, false_term, .. } => two(true_term, false_term),
-            Self::MCDCDecision(_) => zero(),
-        }
-    }
-
     /// Returns a copy of this mapping kind, in which all coverage terms have
     /// been replaced with ones returned by the given function.
     pub fn map_terms(&self, map_fn: impl Fn(CovTerm) -> CovTerm) -> Self {
@@ -255,7 +236,7 @@ impl MappingKind {
 #[derive(TyEncodable, TyDecodable, Hash, HashStable, TypeFoldable, TypeVisitable)]
 pub struct Mapping {
     pub kind: MappingKind,
-    pub code_region: CodeRegion,
+    pub source_region: SourceRegion,
 }
 
 /// Stores per-function coverage information attached to a `mir::Body`,
@@ -266,7 +247,7 @@ pub struct Mapping {
 pub struct FunctionCoverageInfo {
     pub function_source_hash: u64,
     pub num_counters: usize,
-    pub mcdc_bitmap_bytes: u32,
+    pub mcdc_bitmap_bits: usize,
     pub expressions: IndexVec<ExpressionId, Expression>,
     pub mappings: Vec<Mapping>,
     /// The depth of the deepest decision is used to know how many
@@ -274,17 +255,24 @@ pub struct FunctionCoverageInfo {
     pub mcdc_num_condition_bitmaps: usize,
 }
 
-/// Branch information recorded during THIR-to-MIR lowering, and stored in MIR.
+/// Coverage information for a function, recorded during MIR building and
+/// attached to the corresponding `mir::Body`. Used by the `InstrumentCoverage`
+/// MIR pass.
+///
+/// ("Hi" indicates that this is "high-level" information collected at the
+/// THIR/MIR boundary, before the MIR-based coverage instrumentation pass.)
 #[derive(Clone, Debug)]
 #[derive(TyEncodable, TyDecodable, Hash, HashStable, TypeFoldable, TypeVisitable)]
-pub struct BranchInfo {
+pub struct CoverageInfoHi {
     /// 1 more than the highest-numbered [`CoverageKind::BlockMarker`] that was
     /// injected into the MIR body. This makes it possible to allocate per-ID
     /// data structures without having to scan the entire body first.
     pub num_block_markers: usize,
     pub branch_spans: Vec<BranchSpan>,
-    pub mcdc_branch_spans: Vec<MCDCBranchSpan>,
-    pub mcdc_decision_spans: Vec<MCDCDecisionSpan>,
+    /// Branch spans generated by mcdc. Because of some limits mcdc builder give up generating
+    /// decisions including them so that they are handled as normal branch spans.
+    pub mcdc_degraded_branch_spans: Vec<MCDCBranchSpan>,
+    pub mcdc_spans: Vec<(MCDCDecisionSpan, Vec<MCDCBranchSpan>)>,
 }
 
 #[derive(Clone, Debug)]
@@ -299,44 +287,31 @@ pub struct BranchSpan {
 #[derive(TyEncodable, TyDecodable, Hash, HashStable, TypeFoldable, TypeVisitable)]
 pub struct ConditionInfo {
     pub condition_id: ConditionId,
-    pub true_next_id: ConditionId,
-    pub false_next_id: ConditionId,
-}
-
-impl Default for ConditionInfo {
-    fn default() -> Self {
-        Self {
-            condition_id: ConditionId::NONE,
-            true_next_id: ConditionId::NONE,
-            false_next_id: ConditionId::NONE,
-        }
-    }
+    pub true_next_id: Option<ConditionId>,
+    pub false_next_id: Option<ConditionId>,
 }
 
 #[derive(Clone, Debug)]
 #[derive(TyEncodable, TyDecodable, Hash, HashStable, TypeFoldable, TypeVisitable)]
 pub struct MCDCBranchSpan {
     pub span: Span,
-    /// If `None`, this actually represents a normal branch span inserted for
-    /// code that was too complex for MC/DC.
-    pub condition_info: Option<ConditionInfo>,
+    pub condition_info: ConditionInfo,
     pub true_marker: BlockMarkerId,
     pub false_marker: BlockMarkerId,
-    pub decision_depth: u16,
 }
 
 #[derive(Copy, Clone, Debug)]
 #[derive(TyEncodable, TyDecodable, Hash, HashStable, TypeFoldable, TypeVisitable)]
 pub struct DecisionInfo {
     pub bitmap_idx: u32,
-    pub conditions_num: u16,
+    pub num_conditions: u16,
 }
 
 #[derive(Clone, Debug)]
 #[derive(TyEncodable, TyDecodable, Hash, HashStable, TypeFoldable, TypeVisitable)]
 pub struct MCDCDecisionSpan {
     pub span: Span,
-    pub conditions_num: usize,
     pub end_markers: Vec<BlockMarkerId>,
     pub decision_depth: u16,
+    pub num_conditions: usize,
 }

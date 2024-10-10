@@ -1,34 +1,28 @@
 //! This module analyzes crates to find call sites that can serve as examples in the documentation.
 
-use crate::clean;
-use crate::config;
-use crate::formats;
-use crate::formats::renderer::FormatRenderer;
-use crate::html::render::Context;
+use std::fs;
+use std::path::PathBuf;
 
-use rustc_data_structures::fx::FxHashMap;
-use rustc_hir::{
-    self as hir,
-    intravisit::{self, Visitor},
-};
+use rustc_data_structures::fx::FxIndexMap;
+use rustc_errors::DiagCtxtHandle;
+use rustc_hir::intravisit::{self, Visitor};
+use rustc_hir::{self as hir};
 use rustc_interface::interface;
 use rustc_macros::{Decodable, Encodable};
 use rustc_middle::hir::map::Map;
 use rustc_middle::hir::nested_filter;
 use rustc_middle::ty::{self, TyCtxt};
-use rustc_serialize::{
-    opaque::{FileEncoder, MemDecoder},
-    Decodable, Encodable,
-};
+use rustc_serialize::opaque::{FileEncoder, MemDecoder};
+use rustc_serialize::{Decodable, Encodable};
 use rustc_session::getopts;
-use rustc_span::{
-    def_id::{CrateNum, DefPathHash, LOCAL_CRATE},
-    edition::Edition,
-    BytePos, FileName, SourceFile,
-};
+use rustc_span::def_id::{CrateNum, DefPathHash, LOCAL_CRATE};
+use rustc_span::edition::Edition;
+use rustc_span::{BytePos, FileName, SourceFile};
+use tracing::{debug, trace, warn};
 
-use std::fs;
-use std::path::PathBuf;
+use crate::formats::renderer::FormatRenderer;
+use crate::html::render::Context;
+use crate::{clean, config, formats};
 
 #[derive(Debug, Clone)]
 pub(crate) struct ScrapeExamplesOptions {
@@ -38,7 +32,7 @@ pub(crate) struct ScrapeExamplesOptions {
 }
 
 impl ScrapeExamplesOptions {
-    pub(crate) fn new(matches: &getopts::Matches, dcx: &rustc_errors::DiagCtxt) -> Option<Self> {
+    pub(crate) fn new(matches: &getopts::Matches, dcx: DiagCtxtHandle<'_>) -> Option<Self> {
         let output_path = matches.opt_str("scrape-examples-output-path");
         let target_crates = matches.opt_strs("scrape-examples-target-crate");
         let scrape_tests = matches.opt_present("scrape-tests");
@@ -108,8 +102,8 @@ pub(crate) struct CallData {
     pub(crate) is_bin: bool,
 }
 
-pub(crate) type FnCallLocations = FxHashMap<PathBuf, CallData>;
-pub(crate) type AllCallLocations = FxHashMap<DefPathHash, FnCallLocations>;
+pub(crate) type FnCallLocations = FxIndexMap<PathBuf, CallData>;
+pub(crate) type AllCallLocations = FxIndexMap<DefPathHash, FnCallLocations>;
 
 /// Visitor for traversing a crate and finding instances of function calls.
 struct FindCalls<'a, 'tcx> {
@@ -283,7 +277,7 @@ pub(crate) fn run(
         // Collect CrateIds corresponding to provided target crates
         // If two different versions of the crate in the dependency tree, then examples will be collected from both.
         let all_crates = tcx
-            .crates_including_speculative(())
+            .crates(())
             .iter()
             .chain([&LOCAL_CRATE])
             .map(|crate_num| (crate_num, tcx.crate_name(*crate_num)))
@@ -299,7 +293,7 @@ pub(crate) fn run(
         debug!("Scrape examples target_crates: {target_crates:?}");
 
         // Run call-finder on all items
-        let mut calls = FxHashMap::default();
+        let mut calls = FxIndexMap::default();
         let mut finder =
             FindCalls { calls: &mut calls, tcx, map: tcx.hir(), cx, target_crates, bin_crate };
         tcx.hir().visit_all_item_likes_in_crate(&mut finder);
@@ -336,9 +330,9 @@ pub(crate) fn run(
 // options.
 pub(crate) fn load_call_locations(
     with_examples: Vec<String>,
-    dcx: &rustc_errors::DiagCtxt,
+    dcx: DiagCtxtHandle<'_>,
 ) -> AllCallLocations {
-    let mut all_calls: AllCallLocations = FxHashMap::default();
+    let mut all_calls: AllCallLocations = FxIndexMap::default();
     for path in with_examples {
         let bytes = match fs::read(&path) {
             Ok(bytes) => bytes,
